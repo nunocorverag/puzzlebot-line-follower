@@ -56,3 +56,37 @@ Stop safely with:
 ```bash
 scripts/stop_demo.sh
 ```
+
+## Intersection Decision Mode
+
+The line follower now detects stable dashed-line patterns as an intersection cue.
+When that happens it publishes zero `/cmd_vel`, overlays the available options in
+MJPEG, and publishes a text prompt on `/intersection_prompt`.
+
+Watch prompts:
+
+```bash
+ros2 topic echo /intersection_prompt
+```
+
+Answer from another terminal on the Jetson:
+
+```bash
+ros2 topic pub --once /intersection_decision std_msgs/msg/String "{data: 'left'}"
+ros2 topic pub --once /intersection_decision std_msgs/msg/String "{data: 'straight'}"
+ros2 topic pub --once /intersection_decision std_msgs/msg/String "{data: 'right'}"
+```
+
+Spanish aliases also work: `izquierda`, `recto`, `adelante`, `derecha`.
+After receiving a valid decision, the robot performs a short slow commit
+maneuver and then resumes normal line following.
+
+## Camera Undistortion
+
+`config/camera_params.npz` comes from `mod2_computer_vision/Activities/activity_2_07`.
+Undistortion is enabled by default. Override it with ROS parameters if needed:
+
+```bash
+ros2 run puzzlebot_ros line_follower --ros-args -p use_undistort:=false
+ros2 run puzzlebot_ros line_follower --ros-args -p camera_params_path:=/path/to/camera_params.npz
+```

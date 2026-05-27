@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rclpy
+from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
@@ -8,6 +9,7 @@ from std_msgs.msg import String
 import cv2
 import numpy as np
 import threading
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ── MJPEG server ──────────────────────────────────────────────
@@ -51,6 +53,8 @@ class AutonomousRacer(Node):
         # =========================================================
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.state_pub = self.create_publisher(String, '/traffic_state', 10)
+        self.intersection_prompt_pub = self.create_publisher(String, '/intersection_prompt', 10)
+        self.create_subscription(String, '/intersection_decision', self._intersection_decision_cb, 10)
 
         # =========================================================
         # Camera Setup (Jetson)
@@ -67,6 +71,10 @@ class AutonomousRacer(Node):
         if not self.cap.isOpened():
             self.get_logger().error("Could not open camera")
             return
+
+        self.declare_parameter('use_undistort', True)
+        self.declare_parameter('camera_params_path', '')
+        self.camera_matrix, self.dist_coeffs = self._load_camera_params()
 
         # =========================================================
         # Traffic Light Variables
@@ -88,6 +96,15 @@ class AutonomousRacer(Node):
         self.last_top_center = None
         self.max_jump_distance = 80
         self.time_line_lost = None
+
+        self.intersection_pending = False
+        self.intersection_options = []
+        self.intersection_decision = None
+        self.intersection_frames = 0
+        self.last_prompt_time = None
+        self.commit_direction = None
+        self.commit_until = None
+        self.intersection_cooldown_until = None
 
         # ---------------------------------------------------------
         # Per-lane persistent anchors for the top ROI's 3 lines.
@@ -123,6 +140,149 @@ class AutonomousRacer(Node):
         _start_mjpeg_server(port=8080)
         self.get_logger().info("Autonomous Racer Started: Lines + Traffic Lights")
         self.get_logger().info("MJPEG stream disponible en http://10.10.0.100:8080")
+
+    def _load_camera_params(self):
+        if not bool(self.get_parameter('use_undistort').value):
+            self.get_logger().info('Camera undistortion disabled.')
+            return None, None
+
+        configured_path = str(self.get_parameter('camera_params_path').value).strip()
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(Path(configured_path).expanduser())
+        candidate_paths.extend([
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/camera_params.npz'),
+            Path(__file__).resolve().parents[1] / 'config' / 'camera_params.npz',
+        ])
+
+        for params_path in candidate_paths:
+            if params_path.exists():
+                data = np.load(str(params_path))
+                self.get_logger().info(f'Loaded camera calibration: {params_path}')
+                return data['camera_matrix'], data['dist_coeffs']
+
+        self.get_logger().warn('Camera calibration not found; running without undistort.')
+        return None, None
+
+    def _intersection_decision_cb(self, msg):
+        decision = msg.data.strip().lower()
+        aliases = {
+            'left': 'left', 'l': 'left', 'izquierda': 'left', 'i': 'left',
+            'straight': 'straight', 's': 'straight', 'forward': 'straight',
+            'front': 'straight', 'adelante': 'straight', 'recto': 'straight',
+            'right': 'right', 'r': 'right', 'derecha': 'right', 'd': 'right',
+        }
+        normalized = aliases.get(decision)
+        if normalized is None:
+            self.get_logger().warn(
+                f"Intersection decision '{msg.data}' ignored. Use left, straight, or right."
+            )
+            return
+        if self.intersection_pending and normalized not in self.intersection_options:
+            self.get_logger().warn(
+                f"Decision '{normalized}' not in current options: {', '.join(self.intersection_options)}"
+            )
+            return
+        self.intersection_decision = normalized
+        self.get_logger().info(f"Intersection decision received: {normalized}")
+
+    def _black_mask(self, frame):
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
+        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        kernel = np.ones((3, 3), np.uint8)
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+    def _black_ratio(self, mask, x0, x1, y0, y1):
+        h, w = mask.shape[:2]
+        x0 = max(0, min(w, int(x0)))
+        x1 = max(0, min(w, int(x1)))
+        y0 = max(0, min(h, int(y0)))
+        y1 = max(0, min(h, int(y1)))
+        if x1 <= x0 or y1 <= y0:
+            return 0.0
+        roi = mask[y0:y1, x0:x1]
+        return float(cv2.countNonZero(roi)) / float(roi.size)
+
+    def _analyze_intersection(self, frame):
+        h, w = frame.shape[:2]
+        mask = self._black_mask(frame)
+        roi_y0, roi_y1 = int(h * 0.20), int(h * 0.68)
+        contours, _ = cv2.findContours(mask[roi_y0:roi_y1, :], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        dashed = []
+        for c in contours:
+            area = cv2.contourArea(c)
+            if area < 70 or area > 1800:
+                continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            y += roi_y0
+            if bw < 5 or bh < 5:
+                continue
+            rectangularity = area / float(bw * bh)
+            if rectangularity < 0.42:
+                continue
+            aspect = max(bw / float(bh), bh / float(bw))
+            if aspect > 6.5:
+                continue
+            cx, cy = x + bw / 2.0, y + bh / 2.0
+            dashed.append((cx, cy, bw, bh, area))
+
+        center_x = w / 2.0
+        left_dash = [d for d in dashed if d[0] < center_x - w * 0.12]
+        center_dash = [d for d in dashed if abs(d[0] - center_x) <= w * 0.18]
+        right_dash = [d for d in dashed if d[0] > center_x + w * 0.12]
+
+        ahead_ratio = self._black_ratio(mask, w * 0.38, w * 0.62, h * 0.20, h * 0.54)
+        left_ratio = self._black_ratio(mask, w * 0.05, w * 0.42, h * 0.36, h * 0.70)
+        right_ratio = self._black_ratio(mask, w * 0.58, w * 0.95, h * 0.36, h * 0.70)
+
+        dashed_detected = len(dashed) >= 4 or (len(center_dash) >= 2 and (len(left_dash) + len(right_dash)) >= 2)
+        options = []
+        if len(left_dash) >= 2 or left_ratio > 0.035:
+            options.append('left')
+        if len(center_dash) >= 2 or ahead_ratio > 0.030:
+            options.append('straight')
+        if len(right_dash) >= 2 or right_ratio > 0.035:
+            options.append('right')
+        if dashed_detected and not options:
+            options = ['straight']
+
+        debug = {
+            'dashed_count': len(dashed),
+            'left_dash': len(left_dash),
+            'center_dash': len(center_dash),
+            'right_dash': len(right_dash),
+            'ahead_ratio': ahead_ratio,
+            'left_ratio': left_ratio,
+            'right_ratio': right_ratio,
+        }
+        return dashed_detected, options, debug
+
+    def _publish_intersection_prompt(self, options, debug):
+        option_text = ', '.join(options) if options else 'none'
+        msg = String()
+        msg.data = (
+            f"Intersection detected. Options: {option_text}. "
+            "Reply with: ros2 topic pub --once /intersection_decision "
+            "std_msgs/msg/String \"{data: 'left'}\""
+        )
+        self.intersection_prompt_pub.publish(msg)
+        self.get_logger().warn(
+            f"[INTERSECTION] Waiting for decision. Options: {option_text}. Debug: {debug}"
+        )
+
+    def _draw_intersection_overlay(self, frame, options, debug):
+        h, w = frame.shape[:2]
+        cv2.putText(frame, 'INTERSECTION - WAITING', (20, 34),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        cv2.putText(frame, f"options: {', '.join(options)}", (20, 64),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
+        cv2.rectangle(frame, (int(w * 0.38), int(h * 0.20)), (int(w * 0.62), int(h * 0.54)), (255, 255, 0), 2)
+        cv2.rectangle(frame, (int(w * 0.05), int(h * 0.36)), (int(w * 0.42), int(h * 0.70)), (255, 0, 255), 2)
+        cv2.rectangle(frame, (int(w * 0.58), int(h * 0.36)), (int(w * 0.95), int(h * 0.70)), (255, 0, 255), 2)
+        cv2.putText(frame, f"dash:{debug['dashed_count']} L:{debug['left_dash']} S:{debug['center_dash']} R:{debug['right_dash']}",
+                    (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
     # =============================================================
     # TRAFFIC LIGHT DETECTOR
@@ -352,6 +512,9 @@ class AutonomousRacer(Node):
             self.get_logger().warn("No frame received from camera!")
             return
 
+        if self.camera_matrix is not None and self.dist_coeffs is not None:
+            frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+
         h, w = frame.shape[:2]
         frame_center_x = w / 2.0
         now = self.get_clock().now()
@@ -406,7 +569,52 @@ class AutonomousRacer(Node):
         self.state_pub.publish(state_msg)
 
         # ---------------------------------------------------------
-        # 2. LINE PERCEPTION
+        # 2. INTERSECTION / DASHED-LINE PERCEPTION
+        # ---------------------------------------------------------
+        dashed_detected, intersection_options, intersection_debug = self._analyze_intersection(frame)
+
+        cooldown_active = (
+            self.intersection_cooldown_until is not None
+            and now < self.intersection_cooldown_until
+        )
+        if dashed_detected and not cooldown_active and self.commit_direction is None:
+            self.intersection_frames += 1
+        else:
+            self.intersection_frames = 0
+
+        if self.intersection_frames >= 4 and not self.intersection_pending:
+            self.intersection_pending = True
+            self.intersection_options = intersection_options
+            self.intersection_decision = None
+            self.last_prompt_time = None
+
+        if self.intersection_pending:
+            self._draw_intersection_overlay(frame, self.intersection_options, intersection_debug)
+            should_prompt = self.last_prompt_time is None or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0
+            if should_prompt:
+                self._publish_intersection_prompt(self.intersection_options, intersection_debug)
+                self.last_prompt_time = now
+
+            if self.intersection_decision is None:
+                self.cmd_pub.publish(Twist())
+                ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
+                if ok:
+                    with _MJPEGHandler._lock:
+                        _MJPEGHandler._frame = jpeg.tobytes()
+                cv2.imshow("Frame", frame)
+                cv2.waitKey(1)
+                return
+
+            self.commit_direction = self.intersection_decision
+            self.commit_until = now + Duration(seconds=1.0)
+            self.intersection_pending = False
+            self.intersection_options = []
+            self.intersection_decision = None
+            self.intersection_frames = 0
+            self.intersection_cooldown_until = now + Duration(seconds=3.0)
+
+        # ---------------------------------------------------------
+        # 3. LINE PERCEPTION
         # ---------------------------------------------------------
         bottom_y_start, bottom_y_end = int(h * 0.60), h
         bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
@@ -444,7 +652,7 @@ class AutonomousRacer(Node):
         self.get_logger().info(f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}")
 
         # ---------------------------------------------------------
-        # 3. BASE CONTROL CALCULATION (Line Follower)
+        # 4. BASE CONTROL CALCULATION (Line Follower)
         # ---------------------------------------------------------
         base_linear_x  = 0.0
         target_angular_z = 0.0
@@ -505,8 +713,25 @@ class AutonomousRacer(Node):
                 self.last_derivative = derivative
                 self.last_time       = now
 
+        if self.commit_direction is not None:
+            if self.commit_until is not None and now < self.commit_until:
+                base_linear_x = 0.04
+                if self.commit_direction == 'left':
+                    target_angular_z = 0.25
+                elif self.commit_direction == 'right':
+                    target_angular_z = -0.25
+                else:
+                    target_angular_z = 0.0
+                self.get_logger().info(
+                    f"[INTERSECTION] Committing {self.commit_direction}: "
+                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}"
+                )
+            else:
+                self.commit_direction = None
+                self.commit_until = None
+
         # ---------------------------------------------------------
-        # 4. SUPERVISOR OVERRIDE (Traffic Light Scale)
+        # 5. SUPERVISOR OVERRIDE (Traffic Light Scale)
         # ---------------------------------------------------------
         cmd = Twist()
 
