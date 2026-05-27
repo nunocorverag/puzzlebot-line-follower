@@ -571,3 +571,48 @@ camera calibration. It should be intersection detection:
 
 This should stop the robot from asking for an intersection while it is just on a
 straight lane with other black lines visible in the scene.
+
+## Calibration Tool Added
+
+A standalone tool exists at:
+
+```text
+tools/line_vision_calibrator.py
+```
+
+Run it on the Jetson camera:
+
+```bash
+scripts/run_line_calibrator_jetson.sh
+```
+
+This is now the recommended first step before changing the live robot node. Use
+it to tune intersection and mask parameters without publishing `/cmd_vel`.
+
+Recommended workflow for the current false-positive issue:
+
+1. Place the robot on a normal straight segment where it falsely reports an
+   intersection.
+2. Run `LABEL=false_intersection scripts/run_line_calibrator_jetson.sh`.
+3. Adjust sliders until `status:normal` and dash evidence stays below trigger.
+4. Press `s` to save raw/processed/mask/overlay/metadata.
+5. Move to a real dashed intersection.
+6. Run `LABEL=true_intersection scripts/run_line_calibrator_jetson.sh`.
+7. Adjust only if true intersections still trigger reliably.
+8. Copy the final slider values into `line_follower.py` or, preferably, into
+   YAML/ROS parameters in the next implementation step.
+
+The tool starts with stricter values than the current live node:
+
+| Parameter | Calibrator start |
+| --- | ---: |
+| `roi_y0_pct` | `38` |
+| `roi_y1_pct` | `72` |
+| `dash_min_area` | `120` |
+| `rectangularity_pct` | `55` |
+| `max_aspect_x10` | `40` |
+| `min_dash_count` | `5` |
+| `stable_frames_needed` | `6` |
+| `enable_ratio_fallback` | `0` |
+
+These are intentionally conservative to reduce false positives.

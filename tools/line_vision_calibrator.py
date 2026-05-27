@@ -1,0 +1,437 @@
+#!/usr/bin/env python3
+"""Interactive calibration tool for Puzzlebot line/intersection vision.
+
+This tool does not use ROS and never publishes /cmd_vel. It is meant for safe
+perception tuning from a live Jetson CSI camera, a USB camera, or saved images.
+
+Keys:
+  q / ESC  quit
+  s        save raw/processed/mask/overlay + metadata JSON
+  u        toggle undistortion
+  p        pause/resume live camera
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Iterable
+
+import cv2
+import numpy as np
+
+
+REPO_DIR = Path(__file__).resolve().parents[1]
+DEFAULT_CAMERA_PARAMS = REPO_DIR / "config" / "camera_params.npz"
+DEFAULT_OUTPUT_DIR = REPO_DIR / "debug_dataset"
+
+
+@dataclass
+class CalibrationParams:
+    roi_y0_pct: int = 38
+    roi_y1_pct: int = 72
+    dash_min_area: int = 120
+    dash_max_area: int = 1800
+    rectangularity_pct: int = 55
+    max_aspect_x10: int = 40
+    min_dash_count: int = 5
+    stable_frames_needed: int = 6
+    ahead_x0_pct: int = 35
+    ahead_x1_pct: int = 65
+    side_y0_pct: int = 45
+    side_y1_pct: int = 72
+    left_x0_pct: int = 10
+    left_x1_pct: int = 38
+    right_x0_pct: int = 62
+    right_x1_pct: int = 90
+    option_min_dash_count: int = 2
+    enable_ratio_fallback: int = 0
+    ahead_ratio_pct: int = 6
+    side_ratio_pct: int = 8
+
+
+@dataclass
+class DetectionResult:
+    dashed_detected: bool
+    options: list[str]
+    stable_frames: int
+    dashed_count: int
+    left_dash: int
+    center_dash: int
+    right_dash: int
+    ahead_ratio: float
+    left_ratio: float
+    right_ratio: float
+    dashed_boxes: list[tuple[int, int, int, int]]
+
+
+def build_gstreamer_pipeline(width: int = 640, height: int = 480, fps: int = 30) -> str:
+    return (
+        "nvarguscamerasrc sensor-id=0 ! "
+        f"video/x-raw(memory:NVMM), width={width}, height={height}, framerate={fps}/1 ! "
+        "nvvidconv ! video/x-raw, format=BGRx ! "
+        "videoconvert ! video/x-raw, format=BGR ! "
+        "appsink max-buffers=1 drop=true"
+    )
+
+
+def load_camera_params(path: Path) -> tuple[np.ndarray | None, np.ndarray | None]:
+    if not path.exists():
+        print(f"[warn] camera params not found: {path}")
+        return None, None
+    data = np.load(str(path))
+    print(f"[info] loaded camera params: {path}")
+    return data["camera_matrix"], data["dist_coeffs"]
+
+
+def open_capture(args: argparse.Namespace) -> cv2.VideoCapture | None:
+    if args.image:
+        return None
+    if args.video:
+        cap = cv2.VideoCapture(str(args.video))
+        return cap if cap.isOpened() else None
+    if args.gstreamer:
+        cap = cv2.VideoCapture(
+            build_gstreamer_pipeline(args.width, args.height, args.fps),
+            cv2.CAP_GSTREAMER,
+        )
+        if cap.isOpened():
+            return cap
+        cap.release()
+        print("[warn] GStreamer camera failed, trying camera index")
+    cap = cv2.VideoCapture(args.camera)
+    return cap if cap.isOpened() else None
+
+
+def black_mask(frame: np.ndarray) -> np.ndarray:
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
+    _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    kernel = np.ones((3, 3), np.uint8)
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+
+def clamp_box(mask: np.ndarray, x0: float, x1: float, y0: float, y1: float) -> tuple[int, int, int, int]:
+    h, w = mask.shape[:2]
+    ix0 = max(0, min(w, int(x0)))
+    ix1 = max(0, min(w, int(x1)))
+    iy0 = max(0, min(h, int(y0)))
+    iy1 = max(0, min(h, int(y1)))
+    return ix0, ix1, iy0, iy1
+
+
+def black_ratio(mask: np.ndarray, x0: float, x1: float, y0: float, y1: float) -> float:
+    ix0, ix1, iy0, iy1 = clamp_box(mask, x0, x1, y0, y1)
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    roi = mask[iy0:iy1, ix0:ix1]
+    return float(cv2.countNonZero(roi)) / float(roi.size)
+
+
+def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_frames: int) -> DetectionResult:
+    h, w = frame.shape[:2]
+    mask = black_mask(frame)
+    roi_y0 = int(h * params.roi_y0_pct / 100.0)
+    roi_y1 = int(h * params.roi_y1_pct / 100.0)
+    contours, _ = cv2.findContours(mask[roi_y0:roi_y1, :], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    dashed: list[tuple[float, float, int, int, float]] = []
+    boxes: list[tuple[int, int, int, int]] = []
+    rectangularity_min = params.rectangularity_pct / 100.0
+    max_aspect = max(1.0, params.max_aspect_x10 / 10.0)
+
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < params.dash_min_area or area > params.dash_max_area:
+            continue
+        x, y, bw, bh = cv2.boundingRect(c)
+        y += roi_y0
+        if bw < 5 or bh < 5:
+            continue
+        rectangularity = area / float(bw * bh)
+        if rectangularity < rectangularity_min:
+            continue
+        aspect = max(bw / float(bh), bh / float(bw))
+        if aspect > max_aspect:
+            continue
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+        dashed.append((cx, cy, bw, bh, area))
+        boxes.append((x, y, bw, bh))
+
+    center_x = w / 2.0
+    left_dash = [d for d in dashed if d[0] < center_x - w * 0.12]
+    center_dash = [d for d in dashed if abs(d[0] - center_x) <= w * 0.18]
+    right_dash = [d for d in dashed if d[0] > center_x + w * 0.12]
+
+    ahead_ratio = black_ratio(
+        mask,
+        w * params.ahead_x0_pct / 100.0,
+        w * params.ahead_x1_pct / 100.0,
+        h * params.roi_y0_pct / 100.0,
+        h * params.roi_y1_pct / 100.0,
+    )
+    left_ratio = black_ratio(
+        mask,
+        w * params.left_x0_pct / 100.0,
+        w * params.left_x1_pct / 100.0,
+        h * params.side_y0_pct / 100.0,
+        h * params.side_y1_pct / 100.0,
+    )
+    right_ratio = black_ratio(
+        mask,
+        w * params.right_x0_pct / 100.0,
+        w * params.right_x1_pct / 100.0,
+        h * params.side_y0_pct / 100.0,
+        h * params.side_y1_pct / 100.0,
+    )
+
+    raw_detected = len(dashed) >= params.min_dash_count or (
+        len(center_dash) >= params.option_min_dash_count
+        and (len(left_dash) + len(right_dash)) >= params.option_min_dash_count
+    )
+    stable_frames = stable_frames + 1 if raw_detected else 0
+    dashed_detected = stable_frames >= params.stable_frames_needed
+
+    options: list[str] = []
+    if len(left_dash) >= params.option_min_dash_count:
+        options.append("left")
+    if len(center_dash) >= params.option_min_dash_count:
+        options.append("straight")
+    if len(right_dash) >= params.option_min_dash_count:
+        options.append("right")
+
+    if params.enable_ratio_fallback:
+        if "left" not in options and left_ratio > params.side_ratio_pct / 100.0:
+            options.append("left")
+        if "straight" not in options and ahead_ratio > params.ahead_ratio_pct / 100.0:
+            options.append("straight")
+        if "right" not in options and right_ratio > params.side_ratio_pct / 100.0:
+            options.append("right")
+
+    if dashed_detected and not options:
+        options = ["straight"]
+
+    return DetectionResult(
+        dashed_detected=dashed_detected,
+        options=options,
+        stable_frames=stable_frames,
+        dashed_count=len(dashed),
+        left_dash=len(left_dash),
+        center_dash=len(center_dash),
+        right_dash=len(right_dash),
+        ahead_ratio=ahead_ratio,
+        left_ratio=left_ratio,
+        right_ratio=right_ratio,
+        dashed_boxes=boxes,
+    )
+
+
+def create_trackbars(window: str, params: CalibrationParams) -> None:
+    def noop(_: int) -> None:
+        return
+
+    for name, value, max_value in [
+        ("roi_y0_pct", params.roi_y0_pct, 95),
+        ("roi_y1_pct", params.roi_y1_pct, 100),
+        ("dash_min_area", params.dash_min_area, 2000),
+        ("dash_max_area", params.dash_max_area, 5000),
+        ("rect_pct", params.rectangularity_pct, 100),
+        ("max_aspect_x10", params.max_aspect_x10, 120),
+        ("min_dash_count", params.min_dash_count, 20),
+        ("stable_frames", params.stable_frames_needed, 20),
+        ("option_dash_count", params.option_min_dash_count, 10),
+        ("ratio_fallback", params.enable_ratio_fallback, 1),
+        ("ahead_ratio_pct", params.ahead_ratio_pct, 30),
+        ("side_ratio_pct", params.side_ratio_pct, 30),
+        ("side_y0_pct", params.side_y0_pct, 100),
+        ("side_y1_pct", params.side_y1_pct, 100),
+    ]:
+        cv2.createTrackbar(name, window, int(value), int(max_value), noop)
+
+
+def read_trackbars(window: str, params: CalibrationParams) -> CalibrationParams:
+    updated = CalibrationParams(**asdict(params))
+    updated.roi_y0_pct = cv2.getTrackbarPos("roi_y0_pct", window)
+    updated.roi_y1_pct = cv2.getTrackbarPos("roi_y1_pct", window)
+    updated.dash_min_area = max(1, cv2.getTrackbarPos("dash_min_area", window))
+    updated.dash_max_area = max(updated.dash_min_area + 1, cv2.getTrackbarPos("dash_max_area", window))
+    updated.rectangularity_pct = cv2.getTrackbarPos("rect_pct", window)
+    updated.max_aspect_x10 = max(10, cv2.getTrackbarPos("max_aspect_x10", window))
+    updated.min_dash_count = max(1, cv2.getTrackbarPos("min_dash_count", window))
+    updated.stable_frames_needed = max(1, cv2.getTrackbarPos("stable_frames", window))
+    updated.option_min_dash_count = max(1, cv2.getTrackbarPos("option_dash_count", window))
+    updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", window)
+    updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", window)
+    updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", window)
+    updated.side_y0_pct = cv2.getTrackbarPos("side_y0_pct", window)
+    updated.side_y1_pct = cv2.getTrackbarPos("side_y1_pct", window)
+    updated.roi_y1_pct = max(updated.roi_y0_pct + 1, updated.roi_y1_pct)
+    updated.side_y1_pct = max(updated.side_y0_pct + 1, updated.side_y1_pct)
+    return updated
+
+
+def draw_box_pct(frame: np.ndarray, x0_pct: int, x1_pct: int, y0_pct: int, y1_pct: int, color: tuple[int, int, int]) -> None:
+    h, w = frame.shape[:2]
+    p0 = (int(w * x0_pct / 100.0), int(h * y0_pct / 100.0))
+    p1 = (int(w * x1_pct / 100.0), int(h * y1_pct / 100.0))
+    cv2.rectangle(frame, p0, p1, color, 2)
+
+
+def draw_overlay(frame: np.ndarray, result: DetectionResult, params: CalibrationParams, undistort_enabled: bool) -> np.ndarray:
+    overlay = frame.copy()
+    h, w = overlay.shape[:2]
+
+    draw_box_pct(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255))
+    draw_box_pct(overlay, params.ahead_x0_pct, params.ahead_x1_pct, params.roi_y0_pct, params.roi_y1_pct, (255, 255, 0))
+    draw_box_pct(overlay, params.left_x0_pct, params.left_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
+    draw_box_pct(overlay, params.right_x0_pct, params.right_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
+
+    for x, y, bw, bh in result.dashed_boxes:
+        cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
+
+    status = "INTERSECTION" if result.dashed_detected else "normal"
+    options = ",".join(result.options) if result.options else "none"
+    lines = [
+        f"status:{status} options:{options} undistort:{int(undistort_enabled)}",
+        f"dash:{result.dashed_count} stable:{result.stable_frames}/{params.stable_frames_needed} "
+        f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
+        f"ratio L:{result.left_ratio:.3f} S:{result.ahead_ratio:.3f} R:{result.right_ratio:.3f}",
+        "keys: s save | u undistort | p pause | q quit",
+    ]
+    y = 24
+    for line in lines:
+        cv2.putText(overlay, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(overlay, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+        y += 24
+    cv2.line(overlay, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
+    return overlay
+
+
+def save_sample(
+    output_dir: Path,
+    raw: np.ndarray,
+    processed: np.ndarray,
+    mask: np.ndarray,
+    overlay: np.ndarray,
+    params: CalibrationParams,
+    result: DetectionResult,
+    label: str,
+) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    prefix = output_dir / f"{stamp}_{label}"
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_raw.jpg")), raw)
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_processed.jpg")), processed)
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_mask.png")), mask)
+    cv2.imwrite(str(prefix.with_name(prefix.name + "_overlay.jpg")), overlay)
+    metadata = {
+        "label": label,
+        "params": asdict(params),
+        "result": {k: v for k, v in asdict(result).items() if k != "dashed_boxes"},
+        "dashed_boxes": result.dashed_boxes,
+    }
+    prefix.with_name(prefix.name + "_meta.json").write_text(json.dumps(metadata, indent=2))
+    print(f"[save] {prefix.name}_*.jpg/png/json")
+
+
+def iter_images(paths: Iterable[Path]) -> list[np.ndarray]:
+    frames = []
+    for path in paths:
+        image = cv2.imread(str(path))
+        if image is None:
+            print(f"[warn] could not read image: {path}")
+            continue
+        frames.append(image)
+    return frames
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--image", nargs="*", type=Path, help="Image file(s) for offline calibration")
+    parser.add_argument("--video", type=Path, help="Video file for offline calibration")
+    parser.add_argument("--camera", default=0, help="Camera index/path fallback")
+    parser.add_argument("--gstreamer", action="store_true", default=False, help="Use Jetson CSI GStreamer pipeline")
+    parser.add_argument("--width", type=int, default=640)
+    parser.add_argument("--height", type=int, default=480)
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--camera-params", type=Path, default=DEFAULT_CAMERA_PARAMS)
+    parser.add_argument("--no-undistort", action="store_true")
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--label", default="sample", help="Label used when saving samples")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    camera_matrix, dist_coeffs = load_camera_params(args.camera_params)
+    undistort_enabled = not args.no_undistort and camera_matrix is not None and dist_coeffs is not None
+
+    frames = iter_images(args.image or [])
+    cap = None if frames else open_capture(args)
+    if not frames and cap is None:
+        print("[error] no image/video/camera source available")
+        return 1
+
+    window = "Line Vision Calibrator"
+    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    params = CalibrationParams()
+    create_trackbars(window, params)
+
+    paused = False
+    frame_index = 0
+    last_raw = frames[0].copy() if frames else None
+    stable_frames = 0
+
+    while True:
+        if frames:
+            raw = frames[frame_index].copy()
+        elif not paused or last_raw is None:
+            ok, raw = cap.read()
+            if not ok:
+                print("[warn] frame read failed")
+                break
+            last_raw = raw.copy()
+        else:
+            raw = last_raw.copy()
+
+        params = read_trackbars(window, params)
+        processed = raw.copy()
+        if undistort_enabled:
+            processed = cv2.undistort(processed, camera_matrix, dist_coeffs)
+
+        result = analyze_intersection(processed, params, stable_frames)
+        stable_frames = result.stable_frames
+        mask = black_mask(processed)
+        overlay = draw_overlay(processed, result, params, undistort_enabled)
+        cv2.imshow(window, overlay)
+        cv2.imshow("Mask", mask)
+
+        key = cv2.waitKey(0 if frames else 1) & 0xFF
+        if key in (ord("q"), 27):
+            break
+        if key == ord("s"):
+            save_sample(args.output_dir, raw, processed, mask, overlay, params, result, args.label)
+        elif key == ord("u"):
+            undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
+            print(f"[info] undistort={undistort_enabled}")
+        elif key == ord("p"):
+            paused = not paused
+            print(f"[info] paused={paused}")
+        elif frames and key in (ord("n"), ord(" ")):
+            frame_index = (frame_index + 1) % len(frames)
+            stable_frames = 0
+        elif frames and key == ord("b"):
+            frame_index = (frame_index - 1) % len(frames)
+            stable_frames = 0
+
+    if cap is not None:
+        cap.release()
+    cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

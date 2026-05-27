@@ -90,3 +90,45 @@ Undistortion is enabled by default. Override it with ROS parameters if needed:
 ros2 run puzzlebot_ros line_follower --ros-args -p use_undistort:=false
 ros2 run puzzlebot_ros line_follower --ros-args -p camera_params_path:=/path/to/camera_params.npz
 ```
+
+## Vision Calibration Tool
+
+Use this before tuning the robot controller. It never publishes `/cmd_vel`.
+
+Run live on the Jetson camera:
+
+```bash
+scripts/run_line_calibrator_jetson.sh
+```
+
+Optional label for saved samples:
+
+```bash
+LABEL=false_intersection scripts/run_line_calibrator_jetson.sh
+```
+
+Inside the OpenCV window:
+
+- `s`: save raw/processed/mask/overlay + JSON metadata.
+- `u`: toggle undistortion.
+- `p`: pause live camera.
+- `q`: quit.
+
+The most important sliders for the current false positive are:
+
+- `roi_y0_pct`, `roi_y1_pct`: vertical band used for dashed detection.
+- `dash_min_area`, `rect_pct`, `max_aspect_x10`: dash-shape filters.
+- `min_dash_count`, `stable_frames`: how much evidence is needed.
+- `ratio_fallback`: keep at `0` while tuning; ratios are debug only.
+
+Pull saved samples from the Jetson:
+
+```bash
+scripts/pull_calibration_dataset.sh
+```
+
+Run on saved images locally:
+
+```bash
+python3 tools/line_vision_calibrator.py --image path/to/frame.jpg --label false_intersection
+```

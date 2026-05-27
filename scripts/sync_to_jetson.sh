@@ -24,6 +24,7 @@ rsync -az --delete \
   --exclude 'puzzlebot_ros/*_plot.png' \
   --exclude 'puzzlebot_ros/controller_data.csv' \
   --exclude 'puzzlebot_ros/calibration_images/' \
+  --exclude 'debug_dataset/' \
   "${REPO_DIR}/" "${JETSON_USER}@${JETSON_HOST}:${REMOTE_PACKAGE}/"
 
 ssh "${JETSON_USER}@${JETSON_HOST}" "chmod +x '${REMOTE_PACKAGE}/scripts/'*.sh '${REMOTE_PACKAGE}/env_jetson.sh' '${REMOTE_PACKAGE}/env_laptop.sh'"
