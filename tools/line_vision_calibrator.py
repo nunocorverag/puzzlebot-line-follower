@@ -17,6 +17,7 @@ import argparse
 import json
 import queue
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -265,7 +266,7 @@ def start_stdin_command_thread(command_queue: queue.Queue[str]) -> None:
     thread.start()
 
 
-def parse_param_command(command: str) -> tuple[str, int] | None:
+def parse_param_command(command: str) -> tuple[str, str] | None:
     command = command.strip()
     if not command or command.startswith("#"):
         return None
@@ -278,24 +279,33 @@ def parse_param_command(command: str) -> tuple[str, int] | None:
         if len(parts) != 2:
             return None
         name, value = parts
-    name = name.strip()
-    try:
-        parsed_value = int(float(value.strip()))
-    except ValueError:
-        return None
-    return name, parsed_value
+    return name.strip(), value.strip()
 
 
-def apply_param_command(controls_window: str, command: str) -> bool:
+def apply_param_command(controls_window: str, command: str, state: dict[str, str]) -> bool:
     parsed = parse_param_command(command)
     if parsed is None:
         print(f"[cmd] ignored: {command}")
         return False
-    name, value = parsed
+    name, raw_value = parsed
+    if name == "label":
+        label = raw_value.strip().replace(" ", "_")
+        if not label:
+            print("[cmd] ignored empty label")
+            return False
+        state["label"] = label
+        print(f"[cmd] label={label}")
+        return True
+
     binding = TRACKBAR_BINDINGS.get(name)
     if binding is None:
-        known = ", ".join(sorted(TRACKBAR_BINDINGS))
+        known = ", ".join(["label"] + sorted(TRACKBAR_BINDINGS))
         print(f"[cmd] unknown parameter '{name}'. Known: {known}")
+        return False
+    try:
+        value = int(float(raw_value))
+    except ValueError:
+        print(f"[cmd] invalid numeric value for {name}: {raw_value}")
         return False
     trackbar_name, min_value, max_value = binding
     clamped = max(min_value, min(max_value, value))
@@ -304,14 +314,14 @@ def apply_param_command(controls_window: str, command: str) -> bool:
     return True
 
 
-def apply_command_file(controls_window: str, command_file: Path, last_mtime: float | None) -> float | None:
+def apply_command_file(controls_window: str, command_file: Path, last_mtime: float | None, state: dict[str, str]) -> float | None:
     if not command_file.exists():
         return last_mtime
     mtime = command_file.stat().st_mtime
     if last_mtime is not None and mtime <= last_mtime:
         return last_mtime
     for line in command_file.read_text().splitlines():
-        apply_param_command(controls_window, line)
+        apply_param_command(controls_window, line, state)
     return mtime
 
 def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
@@ -365,7 +375,7 @@ def draw_box_pct(frame: np.ndarray, x0_pct: int, x1_pct: int, y0_pct: int, y1_pc
     cv2.rectangle(frame, p0, p1, color, 2)
 
 
-def draw_overlay(frame: np.ndarray, result: DetectionResult, params: CalibrationParams, undistort_enabled: bool) -> np.ndarray:
+def draw_overlay(frame: np.ndarray, result: DetectionResult, params: CalibrationParams, undistort_enabled: bool, label: str) -> np.ndarray:
     overlay = frame.copy()
     h, w = overlay.shape[:2]
 
@@ -380,11 +390,11 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
     status = "INTERSECTION" if result.dashed_detected else "normal"
     options = ",".join(result.options) if result.options else "none"
     lines = [
-        f"status:{status} options:{options} undistort:{int(undistort_enabled)}",
+        f"label:{label} status:{status} options:{options} undistort:{int(undistort_enabled)}",
         f"dash:{result.dashed_count} stable:{result.stable_frames}/{params.stable_frames_needed} "
         f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
         f"ratio L:{result.left_ratio:.3f} S:{result.ahead_ratio:.3f} R:{result.right_ratio:.3f}",
-        "keys: s save | u undistort | p pause | q quit | cmd: name=value",
+        "keys: s save | u undistort | p pause | q quit | cmd: name=value | label=...",
     ]
     y = 24
     for line in lines:
@@ -475,7 +485,8 @@ def main() -> int:
     command_queue: queue.Queue[str] = queue.Queue()
     start_stdin_command_thread(command_queue)
     command_file_mtime = None
-    print("[cmd] type commands here, e.g. min_dash_count=6 or set roi_y0_pct 42")
+    state = {"label": args.label}
+    print("[cmd] type commands here, e.g. min_dash_count=6, label=true_intersection, or set roi_y0_pct 42")
     print(f"[cmd] also watching command file: {args.command_file}")
 
     paused = False
@@ -496,8 +507,8 @@ def main() -> int:
             raw = last_raw.copy()
 
         while not command_queue.empty():
-            apply_param_command(controls_window, command_queue.get_nowait())
-        command_file_mtime = apply_command_file(controls_window, args.command_file, command_file_mtime)
+            apply_param_command(controls_window, command_queue.get_nowait(), state)
+        command_file_mtime = apply_command_file(controls_window, args.command_file, command_file_mtime, state)
         params = read_trackbars(controls_window, params)
         processed = raw.copy()
         if undistort_enabled:
@@ -506,7 +517,7 @@ def main() -> int:
         result = analyze_intersection(processed, params, stable_frames)
         stable_frames = result.stable_frames
         mask = black_mask(processed)
-        overlay = draw_overlay(processed, result, params, undistort_enabled)
+        overlay = draw_overlay(processed, result, params, undistort_enabled, state["label"])
         cv2.imshow(image_window, overlay)
         cv2.imshow(mask_window, mask)
 
@@ -514,7 +525,7 @@ def main() -> int:
         if key in (ord("q"), 27):
             break
         if key == ord("s"):
-            save_sample(args.output_dir, raw, processed, mask, overlay, params, result, args.label)
+            save_sample(args.output_dir, raw, processed, mask, overlay, params, result, state["label"])
         elif key == ord("u"):
             undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
             print(f"[info] undistort={undistort_enabled}")

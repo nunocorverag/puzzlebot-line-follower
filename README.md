@@ -133,13 +133,14 @@ Run on saved images locally:
 python3 tools/line_vision_calibrator.py --image path/to/frame.jpg --label false_intersection
 ```
 
-You can also change calibrator sliders without touching the OpenCV controls.
+You can also change calibrator sliders and the active save label without touching the OpenCV controls.
 In the calibrator terminal, type commands like:
 
 ```text
 min_dash_count=6
 roi_y0_pct 42
 set dash_min_area 90
+label=true_intersection
 ```
 
 Or from another laptop terminal while the Jetson calibrator is running:
@@ -148,6 +149,7 @@ Or from another laptop terminal while the Jetson calibrator is running:
 scripts/set_calibrator_param.sh min_dash_count 6
 scripts/set_calibrator_param.sh roi_y0_pct 42
 scripts/set_calibrator_param.sh dash_min_area 90
+scripts/set_calibrator_param.sh label true_intersection
 ```
 
-The `Controls` sliders update when the command is applied.
+The `Controls` sliders update when parameter commands are applied, and the overlay shows the current `label:` used by the next `s` save.

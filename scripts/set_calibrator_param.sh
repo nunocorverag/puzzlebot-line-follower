@@ -2,8 +2,10 @@
 set -euo pipefail
 
 if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 PARAM VALUE" >&2
-  echo "Example: $0 min_dash_count 6" >&2
+  echo "Usage: $0 PARAM_OR_LABEL VALUE" >&2
+  echo "Examples:
+  $0 min_dash_count 6
+  $0 label true_intersection" >&2
   exit 2
 fi
 
