@@ -1,0 +1,14 @@
+build/
+install/
+log/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Runtime/debug outputs from Jetson tests.
+puzzlebot_ros/line_debug/
+puzzlebot_ros/*_plot.png
+puzzlebot_ros/controller_data.csv
+
+# Captured calibration data can be copied in locally when needed.
+puzzlebot_ros/calibration_images/
