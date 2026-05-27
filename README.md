@@ -132,3 +132,22 @@ Run on saved images locally:
 ```bash
 python3 tools/line_vision_calibrator.py --image path/to/frame.jpg --label false_intersection
 ```
+
+You can also change calibrator sliders without touching the OpenCV controls.
+In the calibrator terminal, type commands like:
+
+```text
+min_dash_count=6
+roi_y0_pct 42
+set dash_min_area 90
+```
+
+Or from another laptop terminal while the Jetson calibrator is running:
+
+```bash
+scripts/set_calibrator_param.sh min_dash_count 6
+scripts/set_calibrator_param.sh roi_y0_pct 42
+scripts/set_calibrator_param.sh dash_min_area 90
+```
+
+The `Controls` sliders update when the command is applied.

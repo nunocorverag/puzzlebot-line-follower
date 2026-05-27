@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import queue
+import sys
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -229,6 +231,89 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
     )
 
 
+TRACKBAR_BINDINGS = {
+    "roi_y0_pct": ("roi_y0_pct", 0, 95),
+    "roi_y1_pct": ("roi_y1_pct", 1, 100),
+    "dash_min_area": ("dash_min_area", 1, 2000),
+    "dash_max_area": ("dash_max_area", 2, 5000),
+    "rect_pct": ("rect_pct", 0, 100),
+    "rectangularity_pct": ("rect_pct", 0, 100),
+    "max_aspect_x10": ("max_aspect_x10", 10, 120),
+    "min_dash_count": ("min_dash_count", 1, 20),
+    "stable_frames": ("stable_frames", 1, 20),
+    "stable_frames_needed": ("stable_frames", 1, 20),
+    "option_dash_count": ("option_dash_count", 1, 10),
+    "option_min_dash_count": ("option_dash_count", 1, 10),
+    "ratio_fallback": ("ratio_fallback", 0, 1),
+    "enable_ratio_fallback": ("ratio_fallback", 0, 1),
+    "ahead_ratio_pct": ("ahead_ratio_pct", 0, 30),
+    "side_ratio_pct": ("side_ratio_pct", 0, 30),
+    "side_y0_pct": ("side_y0_pct", 0, 100),
+    "side_y1_pct": ("side_y1_pct", 1, 100),
+}
+
+
+def start_stdin_command_thread(command_queue: queue.Queue[str]) -> None:
+    def worker() -> None:
+        while True:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            command_queue.put(line.strip())
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+
+def parse_param_command(command: str) -> tuple[str, int] | None:
+    command = command.strip()
+    if not command or command.startswith("#"):
+        return None
+    if command.startswith("set "):
+        command = command[4:].strip()
+    if "=" in command:
+        name, value = command.split("=", 1)
+    else:
+        parts = command.split()
+        if len(parts) != 2:
+            return None
+        name, value = parts
+    name = name.strip()
+    try:
+        parsed_value = int(float(value.strip()))
+    except ValueError:
+        return None
+    return name, parsed_value
+
+
+def apply_param_command(controls_window: str, command: str) -> bool:
+    parsed = parse_param_command(command)
+    if parsed is None:
+        print(f"[cmd] ignored: {command}")
+        return False
+    name, value = parsed
+    binding = TRACKBAR_BINDINGS.get(name)
+    if binding is None:
+        known = ", ".join(sorted(TRACKBAR_BINDINGS))
+        print(f"[cmd] unknown parameter '{name}'. Known: {known}")
+        return False
+    trackbar_name, min_value, max_value = binding
+    clamped = max(min_value, min(max_value, value))
+    cv2.setTrackbarPos(trackbar_name, controls_window, clamped)
+    print(f"[cmd] {name}={clamped}")
+    return True
+
+
+def apply_command_file(controls_window: str, command_file: Path, last_mtime: float | None) -> float | None:
+    if not command_file.exists():
+        return last_mtime
+    mtime = command_file.stat().st_mtime
+    if last_mtime is not None and mtime <= last_mtime:
+        return last_mtime
+    for line in command_file.read_text().splitlines():
+        apply_param_command(controls_window, line)
+    return mtime
+
 def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
     def noop(_: int) -> None:
         return
@@ -299,7 +384,7 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
         f"dash:{result.dashed_count} stable:{result.stable_frames}/{params.stable_frames_needed} "
         f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
         f"ratio L:{result.left_ratio:.3f} S:{result.ahead_ratio:.3f} R:{result.right_ratio:.3f}",
-        "keys: s save | u undistort | p pause | q quit",
+        "keys: s save | u undistort | p pause | q quit | cmd: name=value",
     ]
     y = 24
     for line in lines:
@@ -361,6 +446,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-undistort", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--label", default="sample", help="Label used when saving samples")
+    parser.add_argument("--command-file", type=Path, default=DEFAULT_OUTPUT_DIR / "calibrator_commands.txt")
     return parser.parse_args()
 
 
@@ -386,6 +472,11 @@ def main() -> int:
     cv2.resizeWindow(controls_window, 760, 520)
     params = CalibrationParams()
     create_trackbars(controls_window, params)
+    command_queue: queue.Queue[str] = queue.Queue()
+    start_stdin_command_thread(command_queue)
+    command_file_mtime = None
+    print("[cmd] type commands here, e.g. min_dash_count=6 or set roi_y0_pct 42")
+    print(f"[cmd] also watching command file: {args.command_file}")
 
     paused = False
     frame_index = 0
@@ -404,6 +495,9 @@ def main() -> int:
         else:
             raw = last_raw.copy()
 
+        while not command_queue.empty():
+            apply_param_command(controls_window, command_queue.get_nowait())
+        command_file_mtime = apply_command_file(controls_window, args.command_file, command_file_mtime)
         params = read_trackbars(controls_window, params)
         processed = raw.copy()
         if undistort_enabled:
