@@ -229,7 +229,7 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
     )
 
 
-def create_trackbars(window: str, params: CalibrationParams) -> None:
+def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
     def noop(_: int) -> None:
         return
 
@@ -249,25 +249,25 @@ def create_trackbars(window: str, params: CalibrationParams) -> None:
         ("side_y0_pct", params.side_y0_pct, 100),
         ("side_y1_pct", params.side_y1_pct, 100),
     ]:
-        cv2.createTrackbar(name, window, int(value), int(max_value), noop)
+        cv2.createTrackbar(name, controls_window, int(value), int(max_value), noop)
 
 
-def read_trackbars(window: str, params: CalibrationParams) -> CalibrationParams:
+def read_trackbars(controls_window: str, params: CalibrationParams) -> CalibrationParams:
     updated = CalibrationParams(**asdict(params))
-    updated.roi_y0_pct = cv2.getTrackbarPos("roi_y0_pct", window)
-    updated.roi_y1_pct = cv2.getTrackbarPos("roi_y1_pct", window)
-    updated.dash_min_area = max(1, cv2.getTrackbarPos("dash_min_area", window))
-    updated.dash_max_area = max(updated.dash_min_area + 1, cv2.getTrackbarPos("dash_max_area", window))
-    updated.rectangularity_pct = cv2.getTrackbarPos("rect_pct", window)
-    updated.max_aspect_x10 = max(10, cv2.getTrackbarPos("max_aspect_x10", window))
-    updated.min_dash_count = max(1, cv2.getTrackbarPos("min_dash_count", window))
-    updated.stable_frames_needed = max(1, cv2.getTrackbarPos("stable_frames", window))
-    updated.option_min_dash_count = max(1, cv2.getTrackbarPos("option_dash_count", window))
-    updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", window)
-    updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", window)
-    updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", window)
-    updated.side_y0_pct = cv2.getTrackbarPos("side_y0_pct", window)
-    updated.side_y1_pct = cv2.getTrackbarPos("side_y1_pct", window)
+    updated.roi_y0_pct = cv2.getTrackbarPos("roi_y0_pct", controls_window)
+    updated.roi_y1_pct = cv2.getTrackbarPos("roi_y1_pct", controls_window)
+    updated.dash_min_area = max(1, cv2.getTrackbarPos("dash_min_area", controls_window))
+    updated.dash_max_area = max(updated.dash_min_area + 1, cv2.getTrackbarPos("dash_max_area", controls_window))
+    updated.rectangularity_pct = cv2.getTrackbarPos("rect_pct", controls_window)
+    updated.max_aspect_x10 = max(10, cv2.getTrackbarPos("max_aspect_x10", controls_window))
+    updated.min_dash_count = max(1, cv2.getTrackbarPos("min_dash_count", controls_window))
+    updated.stable_frames_needed = max(1, cv2.getTrackbarPos("stable_frames", controls_window))
+    updated.option_min_dash_count = max(1, cv2.getTrackbarPos("option_dash_count", controls_window))
+    updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", controls_window)
+    updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", controls_window)
+    updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", controls_window)
+    updated.side_y0_pct = cv2.getTrackbarPos("side_y0_pct", controls_window)
+    updated.side_y1_pct = cv2.getTrackbarPos("side_y1_pct", controls_window)
     updated.roi_y1_pct = max(updated.roi_y0_pct + 1, updated.roi_y1_pct)
     updated.side_y1_pct = max(updated.side_y0_pct + 1, updated.side_y1_pct)
     return updated
@@ -375,10 +375,17 @@ def main() -> int:
         print("[error] no image/video/camera source available")
         return 1
 
-    window = "Line Vision Calibrator"
-    cv2.namedWindow(window, cv2.WINDOW_NORMAL)
+    image_window = "Line Vision Calibrator"
+    controls_window = "Controls"
+    mask_window = "Mask"
+    cv2.namedWindow(image_window, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(mask_window, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(image_window, args.width, args.height)
+    cv2.resizeWindow(mask_window, args.width, args.height)
+    cv2.resizeWindow(controls_window, 760, 520)
     params = CalibrationParams()
-    create_trackbars(window, params)
+    create_trackbars(controls_window, params)
 
     paused = False
     frame_index = 0
@@ -397,7 +404,7 @@ def main() -> int:
         else:
             raw = last_raw.copy()
 
-        params = read_trackbars(window, params)
+        params = read_trackbars(controls_window, params)
         processed = raw.copy()
         if undistort_enabled:
             processed = cv2.undistort(processed, camera_matrix, dist_coeffs)
@@ -406,8 +413,8 @@ def main() -> int:
         stable_frames = result.stable_frames
         mask = black_mask(processed)
         overlay = draw_overlay(processed, result, params, undistort_enabled)
-        cv2.imshow(window, overlay)
-        cv2.imshow("Mask", mask)
+        cv2.imshow(image_window, overlay)
+        cv2.imshow(mask_window, mask)
 
         key = cv2.waitKey(0 if frames else 1) & 0xFF
         if key in (ord("q"), 27):
