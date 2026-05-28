@@ -51,6 +51,8 @@ class CalibrationParams:
     right_x0_pct: int = 62
     right_x1_pct: int = 90
     option_min_dash_count: int = 2
+    option_y0_pct: int = 42
+    option_y1_pct: int = 64
     enable_ratio_fallback: int = 0
     ahead_ratio_pct: int = 6
     side_ratio_pct: int = 8
@@ -165,9 +167,12 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         boxes.append((x, y, bw, bh))
 
     center_x = w / 2.0
-    left_dash = [d for d in dashed if d[0] < center_x - w * 0.12]
-    center_dash = [d for d in dashed if abs(d[0] - center_x) <= w * 0.18]
-    right_dash = [d for d in dashed if d[0] > center_x + w * 0.12]
+    option_y0 = h * params.option_y0_pct / 100.0
+    option_y1 = h * params.option_y1_pct / 100.0
+    option_dashed = [d for d in dashed if option_y0 <= d[1] <= option_y1]
+    left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
+    center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
+    right_dash = [d for d in option_dashed if d[0] > center_x + w * 0.12]
 
     ahead_ratio = black_ratio(
         mask,
@@ -214,8 +219,6 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         if "right" not in options and right_ratio > params.side_ratio_pct / 100.0:
             options.append("right")
 
-    if dashed_detected and not options:
-        options = ["straight"]
 
     return DetectionResult(
         dashed_detected=dashed_detected,
@@ -245,6 +248,8 @@ TRACKBAR_BINDINGS = {
     "stable_frames_needed": ("stable_frames", 1, 20),
     "option_dash_count": ("option_dash_count", 1, 10),
     "option_min_dash_count": ("option_dash_count", 1, 10),
+    "option_y0_pct": ("option_y0_pct", 0, 100),
+    "option_y1_pct": ("option_y1_pct", 1, 100),
     "ratio_fallback": ("ratio_fallback", 0, 1),
     "enable_ratio_fallback": ("ratio_fallback", 0, 1),
     "ahead_ratio_pct": ("ahead_ratio_pct", 0, 30),
@@ -338,6 +343,8 @@ def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
         ("min_dash_count", params.min_dash_count, 20),
         ("stable_frames", params.stable_frames_needed, 20),
         ("option_dash_count", params.option_min_dash_count, 10),
+        ("option_y0_pct", params.option_y0_pct, 100),
+        ("option_y1_pct", params.option_y1_pct, 100),
         ("ratio_fallback", params.enable_ratio_fallback, 1),
         ("ahead_ratio_pct", params.ahead_ratio_pct, 30),
         ("side_ratio_pct", params.side_ratio_pct, 30),
@@ -358,6 +365,8 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.min_dash_count = max(1, cv2.getTrackbarPos("min_dash_count", controls_window))
     updated.stable_frames_needed = max(1, cv2.getTrackbarPos("stable_frames", controls_window))
     updated.option_min_dash_count = max(1, cv2.getTrackbarPos("option_dash_count", controls_window))
+    updated.option_y0_pct = cv2.getTrackbarPos("option_y0_pct", controls_window)
+    updated.option_y1_pct = cv2.getTrackbarPos("option_y1_pct", controls_window)
     updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", controls_window)
     updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", controls_window)
     updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", controls_window)
@@ -365,6 +374,7 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.side_y1_pct = cv2.getTrackbarPos("side_y1_pct", controls_window)
     updated.roi_y1_pct = max(updated.roi_y0_pct + 1, updated.roi_y1_pct)
     updated.side_y1_pct = max(updated.side_y0_pct + 1, updated.side_y1_pct)
+    updated.option_y1_pct = max(updated.option_y0_pct + 1, updated.option_y1_pct)
     return updated
 
 
@@ -381,6 +391,7 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
 
     draw_box_pct(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255))
     draw_box_pct(overlay, params.ahead_x0_pct, params.ahead_x1_pct, params.roi_y0_pct, params.roi_y1_pct, (255, 255, 0))
+    draw_box_pct(overlay, 0, 100, params.option_y0_pct, params.option_y1_pct, (255, 0, 0))
     draw_box_pct(overlay, params.left_x0_pct, params.left_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
     draw_box_pct(overlay, params.right_x0_pct, params.right_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
 

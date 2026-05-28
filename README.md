@@ -119,6 +119,7 @@ The most important sliders for the current false positive are:
 - `roi_y0_pct`, `roi_y1_pct`: vertical band used for dashed detection.
 - `dash_min_area`, `rect_pct`, `max_aspect_x10`: dash-shape filters.
 - `min_dash_count`, `stable_frames`: how much evidence is needed.
+- `option_y0_pct`, `option_y1_pct`: vertical band used only to infer left/straight/right exits; this excludes lower incoming-lane dashes.
 - `ratio_fallback`: keep at `0` while tuning; ratios are debug only.
 
 Pull saved samples from the Jetson:

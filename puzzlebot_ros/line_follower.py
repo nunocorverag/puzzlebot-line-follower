@@ -229,9 +229,11 @@ class AutonomousRacer(Node):
             dashed.append((cx, cy, bw, bh, area))
 
         center_x = w / 2.0
-        left_dash = [d for d in dashed if d[0] < center_x - w * 0.12]
-        center_dash = [d for d in dashed if abs(d[0] - center_x) <= w * 0.18]
-        right_dash = [d for d in dashed if d[0] > center_x + w * 0.12]
+        option_y0, option_y1 = h * 0.42, h * 0.64
+        option_dashed = [d for d in dashed if option_y0 <= d[1] <= option_y1]
+        left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
+        center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
+        right_dash = [d for d in option_dashed if d[0] > center_x + w * 0.12]
 
         ahead_ratio = self._black_ratio(mask, w * 0.38, w * 0.62, h * 0.20, h * 0.54)
         left_ratio = self._black_ratio(mask, w * 0.05, w * 0.42, h * 0.36, h * 0.70)
@@ -239,14 +241,12 @@ class AutonomousRacer(Node):
 
         dashed_detected = len(dashed) >= 5 or (len(center_dash) >= 2 and (len(left_dash) + len(right_dash)) >= 2)
         options = []
-        if len(left_dash) >= 2 or left_ratio > 0.035:
+        if len(left_dash) >= 2:
             options.append('left')
-        if len(center_dash) >= 2 or ahead_ratio > 0.030:
+        if len(center_dash) >= 2:
             options.append('straight')
-        if len(right_dash) >= 2 or right_ratio > 0.035:
+        if len(right_dash) >= 2:
             options.append('right')
-        if dashed_detected and not options:
-            options = ['straight']
 
         debug = {
             'dashed_count': len(dashed),
