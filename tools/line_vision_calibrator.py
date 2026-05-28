@@ -29,6 +29,7 @@ import numpy as np
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_CAMERA_PARAMS = REPO_DIR / "config" / "camera_params.npz"
+DEFAULT_ILLUMINATION_PARAMS = REPO_DIR / "config" / "illumination_flatfield.npz"
 DEFAULT_OUTPUT_DIR = REPO_DIR / "debug_dataset"
 
 
@@ -92,6 +93,24 @@ def load_camera_params(path: Path) -> tuple[np.ndarray | None, np.ndarray | None
     data = np.load(str(path))
     print(f"[info] loaded camera params: {path}")
     return data["camera_matrix"], data["dist_coeffs"]
+
+
+def load_illumination_gain(path: Path) -> np.ndarray | None:
+    if not path.exists():
+        print(f"[warn] illumination params not found: {path}")
+        return None
+    data = np.load(str(path))
+    print(f"[info] loaded illumination params: {path}")
+    return data["gain"].astype(np.float32)
+
+
+def apply_illumination_gain(frame: np.ndarray, gain: np.ndarray | None) -> np.ndarray:
+    if gain is None:
+        return frame
+    if gain.shape[:2] != frame.shape[:2]:
+        gain = cv2.resize(gain, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+    corrected = frame.astype(np.float32) * gain
+    return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
 def open_capture(args: argparse.Namespace) -> cv2.VideoCapture | None:
@@ -475,6 +494,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--fps", type=int, default=30)
     parser.add_argument("--camera-params", type=Path, default=DEFAULT_CAMERA_PARAMS)
+    parser.add_argument("--illumination-params", type=Path, default=DEFAULT_ILLUMINATION_PARAMS)
+    parser.add_argument("--no-illumination-correction", action="store_true")
     parser.add_argument("--no-undistort", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--label", default="sample", help="Label used when saving samples")
@@ -486,6 +507,9 @@ def main() -> int:
     args = parse_args()
     camera_matrix, dist_coeffs = load_camera_params(args.camera_params)
     undistort_enabled = not args.no_undistort and camera_matrix is not None and dist_coeffs is not None
+    illumination_gain = None
+    if not args.no_illumination_correction:
+        illumination_gain = load_illumination_gain(args.illumination_params)
 
     frames = iter_images(args.image or [])
     cap = None if frames else open_capture(args)
@@ -535,6 +559,7 @@ def main() -> int:
         processed = raw.copy()
         if undistort_enabled:
             processed = cv2.undistort(processed, camera_matrix, dist_coeffs)
+        processed = apply_illumination_gain(processed, illumination_gain)
 
         result = analyze_intersection(processed, params, stable_frames)
         stable_frames = result.stable_frames

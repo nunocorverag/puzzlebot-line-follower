@@ -154,3 +154,19 @@ scripts/set_calibrator_param.sh label true_intersection
 ```
 
 The `Controls` sliders update when parameter commands are applied, and the overlay shows the current `label:` used by the next `s` save.
+
+### Illumination Flat-Field Calibration
+
+Capture a white-lona flat-field reference on the Jetson:
+
+```bash
+scripts/run_illumination_calibrator_jetson.sh
+```
+
+Point the camera at clean white lona/cardstock in the robot camera pose, wait for exposure to settle, press `c` to save `config/illumination_flatfield.npz`, then press `q`. The line calibrator and `puzzlebot_ros/line_follower.py` load that file automatically when it exists. `scripts/sync_to_jetson.sh` excludes this file so a local sync does not delete the Jetson-specific calibration.
+
+A backup copy can be stored outside the repo, for example:
+
+```text
+~/Documents/puzzlebot-line-follower-calibration/illumination_flatfield.npz
+```

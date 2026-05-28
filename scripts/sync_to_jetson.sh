@@ -24,6 +24,7 @@ rsync -az --delete \
   --exclude 'puzzlebot_ros/*_plot.png' \
   --exclude 'puzzlebot_ros/controller_data.csv' \
   --exclude 'puzzlebot_ros/calibration_images/' \
+  --exclude 'config/illumination_flatfield.npz' \
   --exclude 'debug_dataset/' \
   "${REPO_DIR}/" "${JETSON_USER}@${JETSON_HOST}:${REMOTE_PACKAGE}/"
 

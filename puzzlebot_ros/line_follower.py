@@ -74,6 +74,9 @@ class AutonomousRacer(Node):
 
         self.declare_parameter('use_undistort', True)
         self.declare_parameter('camera_params_path', '')
+        self.declare_parameter('use_illumination_correction', True)
+        self.declare_parameter('illumination_params_path', '')
+        self.illumination_gain = self._load_illumination_gain()
         self.camera_matrix, self.dist_coeffs = self._load_camera_params()
 
         # =========================================================
@@ -163,6 +166,38 @@ class AutonomousRacer(Node):
 
         self.get_logger().warn('Camera calibration not found; running without undistort.')
         return None, None
+
+    def _load_illumination_gain(self):
+        if not bool(self.get_parameter('use_illumination_correction').value):
+            self.get_logger().info('Illumination correction disabled.')
+            return None
+
+        configured_path = str(self.get_parameter('illumination_params_path').value).strip()
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(Path(configured_path).expanduser())
+        candidate_paths.extend([
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/illumination_flatfield.npz'),
+            Path(__file__).resolve().parents[1] / 'config' / 'illumination_flatfield.npz',
+        ])
+
+        for params_path in candidate_paths:
+            if params_path.exists():
+                data = np.load(str(params_path))
+                self.get_logger().info(f'Loaded illumination calibration: {params_path}')
+                return data['gain'].astype(np.float32)
+
+        self.get_logger().warn('Illumination calibration not found; running without flat-field correction.')
+        return None
+
+    def _apply_illumination_gain(self, frame):
+        if self.illumination_gain is None:
+            return frame
+        gain = self.illumination_gain
+        if gain.shape[:2] != frame.shape[:2]:
+            gain = cv2.resize(gain, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
+        corrected = frame.astype(np.float32) * gain
+        return np.clip(corrected, 0, 255).astype(np.uint8)
 
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
@@ -515,6 +550,7 @@ class AutonomousRacer(Node):
 
         if self.camera_matrix is not None and self.dist_coeffs is not None:
             frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
+        frame = self._apply_illumination_gain(frame)
 
         h, w = frame.shape[:2]
         frame_center_x = w / 2.0
