@@ -704,6 +704,11 @@ def main() -> int:
     cv2.resizeWindow(mask_window, args.width, args.height)
     cv2.resizeWindow(controls_window, 760, 520)
     cv2.resizeWindow(state_window, 560, 360)
+    # Fixed window layout: mask top-left, calibrator below it, controls to the right, state bottom-right
+    cv2.moveWindow(mask_window,    0,   0)
+    cv2.moveWindow(image_window,   0,   args.height + 30)
+    cv2.moveWindow(controls_window, args.width + 10,  0)
+    cv2.moveWindow(state_window,   args.width + 10,  args.height + 30)
     params = CalibrationParams()
     create_trackbars(controls_window, params)
     command_queue: queue.Queue[str] = queue.Queue()
