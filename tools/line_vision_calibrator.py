@@ -34,12 +34,12 @@ DEFAULT_OUTPUT_DIR = REPO_DIR / "debug_dataset"
 
 @dataclass
 class CalibrationParams:
-    roi_y0_pct: int = 38
-    roi_y1_pct: int = 72
-    dash_min_area: int = 120
-    dash_max_area: int = 1800
-    rectangularity_pct: int = 55
-    max_aspect_x10: int = 40
+    roi_y0_pct: int = 42
+    roi_y1_pct: int = 82
+    dash_min_area: int = 40
+    dash_max_area: int = 2400
+    rectangularity_pct: int = 45
+    max_aspect_x10: int = 60
     min_dash_count: int = 5
     stable_frames_needed: int = 6
     ahead_x0_pct: int = 35

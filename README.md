@@ -137,18 +137,18 @@ You can also change calibrator sliders and the active save label without touchin
 In the calibrator terminal, type commands like:
 
 ```text
-min_dash_count=6
+min_dash_count=5
 roi_y0_pct 42
-set dash_min_area 90
+set dash_min_area 40
 label=true_intersection
 ```
 
 Or from another laptop terminal while the Jetson calibrator is running:
 
 ```bash
-scripts/set_calibrator_param.sh min_dash_count 6
+scripts/set_calibrator_param.sh min_dash_count 5
 scripts/set_calibrator_param.sh roi_y0_pct 42
-scripts/set_calibrator_param.sh dash_min_area 90
+scripts/set_calibrator_param.sh dash_min_area 40
 scripts/set_calibrator_param.sh label true_intersection
 ```
 

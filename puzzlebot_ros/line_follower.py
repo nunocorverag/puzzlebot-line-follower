@@ -207,23 +207,23 @@ class AutonomousRacer(Node):
     def _analyze_intersection(self, frame):
         h, w = frame.shape[:2]
         mask = self._black_mask(frame)
-        roi_y0, roi_y1 = int(h * 0.20), int(h * 0.68)
+        roi_y0, roi_y1 = int(h * 0.42), int(h * 0.82)
         contours, _ = cv2.findContours(mask[roi_y0:roi_y1, :], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         dashed = []
         for c in contours:
             area = cv2.contourArea(c)
-            if area < 70 or area > 1800:
+            if area < 40 or area > 2400:
                 continue
             x, y, bw, bh = cv2.boundingRect(c)
             y += roi_y0
             if bw < 5 or bh < 5:
                 continue
             rectangularity = area / float(bw * bh)
-            if rectangularity < 0.42:
+            if rectangularity < 0.45:
                 continue
             aspect = max(bw / float(bh), bh / float(bw))
-            if aspect > 6.5:
+            if aspect > 6.0:
                 continue
             cx, cy = x + bw / 2.0, y + bh / 2.0
             dashed.append((cx, cy, bw, bh, area))
@@ -237,7 +237,7 @@ class AutonomousRacer(Node):
         left_ratio = self._black_ratio(mask, w * 0.05, w * 0.42, h * 0.36, h * 0.70)
         right_ratio = self._black_ratio(mask, w * 0.58, w * 0.95, h * 0.36, h * 0.70)
 
-        dashed_detected = len(dashed) >= 4 or (len(center_dash) >= 2 and (len(left_dash) + len(right_dash)) >= 2)
+        dashed_detected = len(dashed) >= 5 or (len(center_dash) >= 2 and (len(left_dash) + len(right_dash)) >= 2)
         options = []
         if len(left_dash) >= 2 or left_ratio > 0.035:
             options.append('left')
