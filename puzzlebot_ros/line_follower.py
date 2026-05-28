@@ -229,8 +229,9 @@ class AutonomousRacer(Node):
             dashed.append((cx, cy, bw, bh, area))
 
         center_x = w / 2.0
-        option_y0, option_y1 = h * 0.42, h * 0.64
-        option_dashed = [d for d in dashed if option_y0 <= d[1] <= option_y1]
+        option_x0, option_x1 = w * 0.08, w * 0.92
+        option_y0, option_y1 = h * 0.35, h * 0.68
+        option_dashed = [d for d in dashed if option_x0 <= d[0] <= option_x1 and option_y0 <= d[1] <= option_y1]
         left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
         center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
         right_dash = [d for d in option_dashed if d[0] > center_x + w * 0.12]
