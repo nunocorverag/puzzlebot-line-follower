@@ -164,3 +164,20 @@ scripts/run_illumination_calibrator_jetson.sh
 ```
 
 Point the camera at clean white lona/cardstock in the robot camera pose, wait for exposure to settle, press `c` to save `config/illumination_flatfield.npz`, then press `q`. The line calibrator and `puzzlebot_ros/line_follower.py` load that file automatically when it exists.
+
+### Dynamic Entry-Based Option ROI
+
+The line calibrator can place the option ROI above the detected entry zebra instead of using a fixed blue box. This keeps the option ROI from overlapping the lower entry zebra.
+
+Relevant live parameters:
+
+```text
+dynamic_option_roi = 1
+entry_y0_pct = 58
+entry_margin_pct = 4
+dynamic_option_height_pct = 28
+option_x0_pct = 8
+option_x1_pct = 92
+```
+
+The orange line in the overlay is the detected entry zebra y-position. The blue box is the effective option ROI used for left/straight/right. Set `dynamic_option_roi=0` to return to the fixed option box.

@@ -56,6 +56,10 @@ class CalibrationParams:
     option_x1_pct: int = 92
     option_y0_pct: int = 35
     option_y1_pct: int = 68
+    dynamic_option_roi: int = 1
+    entry_y0_pct: int = 58
+    entry_margin_pct: int = 4
+    dynamic_option_height_pct: int = 28
     enable_ratio_fallback: int = 0
     ahead_ratio_pct: int = 6
     side_ratio_pct: int = 8
@@ -74,6 +78,8 @@ class DetectionResult:
     left_ratio: float
     right_ratio: float
     dashed_boxes: list[tuple[int, int, int, int]]
+    entry_y_pct: float | None
+    option_box_pct: tuple[int, int, int, int]
 
 
 def build_gstreamer_pipeline(width: int = 640, height: int = 480, fps: int = 30) -> str:
@@ -188,10 +194,22 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         boxes.append((x, y, bw, bh))
 
     center_x = w / 2.0
-    option_x0 = w * params.option_x0_pct / 100.0
-    option_x1 = w * params.option_x1_pct / 100.0
-    option_y0 = h * params.option_y0_pct / 100.0
-    option_y1 = h * params.option_y1_pct / 100.0
+    entry_candidates = [d for d in dashed if d[1] >= h * params.entry_y0_pct / 100.0]
+    entry_y_pct = None
+    if entry_candidates:
+        entry_y = float(np.median([d[1] for d in entry_candidates]))
+        entry_y_pct = 100.0 * entry_y / h
+    option_x0_pct = params.option_x0_pct
+    option_x1_pct = params.option_x1_pct
+    option_y0_pct = params.option_y0_pct
+    option_y1_pct = params.option_y1_pct
+    if params.dynamic_option_roi and entry_y_pct is not None:
+        option_y1_pct = max(1, int(entry_y_pct - params.entry_margin_pct))
+        option_y0_pct = max(0, option_y1_pct - params.dynamic_option_height_pct)
+    option_x0 = w * option_x0_pct / 100.0
+    option_x1 = w * option_x1_pct / 100.0
+    option_y0 = h * option_y0_pct / 100.0
+    option_y1 = h * option_y1_pct / 100.0
     option_dashed = [d for d in dashed if option_x0 <= d[0] <= option_x1 and option_y0 <= d[1] <= option_y1]
     left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
     center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
@@ -255,6 +273,8 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         left_ratio=left_ratio,
         right_ratio=right_ratio,
         dashed_boxes=boxes,
+        entry_y_pct=entry_y_pct,
+        option_box_pct=(option_x0_pct, option_x1_pct, option_y0_pct, option_y1_pct),
     )
 
 
@@ -275,6 +295,10 @@ TRACKBAR_BINDINGS = {
     "option_x1_pct": ("option_x1_pct", 1, 100),
     "option_y0_pct": ("option_y0_pct", 0, 100),
     "option_y1_pct": ("option_y1_pct", 1, 100),
+    "dynamic_option_roi": ("dynamic_option_roi", 0, 1),
+    "entry_y0_pct": ("entry_y0_pct", 0, 100),
+    "entry_margin_pct": ("entry_margin_pct", 0, 30),
+    "dynamic_option_height_pct": ("dynamic_option_height_pct", 1, 80),
     "ratio_fallback": ("ratio_fallback", 0, 1),
     "enable_ratio_fallback": ("ratio_fallback", 0, 1),
     "ahead_ratio_pct": ("ahead_ratio_pct", 0, 30),
@@ -372,6 +396,10 @@ def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
         ("option_x1_pct", params.option_x1_pct, 100),
         ("option_y0_pct", params.option_y0_pct, 100),
         ("option_y1_pct", params.option_y1_pct, 100),
+        ("dynamic_option_roi", params.dynamic_option_roi, 1),
+        ("entry_y0_pct", params.entry_y0_pct, 100),
+        ("entry_margin_pct", params.entry_margin_pct, 30),
+        ("dynamic_option_height_pct", params.dynamic_option_height_pct, 80),
         ("ratio_fallback", params.enable_ratio_fallback, 1),
         ("ahead_ratio_pct", params.ahead_ratio_pct, 30),
         ("side_ratio_pct", params.side_ratio_pct, 30),
@@ -396,6 +424,10 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.option_x1_pct = cv2.getTrackbarPos("option_x1_pct", controls_window)
     updated.option_y0_pct = cv2.getTrackbarPos("option_y0_pct", controls_window)
     updated.option_y1_pct = cv2.getTrackbarPos("option_y1_pct", controls_window)
+    updated.dynamic_option_roi = cv2.getTrackbarPos("dynamic_option_roi", controls_window)
+    updated.entry_y0_pct = cv2.getTrackbarPos("entry_y0_pct", controls_window)
+    updated.entry_margin_pct = cv2.getTrackbarPos("entry_margin_pct", controls_window)
+    updated.dynamic_option_height_pct = max(1, cv2.getTrackbarPos("dynamic_option_height_pct", controls_window))
     updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", controls_window)
     updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", controls_window)
     updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", controls_window)
@@ -421,7 +453,11 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
 
     draw_box_pct(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255))
     draw_box_pct(overlay, params.ahead_x0_pct, params.ahead_x1_pct, params.roi_y0_pct, params.roi_y1_pct, (255, 255, 0))
-    draw_box_pct(overlay, params.option_x0_pct, params.option_x1_pct, params.option_y0_pct, params.option_y1_pct, (255, 0, 0))
+    opt_x0, opt_x1, opt_y0, opt_y1 = result.option_box_pct
+    draw_box_pct(overlay, opt_x0, opt_x1, opt_y0, opt_y1, (255, 0, 0))
+    if result.entry_y_pct is not None:
+        entry_y = int(h * result.entry_y_pct / 100.0)
+        cv2.line(overlay, (0, entry_y), (w, entry_y), (0, 128, 255), 2)
     draw_box_pct(overlay, params.left_x0_pct, params.left_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
     draw_box_pct(overlay, params.right_x0_pct, params.right_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
 
@@ -435,6 +471,7 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
         f"dash:{result.dashed_count} stable:{result.stable_frames}/{params.stable_frames_needed} "
         f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
         f"ratio L:{result.left_ratio:.3f} S:{result.ahead_ratio:.3f} R:{result.right_ratio:.3f}",
+        f"entry:{result.entry_y_pct if result.entry_y_pct is not None else 'none'} dyn:{params.dynamic_option_roi} opt:{result.option_box_pct}",
         "keys: s save | u undistort | p pause | q quit | cmd: name=value | label=...",
     ]
     y = 24
