@@ -3,6 +3,15 @@
 ROS2 Humble package copied from the working Jetson workspace and set up for the
 laptop/Jetson workflow used in the Manchester projects.
 
+
+## Handoff / Working Memory
+
+For the full current context of what has been implemented, what worked, what failed, current calibration values, and next steps, read:
+
+```text
+docs/HANDOFF_CONTEXT.md
+```
+
 ## Layout
 
 - `puzzlebot_ros/line_follower.py`: current autonomous racer node. It reads the

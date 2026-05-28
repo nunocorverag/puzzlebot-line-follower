@@ -9,6 +9,7 @@ Keys:
   s        save raw/processed/mask/overlay + metadata JSON
   u        toggle undistortion
   p        pause/resume live camera
+  h        toggle compact state panel
 """
 
 from __future__ import annotations
@@ -35,11 +36,14 @@ DEFAULT_OUTPUT_DIR = REPO_DIR / "debug_dataset"
 
 @dataclass
 class CalibrationParams:
-    roi_y0_pct: int = 42
-    roi_y1_pct: int = 82
+    roi_y0_pct: int = 72
+    roi_y1_pct: int = 88
     dash_min_area: int = 40
+    near_dash_min_area: int = 700
+    dynamic_dash_area: int = 1
+    near_dash_y0_pct: int = 72
     dash_max_area: int = 2400
-    rectangularity_pct: int = 45
+    rectangularity_pct: int = 25
     max_aspect_x10: int = 60
     min_dash_count: int = 5
     stable_frames_needed: int = 6
@@ -52,14 +56,18 @@ class CalibrationParams:
     right_x0_pct: int = 62
     right_x1_pct: int = 90
     option_min_dash_count: int = 2
-    option_x0_pct: int = 8
-    option_x1_pct: int = 92
+    option_x0_pct: int = 4
+    option_x1_pct: int = 96
     option_y0_pct: int = 35
     option_y1_pct: int = 68
     dynamic_option_roi: int = 1
     entry_y0_pct: int = 58
-    entry_margin_pct: int = 4
-    dynamic_option_height_pct: int = 28
+    entry_margin_pct: int = 10
+    dynamic_option_height_pct: int = 22
+    split_option_rois: int = 1
+    option_gap_pct: int = 4
+    straight_option_width_pct: int = 24
+    show_state_panel: int = 1
     enable_ratio_fallback: int = 0
     ahead_ratio_pct: int = 6
     side_ratio_pct: int = 8
@@ -80,6 +88,11 @@ class DetectionResult:
     dashed_boxes: list[tuple[int, int, int, int]]
     entry_y_pct: float | None
     option_box_pct: tuple[int, int, int, int]
+    option_roi_boxes: dict[str, tuple[int, int, int, int]]
+    option_counts: dict[str, int]
+    option_valid: dict[str, bool]
+    state_name: str
+    dash_min_area_range: tuple[int, int]
 
 
 def build_gstreamer_pipeline(width: int = 640, height: int = 480, fps: int = 30) -> str:
@@ -163,6 +176,58 @@ def black_ratio(mask: np.ndarray, x0: float, x1: float, y0: float, y1: float) ->
     return float(cv2.countNonZero(roi)) / float(roi.size)
 
 
+
+def build_option_roi_boxes(params: CalibrationParams, option_box: tuple[int, int, int, int]) -> dict[str, tuple[int, int, int, int]]:
+    x0, x1, y0, y1 = option_box
+    gap = max(0, params.option_gap_pct)
+    straight_half = max(4, params.straight_option_width_pct // 2)
+    straight_x0 = max(x0, 50 - straight_half)
+    straight_x1 = min(x1, 50 + straight_half)
+    left_x1 = min(straight_x0 - gap, 50 - gap)
+    right_x0 = max(straight_x1 + gap, 50 + gap)
+    boxes = {
+        "left": (x0, max(x0 + 1, left_x1), y0, y1),
+        "straight": (straight_x0, max(straight_x0 + 1, straight_x1), y0, y1),
+        "right": (min(x1 - 1, right_x0), x1, y0, y1),
+    }
+    return boxes
+
+
+def dashes_in_pct_box(
+    dashed: list[tuple[float, float, int, int, float]],
+    frame_w: int,
+    frame_h: int,
+    box_pct: tuple[int, int, int, int],
+) -> list[tuple[float, float, int, int, float]]:
+    x0, x1, y0, y1 = box_pct
+    px0 = frame_w * x0 / 100.0
+    px1 = frame_w * x1 / 100.0
+    py0 = frame_h * y0 / 100.0
+    py1 = frame_h * y1 / 100.0
+    return [d for d in dashed if px0 <= d[0] <= px1 and py0 <= d[1] <= py1]
+
+
+def aligned_option_pattern(points: list[tuple[float, float, int, int, float]], option: str, min_count: int) -> bool:
+    if len(points) < min_count:
+        return False
+    if option == "straight":
+        return True
+    if len(points) < 2:
+        return False
+    pts = sorted(points, key=lambda d: d[0])
+    xs = np.array([p[0] for p in pts], dtype=np.float32)
+    ys = np.array([p[1] for p in pts], dtype=np.float32)
+    if float(xs.max() - xs.min()) < 8.0:
+        return False
+    slope = float(np.polyfit(xs, ys, 1)[0])
+    # In image coordinates, left-option zebra usually rises toward the center;
+    # right-option zebra usually falls away from the center.
+    if option == "left":
+        return slope < -0.10
+    if option == "right":
+        return slope > 0.10
+    return False
+
 def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_frames: int) -> DetectionResult:
     h, w = frame.shape[:2]
     mask = black_mask(frame)
@@ -174,14 +239,25 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
     boxes: list[tuple[int, int, int, int]] = []
     rectangularity_min = params.rectangularity_pct / 100.0
     max_aspect = max(1.0, params.max_aspect_x10 / 10.0)
+    near_y0 = h * params.near_dash_y0_pct / 100.0
+
+    def min_area_for_y(cy: float) -> float:
+        if not params.dynamic_dash_area:
+            return float(params.dash_min_area)
+        if cy <= near_y0:
+            return float(params.dash_min_area)
+        denom = max(1.0, float(roi_y1) - near_y0)
+        t = min(1.0, max(0.0, (cy - near_y0) / denom))
+        return float(params.dash_min_area) + t * float(params.near_dash_min_area - params.dash_min_area)
 
     for c in contours:
         area = cv2.contourArea(c)
-        if area < params.dash_min_area or area > params.dash_max_area:
-            continue
         x, y, bw, bh = cv2.boundingRect(c)
         y += roi_y0
         if bw < 5 or bh < 5:
+            continue
+        cx, cy = x + bw / 2.0, y + bh / 2.0
+        if area < min_area_for_y(cy) or area > params.dash_max_area:
             continue
         rectangularity = area / float(bw * bh)
         if rectangularity < rectangularity_min:
@@ -189,7 +265,6 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         aspect = max(bw / float(bh), bh / float(bw))
         if aspect > max_aspect:
             continue
-        cx, cy = x + bw / 2.0, y + bh / 2.0
         dashed.append((cx, cy, bw, bh, area))
         boxes.append((x, y, bw, bh))
 
@@ -206,14 +281,25 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
     if params.dynamic_option_roi and entry_y_pct is not None:
         option_y1_pct = max(1, int(entry_y_pct - params.entry_margin_pct))
         option_y0_pct = max(0, option_y1_pct - params.dynamic_option_height_pct)
+    option_box_pct = (option_x0_pct, option_x1_pct, option_y0_pct, option_y1_pct)
     option_x0 = w * option_x0_pct / 100.0
     option_x1 = w * option_x1_pct / 100.0
     option_y0 = h * option_y0_pct / 100.0
     option_y1 = h * option_y1_pct / 100.0
     option_dashed = [d for d in dashed if option_x0 <= d[0] <= option_x1 and option_y0 <= d[1] <= option_y1]
-    left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
-    center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
-    right_dash = [d for d in option_dashed if d[0] > center_x + w * 0.12]
+    option_roi_boxes = build_option_roi_boxes(params, option_box_pct)
+    option_points = {
+        name: dashes_in_pct_box(dashed, w, h, box)
+        for name, box in option_roi_boxes.items()
+    }
+    option_counts = {name: len(points) for name, points in option_points.items()}
+    option_valid = {
+        name: aligned_option_pattern(points, name, params.option_min_dash_count)
+        for name, points in option_points.items()
+    }
+    left_dash = option_points["left"]
+    center_dash = option_points["straight"]
+    right_dash = option_points["right"]
 
     ahead_ratio = black_ratio(
         mask,
@@ -238,21 +324,20 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
     )
 
     raw_detected = len(dashed) >= params.min_dash_count or (
-        len(center_dash) >= params.option_min_dash_count
-        and (len(left_dash) + len(right_dash)) >= params.option_min_dash_count
+        option_counts["straight"] >= params.option_min_dash_count
+        and (option_counts["left"] + option_counts["right"]) >= params.option_min_dash_count
     )
     stable_frames = stable_frames + 1 if raw_detected else 0
     dashed_detected = stable_frames >= params.stable_frames_needed
 
+    state_name = "READ_OPTIONS" if dashed_detected else ("APPROACH_ENTRY" if raw_detected else "FOLLOW_LINE")
     options: list[str] = []
-    if len(left_dash) >= params.option_min_dash_count:
-        options.append("left")
-    if len(center_dash) >= params.option_min_dash_count:
-        options.append("straight")
-    if len(right_dash) >= params.option_min_dash_count:
-        options.append("right")
+    if dashed_detected:
+        for name in ("left", "straight", "right"):
+            if option_valid[name]:
+                options.append(name)
 
-    if params.enable_ratio_fallback:
+    if dashed_detected and params.enable_ratio_fallback:
         if "left" not in options and left_ratio > params.side_ratio_pct / 100.0:
             options.append("left")
         if "straight" not in options and ahead_ratio > params.ahead_ratio_pct / 100.0:
@@ -266,15 +351,23 @@ def analyze_intersection(frame: np.ndarray, params: CalibrationParams, stable_fr
         options=options,
         stable_frames=stable_frames,
         dashed_count=len(dashed),
-        left_dash=len(left_dash),
-        center_dash=len(center_dash),
-        right_dash=len(right_dash),
+        left_dash=option_counts["left"],
+        center_dash=option_counts["straight"],
+        right_dash=option_counts["right"],
         ahead_ratio=ahead_ratio,
         left_ratio=left_ratio,
         right_ratio=right_ratio,
         dashed_boxes=boxes,
         entry_y_pct=entry_y_pct,
-        option_box_pct=(option_x0_pct, option_x1_pct, option_y0_pct, option_y1_pct),
+        option_box_pct=option_box_pct,
+        option_roi_boxes=option_roi_boxes,
+        option_counts=option_counts,
+        option_valid=option_valid,
+        state_name=state_name,
+        dash_min_area_range=(
+            params.dash_min_area,
+            params.near_dash_min_area if params.dynamic_dash_area else params.dash_min_area,
+        ),
     )
 
 
@@ -282,6 +375,9 @@ TRACKBAR_BINDINGS = {
     "roi_y0_pct": ("roi_y0_pct", 0, 95),
     "roi_y1_pct": ("roi_y1_pct", 1, 100),
     "dash_min_area": ("dash_min_area", 1, 2000),
+    "near_dash_min_area": ("near_dash_min_area", 1, 2000),
+    "dynamic_dash_area": ("dynamic_dash_area", 0, 1),
+    "near_dash_y0_pct": ("near_dash_y0_pct", 0, 100),
     "dash_max_area": ("dash_max_area", 2, 5000),
     "rect_pct": ("rect_pct", 0, 100),
     "rectangularity_pct": ("rect_pct", 0, 100),
@@ -299,6 +395,10 @@ TRACKBAR_BINDINGS = {
     "entry_y0_pct": ("entry_y0_pct", 0, 100),
     "entry_margin_pct": ("entry_margin_pct", 0, 30),
     "dynamic_option_height_pct": ("dynamic_option_height_pct", 1, 80),
+    "split_option_rois": ("split_option_rois", 0, 1),
+    "option_gap_pct": ("option_gap_pct", 0, 20),
+    "straight_option_width_pct": ("straight_option_width_pct", 6, 60),
+    "show_state_panel": ("show_state_panel", 0, 1),
     "ratio_fallback": ("ratio_fallback", 0, 1),
     "enable_ratio_fallback": ("ratio_fallback", 0, 1),
     "ahead_ratio_pct": ("ahead_ratio_pct", 0, 30),
@@ -386,6 +486,9 @@ def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
         ("roi_y0_pct", params.roi_y0_pct, 95),
         ("roi_y1_pct", params.roi_y1_pct, 100),
         ("dash_min_area", params.dash_min_area, 2000),
+        ("near_dash_min_area", params.near_dash_min_area, 2000),
+        ("dynamic_dash_area", params.dynamic_dash_area, 1),
+        ("near_dash_y0_pct", params.near_dash_y0_pct, 100),
         ("dash_max_area", params.dash_max_area, 5000),
         ("rect_pct", params.rectangularity_pct, 100),
         ("max_aspect_x10", params.max_aspect_x10, 120),
@@ -400,6 +503,10 @@ def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
         ("entry_y0_pct", params.entry_y0_pct, 100),
         ("entry_margin_pct", params.entry_margin_pct, 30),
         ("dynamic_option_height_pct", params.dynamic_option_height_pct, 80),
+        ("split_option_rois", params.split_option_rois, 1),
+        ("option_gap_pct", params.option_gap_pct, 20),
+        ("straight_option_width_pct", params.straight_option_width_pct, 60),
+        ("show_state_panel", params.show_state_panel, 1),
         ("ratio_fallback", params.enable_ratio_fallback, 1),
         ("ahead_ratio_pct", params.ahead_ratio_pct, 30),
         ("side_ratio_pct", params.side_ratio_pct, 30),
@@ -414,6 +521,9 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.roi_y0_pct = cv2.getTrackbarPos("roi_y0_pct", controls_window)
     updated.roi_y1_pct = cv2.getTrackbarPos("roi_y1_pct", controls_window)
     updated.dash_min_area = max(1, cv2.getTrackbarPos("dash_min_area", controls_window))
+    updated.near_dash_min_area = max(1, cv2.getTrackbarPos("near_dash_min_area", controls_window))
+    updated.dynamic_dash_area = cv2.getTrackbarPos("dynamic_dash_area", controls_window)
+    updated.near_dash_y0_pct = cv2.getTrackbarPos("near_dash_y0_pct", controls_window)
     updated.dash_max_area = max(updated.dash_min_area + 1, cv2.getTrackbarPos("dash_max_area", controls_window))
     updated.rectangularity_pct = cv2.getTrackbarPos("rect_pct", controls_window)
     updated.max_aspect_x10 = max(10, cv2.getTrackbarPos("max_aspect_x10", controls_window))
@@ -428,6 +538,10 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.entry_y0_pct = cv2.getTrackbarPos("entry_y0_pct", controls_window)
     updated.entry_margin_pct = cv2.getTrackbarPos("entry_margin_pct", controls_window)
     updated.dynamic_option_height_pct = max(1, cv2.getTrackbarPos("dynamic_option_height_pct", controls_window))
+    updated.split_option_rois = cv2.getTrackbarPos("split_option_rois", controls_window)
+    updated.option_gap_pct = cv2.getTrackbarPos("option_gap_pct", controls_window)
+    updated.straight_option_width_pct = max(6, cv2.getTrackbarPos("straight_option_width_pct", controls_window))
+    updated.show_state_panel = cv2.getTrackbarPos("show_state_panel", controls_window)
     updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", controls_window)
     updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", controls_window)
     updated.side_ratio_pct = cv2.getTrackbarPos("side_ratio_pct", controls_window)
@@ -451,37 +565,61 @@ def draw_overlay(frame: np.ndarray, result: DetectionResult, params: Calibration
     overlay = frame.copy()
     h, w = overlay.shape[:2]
 
+    # Red: active entry/dash detection band. It stays low and does not define options.
     draw_box_pct(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255))
-    draw_box_pct(overlay, params.ahead_x0_pct, params.ahead_x1_pct, params.roi_y0_pct, params.roi_y1_pct, (255, 255, 0))
-    opt_x0, opt_x1, opt_y0, opt_y1 = result.option_box_pct
-    draw_box_pct(overlay, opt_x0, opt_x1, opt_y0, opt_y1, (255, 0, 0))
     if result.entry_y_pct is not None:
         entry_y = int(h * result.entry_y_pct / 100.0)
         cv2.line(overlay, (0, entry_y), (w, entry_y), (0, 128, 255), 2)
-    draw_box_pct(overlay, params.left_x0_pct, params.left_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
-    draw_box_pct(overlay, params.right_x0_pct, params.right_x1_pct, params.side_y0_pct, params.side_y1_pct, (255, 0, 255))
+
+    if result.dashed_detected and params.split_option_rois:
+        colors = {
+            "left": (255, 0, 255),
+            "straight": (255, 255, 0),
+            "right": (255, 0, 255),
+        }
+        for name, box in result.option_roi_boxes.items():
+            color = (0, 255, 0) if result.option_valid.get(name, False) else colors[name]
+            draw_box_pct(overlay, *box, color)
+    elif result.dashed_detected:
+        draw_box_pct(overlay, *result.option_box_pct, (255, 0, 0))
 
     for x, y, bw, bh in result.dashed_boxes:
         cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
 
     status = "INTERSECTION" if result.dashed_detected else "normal"
     options = ",".join(result.options) if result.options else "none"
-    lines = [
-        f"label:{label} status:{status} options:{options} undistort:{int(undistort_enabled)}",
-        f"dash:{result.dashed_count} stable:{result.stable_frames}/{params.stable_frames_needed} "
-        f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
-        f"ratio L:{result.left_ratio:.3f} S:{result.ahead_ratio:.3f} R:{result.right_ratio:.3f}",
-        f"entry:{result.entry_y_pct if result.entry_y_pct is not None else 'none'} dyn:{params.dynamic_option_roi} opt:{result.option_box_pct}",
-        "keys: s save | u undistort | p pause | q quit | cmd: name=value | label=...",
-    ]
-    y = 24
-    for line in lines:
-        cv2.putText(overlay, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-        cv2.putText(overlay, line, (12, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
-        y += 24
+    line = f"{result.state_name} | {status} | opt:{options} | dash:{result.dashed_count} | area:{result.dash_min_area_range[0]}->{result.dash_min_area_range[1]}"
+    cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+    cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     cv2.line(overlay, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
     return overlay
 
+
+def draw_state_panel(result: DetectionResult, params: CalibrationParams, undistort_enabled: bool, label: str, paused: bool) -> np.ndarray:
+    panel = np.zeros((360, 560, 3), dtype=np.uint8)
+    rows = [
+        ("STATE", result.state_name),
+        ("label", label),
+        ("paused", str(int(paused))),
+        ("undistort", str(int(undistort_enabled))),
+        ("stable", f"{result.stable_frames}/{params.stable_frames_needed}"),
+        ("dash", str(result.dashed_count)),
+        ("options", ",".join(result.options) if result.options else "none"),
+        ("counts", f"L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}"),
+        ("valid", " ".join(f"{k}:{int(v)}" for k, v in result.option_valid.items())),
+        ("entry_y", f"{result.entry_y_pct:.1f}" if result.entry_y_pct is not None else "none"),
+        ("entry_roi", f"red y:{params.roi_y0_pct}-{params.roi_y1_pct}"),
+        ("option_roi", f"{result.option_box_pct}"),
+        ("area", f"min {result.dash_min_area_range[0]}->{result.dash_min_area_range[1]} near_y {params.near_dash_y0_pct}"),
+        ("keys", "s save | p pause | h panel | q quit"),
+        ("jog", "scripts/jog_forward_jetson.sh 0.04 1.5"),
+    ]
+    y = 28
+    for key, value in rows:
+        color = (0, 255, 0) if key == "STATE" and value == "READ_OPTIONS" else (0, 255, 255)
+        cv2.putText(panel, f"{key}: {value}", (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
+        y += 22
+    return panel
 
 def save_sample(
     output_dir: Path,
@@ -557,12 +695,15 @@ def main() -> int:
     image_window = "Line Vision Calibrator"
     controls_window = "Controls"
     mask_window = "Mask"
+    state_window = "State"
     cv2.namedWindow(image_window, cv2.WINDOW_NORMAL)
     cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
     cv2.namedWindow(mask_window, cv2.WINDOW_NORMAL)
+    cv2.namedWindow(state_window, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(image_window, args.width, args.height)
     cv2.resizeWindow(mask_window, args.width, args.height)
     cv2.resizeWindow(controls_window, 760, 520)
+    cv2.resizeWindow(state_window, 560, 360)
     params = CalibrationParams()
     create_trackbars(controls_window, params)
     command_queue: queue.Queue[str] = queue.Queue()
@@ -604,6 +745,8 @@ def main() -> int:
         overlay = draw_overlay(processed, result, params, undistort_enabled, state["label"])
         cv2.imshow(image_window, overlay)
         cv2.imshow(mask_window, mask)
+        if params.show_state_panel:
+            cv2.imshow(state_window, draw_state_panel(result, params, undistort_enabled, state["label"], paused))
 
         key = cv2.waitKey(0 if frames else 1) & 0xFF
         if key in (ord("q"), 27):
@@ -616,6 +759,8 @@ def main() -> int:
         elif key == ord("p"):
             paused = not paused
             print(f"[info] paused={paused}")
+        elif key == ord("h"):
+            cv2.setTrackbarPos("show_state_panel", controls_window, 0 if params.show_state_panel else 1)
         elif frames and key in (ord("n"), ord(" ")):
             frame_index = (frame_index + 1) % len(frames)
             stable_frames = 0
