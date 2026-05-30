@@ -96,9 +96,10 @@ class DetectionResult:
 
 
 def build_gstreamer_pipeline(width: int = 640, height: int = 480, fps: int = 30) -> str:
+    # Capture at native 1280x720 — caller must cv2.resize to target resolution.
     return (
         "nvarguscamerasrc sensor-id=0 ! "
-        f"video/x-raw(memory:NVMM), width={width}, height={height}, framerate={fps}/1 ! "
+        "video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! "
         "nvvidconv ! video/x-raw, format=BGRx ! "
         "videoconvert ! video/x-raw, format=BGR ! "
         "appsink max-buffers=1 drop=true"

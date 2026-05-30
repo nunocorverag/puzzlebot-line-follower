@@ -18,7 +18,7 @@ def generate_launch_description():
         {"height": 720},
         {"codec": "unknown"},
         {"loop": 0},
-        {"latency": 2000}
+        {"latency": 2000},
         ],
         output='screen'
     )
