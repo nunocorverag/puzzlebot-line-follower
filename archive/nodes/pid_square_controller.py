@@ -18,7 +18,7 @@ Control architecture:
     - Uses odometry feedback for closed-loop control
 
 FSM states:
-    IDLE → ROTATE_TO_GOAL → DRIVE_TO_GOAL → (repeat for 4 corners) → STOP
+    IDLE -> ROTATE_TO_GOAL -> DRIVE_TO_GOAL -> (repeat for 4 corners) -> STOP
 """
 
 import rclpy

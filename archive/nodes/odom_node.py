@@ -28,7 +28,7 @@ class SimpleOdom(Node):
 
         self.prev_time = self.get_clock().now()
 
-        # 🔥 QoS compatible con micro-ROS
+        #  QoS compatible con micro-ROS
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
