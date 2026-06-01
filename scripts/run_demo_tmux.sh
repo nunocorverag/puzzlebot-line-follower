@@ -32,7 +32,7 @@ tmux send-keys -t "${P_MICRO}" \
   "ssh ${JETSON_USER}@${JETSON_HOST} 'bash -lc \"source /opt/ros/humble/setup.bash; source ${REMOTE_WS}/src/puzzlebot_ros/env_jetson.sh; source ~/ros2_packages_ws/install/setup.bash 2>/dev/null || true; ros2 run micro_ros_agent micro_ros_agent serial -D /dev/ttyUSB0 -v 6\"'" C-m
 
 tmux send-keys -t "${P_LINE}" \
-  "while [ ! -f ${READY_FILE} ]; do echo 'Waiting for Jetson build...'; sleep 1; done; xhost +local: >/dev/null 2>&1 || true; ssh -X ${JETSON_USER}@${JETSON_HOST} 'bash -lc \"cd ${REMOTE_WS}; source /opt/ros/humble/setup.bash; source src/puzzlebot_ros/env_jetson.sh; source install/setup.bash; ros2 run puzzlebot_ros line_follower\"'" C-m
+  "while [ ! -f ${READY_FILE} ]; do echo 'Waiting for Jetson build...'; sleep 1; done; xhost +local: >/dev/null 2>&1 || true; ssh -X ${JETSON_USER}@${JETSON_HOST} 'bash -lc \"cd ${REMOTE_WS}; source /opt/ros/humble/setup.bash; source src/puzzlebot_ros/env_jetson.sh; source install/setup.bash; export PYTHONNOUSERSITE=1; ros2 run puzzlebot_ros line_follower\"'" C-m
 
 tmux send-keys -t "${P_MONITOR}" \
   "ssh ${JETSON_USER}@${JETSON_HOST} 'bash -lc \"source /opt/ros/humble/setup.bash; source ${REMOTE_WS}/src/puzzlebot_ros/env_jetson.sh; source ${REMOTE_WS}/install/setup.bash; watch -n 1 ros2 topic list\"'" C-m

@@ -14,7 +14,7 @@ class MotorStopNode(Node):
         # Timer to publish 10 times a second (10 Hz)
         self.timer = self.create_timer(0.1, self.publish_zeros)
         
-        self.get_logger().info("🛑 Motor Stop Node active. Forcing motors to 0.0...")
+        self.get_logger().info("Motor Stop Node active. Forcing motors to 0.0...")
         self.get_logger().info("Press Ctrl+C to kill this node.")
 
     def publish_zeros(self):

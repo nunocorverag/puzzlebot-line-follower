@@ -15,6 +15,7 @@ xhost +local: >/dev/null 2>&1 || true
 
 ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   cd "${REMOTE_PACKAGE}"
+  export PYTHONNOUSERSITE=1
   python3 tools/line_vision_calibrator.py \
     --gstreamer \
     --camera-params config/camera_params.npz \
