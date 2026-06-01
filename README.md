@@ -17,9 +17,16 @@ docs/HANDOFF_CONTEXT.md
 - `puzzlebot_ros/line_follower.py`: current autonomous racer node. It reads the
   Jetson CSI camera, follows the line, handles traffic-light state, publishes
   `/cmd_vel`, and exposes MJPEG on `http://10.10.0.100:8080`.
-- `puzzlebot_ros/line_detector.py`: simpler dual-ROI line follower.
-- `launch/`: original Puzzlebot launch files from the Jetson package.
-- `scripts/`: sync, build, run, tmux demo, and stop helpers.
+- `puzzlebot_ros/traffic_light.py`: standalone HSV traffic-light node.
+- `puzzlebot_ros/pictures.py`: chessboard capture for camera intrinsics.
+- `puzzlebot_ros/stopnoise.py`: emergency zero-`/cmd_vel` helper node.
+- `tools/`: non-ROS perception tools (line/illumination calibrators, recorders,
+  YOLO sign detector).
+- `launch/`: active launch files (`camera_jetson`, `micro_ros_agent`).
+- `scripts/`: sync, build, run, calibrate, tmux demo, and stop helpers.
+  **See `docs/SCRIPTS.md` for a full catalog of every script and tool.**
+- `archive/`: nodes/launch from earlier course modules, kept out of the build.
+  See `archive/README.md`.
 
 ## Jetson Defaults
 

@@ -1,6 +1,49 @@
 # Puzzlebot Line Follower - Handoff Context
 
-Last updated: 2026-05-28
+Last updated: 2026-05-31
+
+## Update 2026-05-31 — Perception unified + repo cleanup
+
+Diagnostic pass + first refactor. Done:
+
+- **Shared perception module** `puzzlebot_ros/perception/intersection.py` is now
+  the single source of truth (`analyze_intersection`, `IntersectionParams`).
+  Both `tools/line_vision_calibrator.py` and `puzzlebot_ros/line_follower.py`
+  import it, so they can no longer diverge. The calibrator was validated to be
+  behavior-identical (0 mismatch over 92 dataset frames).
+- **Runtime ported**: `line_follower.py._analyze_intersection` no longer runs the
+  old permissive logic (fixed high ROI + ratio fallback). It uses the module,
+  with the calibrator's dynamic entry ROI, split L/S/R options, dynamic dash
+  area, and geometric validation. Stability is the module's `stable_frames_needed`.
+- **Two-band detection** added to fix a real bug: dashes were only scanned in the
+  low trigger band (72–88%) while option ROIs sat at ~40–70% (never scanned), so
+  options were always empty. Now a wider band (`option_scan_y0_pct`, default 38)
+  is scanned for option classification, while only low-band dashes drive the
+  trigger. Offline validation: 0 false positives on normal/side_lane/curve/finish;
+  true_intersection now reports left/straight/right.
+- Decision callback now accepts any direction when no options were classified
+  (detected zebra but ambiguous geometry), instead of blocking.
+- **Repo cleanup**: out-of-scope course nodes/launch moved to `archive/`
+  (see `archive/README.md`); `setup.py` trimmed; `docs/SCRIPTS.md` added.
+
+Still pending (priority order):
+
+1. Live-test the ported runtime on the robot (wheels up first), tune
+   `option_scan_y0_pct` / slope thresholds against real approaches.
+2. Capture a `false_intersection` label set (still missing) and re-tune offline.
+3. Recalibrate camera **intrinsics** with `pictures.py` on the real CSI camera
+   (current `camera_params.npz` is from a different camera, rms 2.23).
+4. Fix the illumination "mancha": recapture a uniform flat-field or switch to
+   luminance-only / CLAHE.
+5. Expose tunables as ROS params + `config/line_follower.yaml`.
+6. Factor `scripts/lib/common.sh` to homogenize the SSH/sourcing boilerplate.
+7. Pick a canonical traffic-light/sign path (YOLO) and drop the duplicate HSV.
+
+---
+
+_Original handoff (2026-05-28) below._
+
+Original last updated: 2026-05-28
 
 This document is the working memory for the Puzzlebot line follower project. It
 captures what was built, what worked, what failed, the current calibration logic,
