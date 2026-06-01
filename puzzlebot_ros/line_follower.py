@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import os
+
 import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -10,38 +12,61 @@ import cv2
 import numpy as np
 import threading
 from pathlib import Path
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-# ── MJPEG server ──────────────────────────────────────────────
+from puzzlebot_ros.perception.intersection import IntersectionParams, analyze_intersection
+
+
+# MJPEG server -------------------------------------------------
+# Event-driven: each client connection blocks until a NEW frame is published
+# and sends it exactly once. The previous implementation busy-looped and
+# re-sent the same frame as fast as the socket allowed, flooding the link with
+# duplicate frames and causing the laggy stream.
 class _MJPEGHandler(BaseHTTPRequestHandler):
-    _lock  = threading.Lock()
-    _frame = None                       # bytes JPEG actuales
+    _cond = threading.Condition()
+    _frame = None       # latest JPEG bytes
+    _seq = 0            # increments on every new frame
+
+    @classmethod
+    def update_frame(cls, data):
+        with cls._cond:
+            cls._frame = data
+            cls._seq += 1
+            cls._cond.notify_all()
 
     def do_GET(self):
         self.send_response(200)
-        self.send_header('Content-type',
-                         'multipart/x-mixed-replace; boundary=frame')
+        self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
+        self.send_header('Cache-Control', 'no-cache, private')
+        self.send_header('Connection', 'close')
         self.end_headers()
+        last_seq = -1
         while True:
-            with _MJPEGHandler._lock:
+            with _MJPEGHandler._cond:
+                while _MJPEGHandler._seq == last_seq:
+                    _MJPEGHandler._cond.wait(timeout=5.0)
                 data = _MJPEGHandler._frame
-            if data:
-                try:
-                    self.wfile.write(
-                        b'--frame\r\nContent-Type: image/jpeg\r\n\r\n'
-                        + data + b'\r\n'
-                    )
-                except BrokenPipeError:
-                    break
+                last_seq = _MJPEGHandler._seq
+            if not data:
+                continue
+            try:
+                self.wfile.write(
+                    b'--frame\r\nContent-Type: image/jpeg\r\nContent-Length: '
+                    + str(len(data)).encode() + b'\r\n\r\n' + data + b'\r\n'
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                break
 
-    def log_message(self, *_):          # silencia el log del servidor
+    def log_message(self, *_):          # silence the default server logging
         pass
 
+
 def _start_mjpeg_server(port=8080):
-    srv = HTTPServer(('0.0.0.0', port), _MJPEGHandler)
+    srv = ThreadingHTTPServer(('0.0.0.0', port), _MJPEGHandler)
+    srv.daemon_threads = True
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv
-# ──────────────────────────────────────────────────────────────
+# --------------------------------------------------------------
 
 class AutonomousRacer(Node):
 
@@ -76,6 +101,42 @@ class AutonomousRacer(Node):
         self.declare_parameter('camera_params_path', '')
         self.declare_parameter('use_illumination_correction', True)
         self.declare_parameter('illumination_params_path', '')
+        # MJPEG stream tuning. Lower quality / fps / a capped width all cut
+        # bandwidth, which is the usual cause of a laggy preview over WiFi.
+        self.declare_parameter('stream_fps', 15)
+        self.declare_parameter('stream_quality', 60)
+        self.declare_parameter('stream_max_width', 0)   # 0 = keep full width
+        self._stream_quality = int(self.get_parameter('stream_quality').value)
+        self._stream_max_width = int(self.get_parameter('stream_max_width').value)
+        stream_fps = max(1, int(self.get_parameter('stream_fps').value))
+        self._stream_min_period = 1.0 / stream_fps
+        self._last_stream_time = None
+
+        # Optional hardware-encoded H264/RTP-over-UDP stream. Far lower bandwidth
+        # than MJPEG because it compresses between frames using the Jetson's
+        # nvv4l2h264enc encoder. Opt-in: stream_mode=h264 + h264_host=<laptop IP>.
+        # Receive on the laptop with scripts/view_h264_stream.sh.
+        self.declare_parameter('stream_mode', 'mjpeg')   # 'mjpeg' or 'h264'
+        self.declare_parameter('h264_host', '')          # laptop IP for the UDP sink
+        self.declare_parameter('h264_port', 5000)
+        self.declare_parameter('h264_bitrate', 2000000)  # bits/s
+        self._stream_mode = str(self.get_parameter('stream_mode').value).strip().lower()
+        self._h264_host = str(self.get_parameter('h264_host').value).strip()
+        self._h264_port = int(self.get_parameter('h264_port').value)
+        self._h264_bitrate = int(self.get_parameter('h264_bitrate').value)
+        self._h264_writer = None
+        self._h264_init_failed = False
+        if self._stream_mode == 'h264' and not self._h264_host:
+            self.get_logger().error(
+                'stream_mode=h264 needs h264_host (laptop IP). Falling back to MJPEG.'
+            )
+            self._stream_mode = 'mjpeg'
+
+        self.declare_parameter('show_window', False)
+        requested_window = bool(self.get_parameter('show_window').value)
+        self.show_window = requested_window and bool(os.environ.get('DISPLAY'))
+        if requested_window and not self.show_window:
+            self.get_logger().warn('show_window requested, but DISPLAY is not set; running headless.')
         self.illumination_gain = self._load_illumination_gain()
         self.camera_matrix, self.dist_coeffs = self._load_camera_params()
 
@@ -100,10 +161,14 @@ class AutonomousRacer(Node):
         self.max_jump_distance = 80
         self.time_line_lost = None
 
+        # Intersection detection now uses the shared perception module so the
+        # robot behaves exactly like what was tuned in the calibrator.
+        self.intersection_params = IntersectionParams()
+        self.intersection_stable = 0          # consecutive-frame counter (threaded into the detector)
+        self.intersection_result = None       # latest detector result while a prompt is pending
         self.intersection_pending = False
         self.intersection_options = []
         self.intersection_decision = None
-        self.intersection_frames = 0
         self.last_prompt_time = None
         self.commit_direction = None
         self.commit_until = None
@@ -213,7 +278,9 @@ class AutonomousRacer(Node):
                 f"Intersection decision '{msg.data}' ignored. Use left, straight, or right."
             )
             return
-        if self.intersection_pending and normalized not in self.intersection_options:
+        # Only enforce the option list when we actually classified some options.
+        # If detection fired but no direction could be validated, trust the operator.
+        if self.intersection_pending and self.intersection_options and normalized not in self.intersection_options:
             self.get_logger().warn(
                 f"Decision '{normalized}' not in current options: {', '.join(self.intersection_options)}"
             )
@@ -221,82 +288,71 @@ class AutonomousRacer(Node):
         self.intersection_decision = normalized
         self.get_logger().info(f"Intersection decision received: {normalized}")
 
-    def _black_mask(self, frame):
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        blurred = cv2.GaussianBlur(gray, (5, 5), 1.4)
-        _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        kernel = np.ones((3, 3), np.uint8)
-        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    def _ensure_h264_writer(self, frame):
+        """Lazily open the hardware H264 GStreamer writer once the frame size is known."""
+        if self._h264_writer is not None:
+            return self._h264_writer.isOpened()
+        if self._h264_init_failed:
+            return False
+        h, w = frame.shape[:2]
+        fps = max(1, int(round(1.0 / self._stream_min_period)))
+        pipeline = (
+            "appsrc is-live=true do-timestamp=true ! "
+            f"video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 ! "
+            "videoconvert ! video/x-raw,format=BGRx ! "
+            "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
+            f"nvv4l2h264enc insert-sps-pps=1 idrinterval={fps} bitrate={self._h264_bitrate} maxperf-enable=1 ! "
+            "h264parse ! rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={self._h264_host} port={self._h264_port} sync=false async=false"
+        )
+        writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, float(fps), (w, h), True)
+        if not writer.isOpened():
+            self._h264_init_failed = True
+            self.get_logger().error('Could not open H264 GStreamer writer; check nvv4l2h264enc.')
+            return False
+        self._h264_writer = writer
+        self.get_logger().info(
+            f"H264 UDP stream -> {self._h264_host}:{self._h264_port} "
+            f"@ {fps}fps {self._h264_bitrate // 1000}kbps"
+        )
+        return True
 
-    def _black_ratio(self, mask, x0, x1, y0, y1):
-        h, w = mask.shape[:2]
-        x0 = max(0, min(w, int(x0)))
-        x1 = max(0, min(w, int(x1)))
-        y0 = max(0, min(h, int(y0)))
-        y1 = max(0, min(h, int(y1)))
-        if x1 <= x0 or y1 <= y0:
-            return 0.0
-        roi = mask[y0:y1, x0:x1]
-        return float(cv2.countNonZero(roi)) / float(roi.size)
+    def _publish_stream_frame(self, frame):
+        """Throttle and push the annotated frame to the active stream (MJPEG or H264)."""
+        now = self.get_clock().now()
+        if (self._last_stream_time is not None
+                and (now - self._last_stream_time).nanoseconds * 1e-9 < self._stream_min_period):
+            return
+        self._last_stream_time = now
+
+        if self._stream_mode == 'h264':
+            if self._ensure_h264_writer(frame):
+                self._h264_writer.write(frame)
+                return
+            # Writer unavailable: degrade to MJPEG for the rest of the session.
+            self._stream_mode = 'mjpeg'
+            self.get_logger().error('H264 stream unavailable; using MJPEG at :8080 instead.')
+
+        stream_frame = frame
+        if self._stream_max_width and frame.shape[1] > self._stream_max_width:
+            scale = self._stream_max_width / float(frame.shape[1])
+            stream_frame = cv2.resize(
+                frame,
+                (self._stream_max_width, int(frame.shape[0] * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+        ok, jpeg = cv2.imencode('.jpg', stream_frame, [cv2.IMWRITE_JPEG_QUALITY, self._stream_quality])
+        if ok:
+            _MJPEGHandler.update_frame(jpeg.tobytes())
 
     def _analyze_intersection(self, frame):
-        h, w = frame.shape[:2]
-        mask = self._black_mask(frame)
-        roi_y0, roi_y1 = int(h * 0.42), int(h * 0.82)
-        contours, _ = cv2.findContours(mask[roi_y0:roi_y1, :], cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        """Run the shared intersection detector, threading the stability count."""
+        result = analyze_intersection(frame, self.intersection_params, self.intersection_stable)
+        self.intersection_stable = result.stable_frames
+        return result
 
-        dashed = []
-        for c in contours:
-            area = cv2.contourArea(c)
-            if area < 40 or area > 2400:
-                continue
-            x, y, bw, bh = cv2.boundingRect(c)
-            y += roi_y0
-            if bw < 5 or bh < 5:
-                continue
-            rectangularity = area / float(bw * bh)
-            if rectangularity < 0.45:
-                continue
-            aspect = max(bw / float(bh), bh / float(bw))
-            if aspect > 6.0:
-                continue
-            cx, cy = x + bw / 2.0, y + bh / 2.0
-            dashed.append((cx, cy, bw, bh, area))
-
-        center_x = w / 2.0
-        option_x0, option_x1 = w * 0.08, w * 0.92
-        option_y0, option_y1 = h * 0.35, h * 0.68
-        option_dashed = [d for d in dashed if option_x0 <= d[0] <= option_x1 and option_y0 <= d[1] <= option_y1]
-        left_dash = [d for d in option_dashed if d[0] < center_x - w * 0.12]
-        center_dash = [d for d in option_dashed if abs(d[0] - center_x) <= w * 0.18]
-        right_dash = [d for d in option_dashed if d[0] > center_x + w * 0.12]
-
-        ahead_ratio = self._black_ratio(mask, w * 0.38, w * 0.62, h * 0.20, h * 0.54)
-        left_ratio = self._black_ratio(mask, w * 0.05, w * 0.42, h * 0.36, h * 0.70)
-        right_ratio = self._black_ratio(mask, w * 0.58, w * 0.95, h * 0.36, h * 0.70)
-
-        dashed_detected = len(dashed) >= 5 or (len(center_dash) >= 2 and (len(left_dash) + len(right_dash)) >= 2)
-        options = []
-        if len(left_dash) >= 2:
-            options.append('left')
-        if len(center_dash) >= 2:
-            options.append('straight')
-        if len(right_dash) >= 2:
-            options.append('right')
-
-        debug = {
-            'dashed_count': len(dashed),
-            'left_dash': len(left_dash),
-            'center_dash': len(center_dash),
-            'right_dash': len(right_dash),
-            'ahead_ratio': ahead_ratio,
-            'left_ratio': left_ratio,
-            'right_ratio': right_ratio,
-        }
-        return dashed_detected, options, debug
-
-    def _publish_intersection_prompt(self, options, debug):
-        option_text = ', '.join(options) if options else 'none'
+    def _publish_intersection_prompt(self, result):
+        option_text = ', '.join(result.options) if result.options else 'none'
         msg = String()
         msg.data = (
             f"Intersection detected. Options: {option_text}. "
@@ -305,19 +361,34 @@ class AutonomousRacer(Node):
         )
         self.intersection_prompt_pub.publish(msg)
         self.get_logger().warn(
-            f"[INTERSECTION] Waiting for decision. Options: {option_text}. Debug: {debug}"
+            f"[INTERSECTION] Waiting for decision. Options: {option_text}. "
+            f"dash={result.dashed_count} L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}"
         )
 
-    def _draw_intersection_overlay(self, frame, options, debug):
+    def _draw_intersection_overlay(self, frame, result):
         h, w = frame.shape[:2]
         cv2.putText(frame, 'INTERSECTION - WAITING', (20, 34),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-        cv2.putText(frame, f"options: {', '.join(options)}", (20, 64),
+        opt_text = ', '.join(result.options) if result.options else 'none'
+        cv2.putText(frame, f"options: {opt_text}", (20, 64),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 255), 2)
-        cv2.rectangle(frame, (int(w * 0.38), int(h * 0.20)), (int(w * 0.62), int(h * 0.54)), (255, 255, 0), 2)
-        cv2.rectangle(frame, (int(w * 0.05), int(h * 0.36)), (int(w * 0.42), int(h * 0.70)), (255, 0, 255), 2)
-        cv2.rectangle(frame, (int(w * 0.58), int(h * 0.36)), (int(w * 0.95), int(h * 0.70)), (255, 0, 255), 2)
-        cv2.putText(frame, f"dash:{debug['dashed_count']} L:{debug['left_dash']} S:{debug['center_dash']} R:{debug['right_dash']}",
+        # Red entry/trigger band + orange detected entry line.
+        ry0 = int(h * self.intersection_params.roi_y0_pct / 100.0)
+        ry1 = int(h * self.intersection_params.roi_y1_pct / 100.0)
+        cv2.rectangle(frame, (0, ry0), (w, ry1), (0, 0, 255), 2)
+        if result.entry_y_pct is not None:
+            ey = int(h * result.entry_y_pct / 100.0)
+            cv2.line(frame, (0, ey), (w, ey), (0, 128, 255), 2)
+        # Option ROIs: green when geometrically validated, magenta otherwise.
+        for name, box in result.option_roi_boxes.items():
+            x0p, x1p, y0p, y1p = box
+            p0 = (int(w * x0p / 100.0), int(h * y0p / 100.0))
+            p1 = (int(w * x1p / 100.0), int(h * y1p / 100.0))
+            color = (0, 255, 0) if result.option_valid.get(name, False) else (255, 0, 255)
+            cv2.rectangle(frame, p0, p1, color, 2)
+        for x, y, bw, bh in result.dashed_boxes:
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 255), 1)
+        cv2.putText(frame, f"dash:{result.dashed_count} L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
                     (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
     # =============================================================
@@ -362,7 +433,7 @@ class AutonomousRacer(Node):
         MAX_JUMP = self.anchor_max_jump
 
         # If anchors are not yet set, do a one-time bootstrap by sorting
-        # the candidates by X and assigning left→middle→right in order.
+        # the candidates by X and assigning left->middle->right in order.
         if anchor_left is None and anchor_middle is None and anchor_right is None:
             if len(candidates) >= 3:
                 by_x = sorted(candidates, key=lambda c: c['cx'])[:3]
@@ -608,38 +679,42 @@ class AutonomousRacer(Node):
         # ---------------------------------------------------------
         # 2. INTERSECTION / DASHED-LINE PERCEPTION
         # ---------------------------------------------------------
-        dashed_detected, intersection_options, intersection_debug = self._analyze_intersection(frame)
-
         cooldown_active = (
             self.intersection_cooldown_until is not None
             and now < self.intersection_cooldown_until
         )
-        if dashed_detected and not cooldown_active and self.commit_direction is None:
-            self.intersection_frames += 1
+        if cooldown_active or self.commit_direction is not None:
+            # Suppress detection while committing a turn or cooling down.
+            self.intersection_stable = 0
+            result = None
         else:
-            self.intersection_frames = 0
+            result = self._analyze_intersection(frame)
+            self.intersection_result = result
 
-        if self.intersection_frames >= 4 and not self.intersection_pending:
+        # The detector itself requires stable_frames_needed consecutive frames,
+        # so dashed_detected is already debounced.
+        if result is not None and result.dashed_detected and not self.intersection_pending:
             self.intersection_pending = True
-            self.intersection_options = intersection_options
+            self.intersection_options = result.options
             self.intersection_decision = None
             self.last_prompt_time = None
 
         if self.intersection_pending:
-            self._draw_intersection_overlay(frame, self.intersection_options, intersection_debug)
+            draw_result = self.intersection_result
+            if draw_result is not None:
+                self.intersection_options = draw_result.options
+                self._draw_intersection_overlay(frame, draw_result)
             should_prompt = self.last_prompt_time is None or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0
-            if should_prompt:
-                self._publish_intersection_prompt(self.intersection_options, intersection_debug)
+            if should_prompt and draw_result is not None:
+                self._publish_intersection_prompt(draw_result)
                 self.last_prompt_time = now
 
             if self.intersection_decision is None:
                 self.cmd_pub.publish(Twist())
-                ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                if ok:
-                    with _MJPEGHandler._lock:
-                        _MJPEGHandler._frame = jpeg.tobytes()
-                cv2.imshow("Frame", frame)
-                cv2.waitKey(1)
+                self._publish_stream_frame(frame)
+                if self.show_window:
+                    cv2.imshow("Frame", frame)
+                    cv2.waitKey(1)
                 return
 
             self.commit_direction = self.intersection_decision
@@ -647,7 +722,8 @@ class AutonomousRacer(Node):
             self.intersection_pending = False
             self.intersection_options = []
             self.intersection_decision = None
-            self.intersection_frames = 0
+            self.intersection_stable = 0
+            self.intersection_result = None
             self.intersection_cooldown_until = now + Duration(seconds=3.0)
 
         # ---------------------------------------------------------
@@ -795,18 +871,19 @@ class AutonomousRacer(Node):
 
         # Debug Visuals
         cv2.line(frame, (int(frame_center_x), 0), (int(frame_center_x), h), (0, 255, 255), 2)
-        cv2.imshow("Frame", frame)
-        cv2.waitKey(1)
+        if self.show_window:
+            cv2.imshow("Frame", frame)
+            cv2.waitKey(1)
 
-        # Publicar frame al stream MJPEG
-        ok, jpeg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-        if ok:
-            with _MJPEGHandler._lock:
-                _MJPEGHandler._frame = jpeg.tobytes()
+        # Push the annotated frame to the MJPEG stream.
+        self._publish_stream_frame(frame)
 
     def destroy_node(self):
         self.cap.release()
-        cv2.destroyAllWindows()
+        if self._h264_writer is not None:
+            self._h264_writer.release()
+        if self.show_window:
+            cv2.destroyAllWindows()
         super().destroy_node()
 
 
