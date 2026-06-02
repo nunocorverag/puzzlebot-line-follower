@@ -33,7 +33,7 @@ class WaypointFollower(Node):
         self.waypoints = []
         self.index = 0
 
-        #  IMPORTANTE: inicia detenido SIEMPRE
+        #  IMPORTANT: always start stopped
         self.finished = True
 
         self.get_logger().info("Waypoint follower initialized in STOP mode")
@@ -60,7 +60,7 @@ class WaypointFollower(Node):
             msg.pose.position.y
         ))
 
-        # si llega primer waypoint, activa ejecución
+        # when the first waypoint arrives, enable execution
         if self.finished:
             self.finished = False
             self.index = 0
@@ -69,7 +69,7 @@ class WaypointFollower(Node):
     # ---------------- CONTROL ----------------
     def control_loop(self):
 
-        #  STOP TOTAL SI NO HAY TRAJECTORY
+        #  FULL STOP IF THERE IS NO TRAJECTORY
         if self.finished or len(self.waypoints) == 0:
             self.pub_cmd.publish(Twist())
             return
@@ -122,7 +122,7 @@ def main():
     except KeyboardInterrupt:
         pass
 
-    #  STOP de emergencia al salir SIEMPRE
+    #  Emergency STOP on exit, always
     node.pub_cmd.publish(Twist())
 
     node.destroy_node()

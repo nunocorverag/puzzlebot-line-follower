@@ -15,9 +15,9 @@ class SimpleOdom(Node):
     def __init__(self):
         super().__init__('simple_odom')
 
-        # PARAMS (ajústalos luego si hace falta)
-        self.r = 0.05      # radio rueda (m)
-        self.L = 0.19      # distancia entre ruedas (m)
+        # PARAMS (tune them later if needed)
+        self.r = 0.05      # wheel radius (m)
+        self.L = 0.19      # wheel separation (m)
 
         self.v_l = 0.0
         self.v_r = 0.0
@@ -28,7 +28,7 @@ class SimpleOdom(Node):
 
         self.prev_time = self.get_clock().now()
 
-        #  QoS compatible con micro-ROS
+        #  QoS compatible with micro-ROS
         qos = QoSProfile(depth=10)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
 
@@ -55,7 +55,7 @@ class SimpleOdom(Node):
         if dt <= 0:
             return
 
-        # Modelo diferencial
+        # Differential model
         v = self.r * (self.v_r + self.v_l) / 2.0
         w = self.r * (self.v_r - self.v_l) / self.L
 
@@ -63,7 +63,7 @@ class SimpleOdom(Node):
         self.y += v * np.sin(self.theta) * dt
         self.theta += w * dt
 
-        # Crear mensaje
+        # Build message
         msg = Odometry()
         msg.header.stamp = now.to_msg()
         msg.header.frame_id = "odom"
