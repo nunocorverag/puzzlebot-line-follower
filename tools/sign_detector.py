@@ -26,22 +26,17 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
 from std_msgs.msg import String
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from line_vision_calibrator import load_camera_params, load_illumination_gain, apply_illumination_gain
-
-
-def imgmsg_to_cv2(msg: Image) -> np.ndarray:
-    channels = {"bgr8": 3, "rgb8": 3, "mono8": 1}.get(msg.encoding, 3)
-    frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, channels)
-    if msg.encoding == "rgb8":
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    return frame.copy()
-
-
 REPO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_DIR))
+from puzzlebot_ros.perception.camera import (  # noqa: E402
+    load_camera_params,
+    load_illumination_gain,
+    open_csi_capture,
+    preprocess_frame,
+)
+from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 MODEL_PATH = REPO_DIR / "config" / "best.pt"
 
 # BGR colors for YOLO sign classes
@@ -93,18 +88,19 @@ class SignDetectorNode(Node):
         self.tl_kernel = np.ones((5, 5), np.uint8)
         self.tl_last_state = "NONE"
 
-        # --- Camera subscription ---
-        self.latest_frame = None
-        self.create_subscription(Image, "/video_source/raw", self._image_cb, 10)
-        self.get_logger().info("Subscribed to /video_source/raw")
+        # --- Camera (direct CSI capture; self-contained, no separate node) ---
+        self.cap = open_csi_capture(width=640, height=480, fps=30,
+                                    log=self.get_logger().info)
+        if self.cap is None:
+            self.get_logger().error("Could not open CSI camera.")
+            raise RuntimeError("camera unavailable")
 
         # --- Publishers ---
         self.sign_pub = self.create_publisher(String, "/sign_detection", 10)
         self.tl_pub   = self.create_publisher(String, "/traffic_light_state", 10)
 
-        # --- Preview window ---
-        cv2.namedWindow("Detector", cv2.WINDOW_NORMAL)
-        cv2.resizeWindow("Detector", 640, 480)
+        # --- Preview (h264 | local | none via $STREAM) ---
+        self.preview = Preview.from_env("Detector", fps=10, log=self.get_logger().info)
 
         # --- Inference timer (10 Hz) ---
         self.create_timer(0.1, self._loop)
@@ -114,17 +110,24 @@ class SignDetectorNode(Node):
         self.get_logger().info(f"Detector ready — YOLO conf: {conf_threshold}")
 
     # ------------------------------------------------------------------
-    # Camera callback
+    # Camera grab
     # ------------------------------------------------------------------
-    def _image_cb(self, msg: Image):
-        frame = imgmsg_to_cv2(msg)
-        # ros_deep_learning video_source hardcodes rotate-180 in its pipeline;
-        # undo it so the orientation matches the calibrator.
-        frame = cv2.flip(frame, -1)
-        frame = cv2.resize(frame, (640, 480))
-        if self.camera_matrix is not None:
-            frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-        self.latest_frame = apply_illumination_gain(frame, self.illumination_gain)
+    def _grab_frame(self):
+        """Read + condition one frame from the direct CSI capture.
+
+        Direct nvarguscamerasrc capture is upright (no rotate-180 quirk like the
+        old ros_deep_learning node), so the orientation matches the calibrator.
+        """
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return None
+        return preprocess_frame(
+            frame,
+            camera_matrix=self.camera_matrix,
+            dist_coeffs=self.dist_coeffs,
+            gain=self.illumination_gain,
+            size=(640, 480),
+        )
 
     # ------------------------------------------------------------------
     # Traffic light helpers
@@ -183,7 +186,7 @@ class SignDetectorNode(Node):
     # Main inference loop
     # ------------------------------------------------------------------
     def _loop(self):
-        frame = self.latest_frame
+        frame = self._grab_frame()
         if frame is None:
             return
 
@@ -244,11 +247,12 @@ class SignDetectorNode(Node):
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4)
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
 
-        cv2.imshow("Detector", display)
-        cv2.waitKey(1)
+        self.preview.show(display)
 
     def destroy_node(self):
-        cv2.destroyAllWindows()
+        self.preview.close()
+        if self.cap is not None:
+            self.cap.release()
         super().destroy_node()
 
 

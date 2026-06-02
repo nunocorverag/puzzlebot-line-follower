@@ -32,14 +32,15 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from line_vision_calibrator import (
-    build_gstreamer_pipeline,
+REPO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_DIR))
+from puzzlebot_ros.perception.camera import (  # noqa: E402
+    apply_illumination_gain,
     load_camera_params,
     load_illumination_gain,
-    apply_illumination_gain,
+    open_csi_capture,
 )
-
-REPO_DIR = Path(__file__).resolve().parents[1]
+from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 
 
 class TeleopRecorder(Node):
@@ -56,12 +57,15 @@ class TeleopRecorder(Node):
         )
 
         # Direct GStreamer camera
-        self.cap = cv2.VideoCapture(
-            build_gstreamer_pipeline(1280, 720, 30), cv2.CAP_GSTREAMER
-        )
-        if not self.cap.isOpened():
+        self.cap = open_csi_capture(width=1280, height=720, fps=30,
+                                    log=self.get_logger().info)
+        if self.cap is None:
             self.get_logger().error("Could not open camera")
             raise RuntimeError("Camera failed")
+
+        # Preview (h264 | local | none via $STREAM); keys are read from the
+        # terminal (tty), so a one-way H264 stream is fine for watching.
+        self.preview = Preview.from_env("Teleop Recorder", fps=30, log=self.get_logger().info)
 
         # cmd_vel publisher
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
@@ -169,8 +173,7 @@ class TeleopRecorder(Node):
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 1)
         if self.auto_save:
             cv2.rectangle(preview, (0, 0), (preview.shape[1]-1, preview.shape[0]-1), (0, 200, 0), 4)
-        cv2.imshow("Teleop Recorder", preview)
-        cv2.waitKey(1)
+        self.preview.show(preview)
 
     def _shutdown(self):
         try:
@@ -178,7 +181,7 @@ class TeleopRecorder(Node):
         except Exception:
             pass
         self.cap.release()
-        cv2.destroyAllWindows()
+        self.preview.close()
         print(f"\n[done] {self.save_count} images in {self.save_dir}")
         rclpy.shutdown()
 

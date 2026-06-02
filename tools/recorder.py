@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record camera frames with full calibration applied, ready for YOLO training.
 
-Reads from the ROS topic /video_source/raw (published by camera_jetson.launch.py).
+Opens the CSI camera directly (GStreamer) — no separate camera node needed.
 
 Applies in order:
   1. Camera undistortion  (config/camera_params.npz)
@@ -26,22 +26,16 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
-
-from line_vision_calibrator import load_camera_params, load_illumination_gain, apply_illumination_gain
-
-
-def imgmsg_to_cv2(msg: Image) -> np.ndarray:
-    dtype = np.uint8
-    channels = {"bgr8": 3, "rgb8": 3, "mono8": 1, "bgra8": 4, "rgba8": 4}.get(msg.encoding, 3)
-    frame = np.frombuffer(msg.data, dtype=dtype).reshape(msg.height, msg.width, channels)
-    if msg.encoding == "rgb8":
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-    elif msg.encoding in ("rgba8", "bgra8"):
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGBA2BGR if msg.encoding == "rgba8" else cv2.COLOR_BGRA2BGR)
-    return frame.copy()
 
 REPO_DIR = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_DIR))
+from puzzlebot_ros.perception.camera import (  # noqa: E402
+    load_camera_params,
+    load_illumination_gain,
+    open_csi_capture,
+    preprocess_frame,
+)
+from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 DEFAULT_CAMERA_PARAMS     = REPO_DIR / "config" / "camera_params.npz"
 DEFAULT_ILLUMINATION_PARAMS = REPO_DIR / "config" / "illumination_flatfield.npz"
 DEFAULT_OUTPUT_DIR        = REPO_DIR / "dataset"
@@ -91,12 +85,17 @@ class RecorderNode(Node):
         self.start_time = time.time()
         self.recording = False  # start paused — press Enter to begin
 
-        self.sub = self.create_subscription(
-            Image, "/video_source/raw", self.image_callback, 10)
+        self.cap = open_csi_capture(width=args.width, height=args.height, fps=args.fps,
+                                    log=self.get_logger().info)
+        if self.cap is None:
+            raise RuntimeError("camera unavailable")
 
-        if not args.headless:
-            cv2.namedWindow("Recorder", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Recorder", 640, 480)
+        mode = "none" if args.headless else None
+        self.preview = (Preview("Recorder", mode="none", log=self.get_logger().info)
+                        if mode == "none"
+                        else Preview.from_env("Recorder", fps=args.fps, log=self.get_logger().info))
+
+        self.create_timer(1.0 / max(1, args.fps), self.tick)
 
         print(f"[info] Saving to: {args.output_dir}  interval={args.interval}s", flush=True)
         print("[info] Presiona Enter para INICIAR/PAUSAR grabacion. Ctrl+C para salir.", flush=True)
@@ -107,28 +106,32 @@ class RecorderNode(Node):
         status = "GRABANDO" if self.recording else "PAUSADO"
         print(f"[{status}] frames guardados hasta ahora: {self.save_count}", flush=True)
 
-    def image_callback(self, msg: Image):
+    def tick(self):
         if self.args.duration > 0 and (time.time() - self.start_time) >= self.args.duration:
             rclpy.shutdown()
             return
 
-        frame = imgmsg_to_cv2(msg)
+        ok, frame = self.cap.read()
+        if not ok or frame is None:
+            return
 
-        if self.undistort:
-            frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
-        frame = apply_illumination_gain(frame, self.illumination_gain)
+        frame = preprocess_frame(
+            frame,
+            camera_matrix=self.camera_matrix if self.undistort else None,
+            dist_coeffs=self.dist_coeffs if self.undistort else None,
+            gain=self.illumination_gain,
+        )
         self.frame_count += 1
 
-        if not self.args.headless:
-            preview = frame.copy()
-            status = "GRABANDO" if self.recording else "PAUSADO"
-            color = (0, 255, 0) if self.recording else (0, 100, 255)
-            cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
-                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
-            cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
-                        (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
-            cv2.imshow("Recorder", preview)
-            cv2.waitKey(1)
+        # Preview gets the status overlay; saved frames stay clean for training.
+        preview = frame.copy()
+        status = "GRABANDO" if self.recording else "PAUSADO"
+        color = (0, 255, 0) if self.recording else (0, 100, 255)
+        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
+        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
+        self.preview.show(preview)
 
         if not self.recording:
             return
@@ -139,6 +142,12 @@ class RecorderNode(Node):
             self.save_count += 1
             self.last_save_time = now
             print(f"[save] {path}  (total: {self.save_count})", flush=True)
+
+    def destroy_node(self):
+        self.preview.close()
+        if self.cap is not None:
+            self.cap.release()
+        super().destroy_node()
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +164,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--interval",             type=float, default=0.5)
     parser.add_argument("--duration",             type=float, default=0.0,
                         help="stop after N seconds (0 = run until Ctrl+C)")
-    # kept for backwards compat, ignored (camera comes from ROS topic now)
+    # kept for backwards compat, ignored (camera is opened directly via GStreamer)
     parser.add_argument("--gstreamer",   action="store_true", default=False)
     parser.add_argument("--headless",    action="store_true", default=False)
     parser.add_argument("--camera",      type=int, default=0)
