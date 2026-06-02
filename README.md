@@ -99,7 +99,9 @@ maneuver and then resumes normal line following.
 
 ## Camera Undistortion
 
-`config/camera_params.npz` comes from `mod2_computer_vision/Activities/activity_2_07`.
+`config/camera_params.npz` holds the camera intrinsics. To recalibrate this CSI
+camera from scratch (auto-guided checkerboard capture + compute, all over H264),
+see **[docs/CALIBRATION_CHECKERBOARD.md](docs/CALIBRATION_CHECKERBOARD.md)**.
 Undistortion is enabled by default. Override it with ROS parameters if needed:
 
 ```bash
@@ -111,11 +113,15 @@ ros2 run puzzlebot_ros line_follower --ros-args -p camera_params_path:=/path/to/
 
 Use this before tuning the robot controller. It never publishes `/cmd_vel`.
 
-Run live on the Jetson camera:
+Run live on the Jetson camera. Default is the fast H264 dashboard; use
+`STREAM=local` for the old OpenCV trackbars:
 
 ```bash
 scripts/run_line_calibrator_jetson.sh
+STREAM=local scripts/run_line_calibrator_jetson.sh
 ```
+
+Full current workflow: **[docs/PERCEPTION_TUNING.md](docs/PERCEPTION_TUNING.md)**.
 
 Optional label for saved samples:
 
@@ -123,12 +129,9 @@ Optional label for saved samples:
 LABEL=false_intersection scripts/run_line_calibrator_jetson.sh
 ```
 
-Inside the OpenCV window:
-
-- `s`: save raw/processed/mask/overlay + JSON metadata.
-- `u`: toggle undistortion.
-- `p`: pause live camera.
-- `q`: quit.
+In H264 mode, type commands in the calibrator terminal: `s=1`, `u=1`, `p=1`,
+`q=1`, or set parameters such as `roi_y0_pct=72`. In `STREAM=local` mode, the
+OpenCV window keys still work: `s`, `u`, `p`, `q`.
 
 The most important sliders for the current false positive are:
 
@@ -173,17 +176,20 @@ The `Controls` sliders update when parameter commands are applied, and the overl
 
 ### Illumination Flat-Field Calibration
 
-Capture a white-lona flat-field reference on the Jetson:
+Removes the reddish color cast and vignetting. Auto-guided over H264 — point the
+camera at the white lona filling the frame and it averages good frames by itself:
 
 ```bash
 scripts/run_illumination_calibrator_jetson.sh
 ```
 
-Point the camera at clean white lona/cardstock in the robot camera pose, wait for exposure to settle, press `c` to save `config/illumination_flatfield.npz`, then press `q`. The line calibrator and `puzzlebot_ros/line_follower.py` load that file automatically when it exists.
+It writes `config/illumination_flatfield.npz` (loaded automatically by the line
+calibrator and `line_follower.py`). Run it **after** the camera calibration. Full
+guide with sampling tips: **[docs/CALIBRATION_ILLUMINATION.md](docs/CALIBRATION_ILLUMINATION.md)**.
 
 ### Dynamic Entry-Based Option ROI
 
-The line calibrator can place the option ROI above the detected entry zebra instead of using a fixed blue box. This keeps the option ROI from overlapping the lower entry zebra.
+The line calibrator can place the option ROI above the detected entry zebra instead of using a fixed blue box. Option ROIs are now drawn and counted as perspective-friendly polygons with adjustable `roi_skew`.
 
 Relevant live parameters:
 
@@ -194,6 +200,7 @@ entry_margin_pct = 4
 dynamic_option_height_pct = 28
 option_x0_pct = 8
 option_x1_pct = 92
+option_roi_skew_pct = 8
 ```
 
-The orange line in the overlay is the detected entry zebra y-position. The blue box is the effective option ROI used for left/straight/right. Set `dynamic_option_roi=0` to return to the fixed option box.
+The orange line in the overlay is the detected entry zebra y-position. The colored polygons are the effective option ROIs used for left/straight/right. Set `dynamic_option_roi=0` to return to the fixed option box.
