@@ -1,0 +1,27 @@
+name: Validate main PR source
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - edited
+
+permissions:
+  contents: read
+
+jobs:
+  require-develop-source:
+    name: Require develop source branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate source branch
+        run: |
+          if [ "${{ github.head_ref }}" != "develop" ]; then
+            echo "Pull requests into main must come from develop."
+            echo "Current source branch: ${{ github.head_ref }}"
+            exit 1
+          fi
