@@ -54,7 +54,6 @@ single-owner, so run one at a time; the scripts free it before starting.
 | `run_line_follower_jetson.sh` | Runs `ros2 run puzzlebot_ros line_follower` (the autonomous racer). MJPEG at `http://10.10.0.100:8080`. Override node with `NODE=`. | Real autonomous run. Wheels-up first. |
 | `run_demo_tmux.sh` | tmux session: sync/build + micro-ROS agent + line follower + topic monitor. | Full demo orchestration. |
 | `stop_demo.sh` (canonical) | Kills tmux, kills `line_follower`/`autonomous_racer`, publishes a zero `/cmd_vel` burst, stops micro-ROS agent. | **Emergency stop / clean shutdown.** Keep it in a ready terminal. |
-| `kill_all_jetson.sh` | `pkill` of recorder/camera/agent processes on the Jetson. | Quick cleanup of stray processes. |
 | `start_all_jetson.sh` | `nohup` launch of camera + recorder in background with logs in `/tmp`. | Headless data-collection sessions. |
 
 ## Calibration & perception tuning
@@ -92,10 +91,8 @@ single-owner, so run one at a time; the scripts free it before starting.
 | Script | What it does | When to run |
 | --- | --- | --- |
 | `run_motor_agent_jetson.sh` | Starts the micro-ROS agent (the `/cmd_vel` → motors bridge) via `~/start_robot.sh`. Foreground; Ctrl-C stops. | **Run this first** for any motion (teleop/jog/follower). Safe alongside the follower. |
-| `run_teleop_wasd_jetson.sh` + `tools/teleop_wasd.py` | Robust real-time WASD teleop. **Hold-to-go** (release a key → stops after `HOLD_TIMEOUT`≈0.4 s; `HOLD_TIMEOUT=0` = sticky), one tap = real speed, depth-1 QoS + 50 Hz republish, zeroes on exit/SSH drop. `w/s`=fwd/back, `a/d`=**steer** (gentle, so `w`+`a` is a real curve, not a one-wheel pivot), `q/e`=**pivot in place** (strong). `z` straighten, `x` stop-linear, space STOP, `-`/`=` scale, Ctrl-C quit. Tune `V_MAX`/`STEER_W`/`PIVOT_W`. | Manual driving with combined moves. |
 | `run_teleop_wasd_combo.sh` + `tools/teleop_wasd_gui.py` + `tools/cmd_vel_udp_bridge.py` | **True-combo** WASD: reads the **laptop** keyboard with real key state (pygame window) so holding `w`+`a` together is a genuine curve, and sends velocity over **UDP** to a Jetson bridge that republishes `/cmd_vel` (no ROS on the laptop; bridge has a 0.3 s watchdog). A terminal/SSH teleop physically *cannot* do simultaneous key holds — this can. Needs `python3-pygame` on the laptop (`sudo apt install python3-pygame`). Keys: `w/s` `a/d` `q/e`, space stop, `-`/`=` speed, ESC quit. | Manual driving when you need real simultaneous combos. |
 | `jog_forward_jetson.sh SPEED DURATION` | Publishes `/cmd_vel linear.x=SPEED` for `DURATION` s, then zero. Use ≥0.10 (deadband). e.g. `0.10 1.5`. | Move forward for visual ROI tests **without** the autonomous node. Never alongside `line_follower`. |
-| `teleop_jetson.sh` | `teleop_twist_keyboard` over SSH (keys `i/,/j/l`, `k`=stop). | Manual driving (single-axis). |
 | `set_drive_jetson.sh on\|off` | Toggles the follower's motion master switch via `/drive_enable` (Bool). The follower starts with driving **disabled**. | Enable/halt the follower's motion during testing without killing it. |
 
 ### Testing the follower's approach-and-center

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Combined traffic sign (YOLO) + traffic light (HSV) detector.
 
-Subscribes to /video_source/raw, runs both detectors on each frame,
+Opens the CSI camera directly, runs both detectors on each frame,
 draws overlays on a single preview window, and publishes to:
   /sign_detection       (String) — YOLO sign class name
   /traffic_light_state  (String) — RED / YELLOW / GREEN / NONE

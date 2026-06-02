@@ -59,6 +59,6 @@ case "${1:-start}" in
     echo "Everything running in the background. Useful commands:"
     echo "  scripts/start_all_jetson.sh logs   # see what is happening"
     echo "  scripts/start_all_jetson.sh stop   # kill everything"
-    echo "  scripts/teleop_jetson.sh            # drive the robot"
+    echo "  scripts/run_teleop_wasd_combo.sh    # drive the robot"
     ;;
 esac
