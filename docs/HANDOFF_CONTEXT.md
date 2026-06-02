@@ -281,12 +281,12 @@ How to capture:
 scripts/run_illumination_calibrator_jetson.sh
 ```
 
-Point camera at the same white lona / uniform track-like material in the mounted
+Point camera at the same white banner / uniform track-like material in the mounted
 robot pose. Press `c` after exposure settles. Press `q` to exit.
 
 What we learned:
 
-- A wall is uniform, but the lona is more representative because it has the same
+- A wall is uniform, but the banner is more representative because it has the same
   texture/reflection as the actual track.
 - The target should fill the frame as much as possible.
 - It does not need to be perfectly geometrically straight, but it should be
@@ -470,7 +470,7 @@ Important safety:
 - Loading `config/camera_params.npz` improved geometry.
 - Loading `config/illumination_flatfield.npz` helped with uneven red/pink camera
   cast.
-- Using the lona as illumination target is more representative than a wall.
+- Using the banner as illumination target is more representative than a wall.
 
 ### Detection
 

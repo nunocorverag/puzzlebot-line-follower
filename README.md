@@ -177,7 +177,7 @@ The `Controls` sliders update when parameter commands are applied, and the overl
 ### Illumination Flat-Field Calibration
 
 Removes the reddish color cast and vignetting. Auto-guided over H264 — point the
-camera at the white lona filling the frame and it averages good frames by itself:
+camera at the white banner filling the frame and it averages good frames by itself:
 
 ```bash
 scripts/run_illumination_calibrator_jetson.sh
