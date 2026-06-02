@@ -73,11 +73,18 @@ Stop safely with:
 scripts/stop_demo.sh
 ```
 
+`stop_demo.sh` is the clean stop for the full test stack: it stops local H264
+receivers, Jetson camera/perception tools, the follower, micro-ROS, and sends a
+zero `/cmd_vel` burst.
+
 ## Intersection Decision Mode
 
-The line follower now detects stable dashed-line patterns as an intersection cue.
-When that happens it publishes zero `/cmd_vel`, overlays the available options in
-MJPEG, and publishes a text prompt on `/intersection_prompt`.
+The line follower detects stable dashed-line patterns as an intersection cue.
+In test mode it can ignore the traffic light, approach the intersection, and
+center itself using the detected `entry_center_x`; the bottom line-following ROI
+is recentered around that entry during the approach. When the target entry band
+is reached and centered, it publishes zero `/cmd_vel`, overlays the available
+options, and publishes a text prompt on `/intersection_prompt`.
 
 Watch prompts:
 
@@ -113,12 +120,14 @@ ros2 run puzzlebot_ros line_follower --ros-args -p camera_params_path:=/path/to/
 
 Use this before tuning the robot controller. It never publishes `/cmd_vel`.
 
-Run live on the Jetson camera. Default is the fast H264 dashboard; use
-`STREAM=local` for the old OpenCV trackbars:
+Run live on the Jetson camera. The script sends `drive_enable=false` before
+opening the CSI camera, so the calibrator stays perception-only. Default is the
+fast H264 dashboard; use `STREAM=local` for the old OpenCV trackbars:
 
 ```bash
 scripts/run_line_calibrator_jetson.sh
 STREAM=local scripts/run_line_calibrator_jetson.sh
+VIDEO_SINK=ximagesink scripts/run_line_calibrator_jetson.sh   # WSL/X11
 ```
 
 Full current workflow: **[docs/PERCEPTION_TUNING.md](docs/PERCEPTION_TUNING.md)**.
@@ -130,8 +139,10 @@ LABEL=false_intersection scripts/run_line_calibrator_jetson.sh
 ```
 
 In H264 mode, type commands in the calibrator terminal: `s=1`, `u=1`, `p=1`,
-`q=1`, or set parameters such as `roi_y0_pct=72`. In `STREAM=local` mode, the
-OpenCV window keys still work: `s`, `u`, `p`, `q`.
+`q=1`, or set parameters such as `roi_y0_pct=72`. The same controls work from
+another laptop terminal with `scripts/set_calibrator_param.sh s 1`,
+`scripts/set_calibrator_param.sh u 1`, etc. In `STREAM=local` mode, the OpenCV
+window keys still work: `s`, `u`, `p`, `q`.
 
 The most important sliders for the current false positive are:
 
@@ -203,4 +214,4 @@ option_x1_pct = 92
 option_roi_skew_pct = 8
 ```
 
-The orange line in the overlay is the detected entry zebra y-position. The colored polygons are the effective option ROIs used for left/straight/right. Set `dynamic_option_roi=0` to return to the fixed option box.
+The orange line in the overlay is the detected entry zebra y-position. The colored polygons are the effective option ROIs used for left/straight/right. At runtime, the follower also uses the detected `entry_center_x` to recenter its lower line-following ROI during `APPROACH_CENTER`, which is what parks the robot squarely at the intersection before tuning or decision handling. Set `dynamic_option_roi=0` to return to the fixed option box.
