@@ -234,10 +234,10 @@ class AutonomousRacer(Node):
         # Timer (30 Hz)
         self.timer = self.create_timer(0.033, self.control_loop)
 
-        # Servidor MJPEG (acceder desde la PC: http://10.10.0.100:8080)
+        # MJPEG server (access from the PC: http://10.10.0.100:8080)
         _start_mjpeg_server(port=8080)
         self.get_logger().info("Autonomous Racer Started: Lines + Traffic Lights")
-        self.get_logger().info("MJPEG stream disponible en http://10.10.0.100:8080")
+        self.get_logger().info("MJPEG stream available at http://10.10.0.100:8080")
 
     def _load_camera_params(self):
         if not bool(self.get_parameter('use_undistort').value):
