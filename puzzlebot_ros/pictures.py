@@ -5,6 +5,9 @@ from rclpy.node import Node
 import cv2
 import os
 
+from puzzlebot_ros.perception.camera import open_csi_capture
+
+
 class CalibrationCaptureNode(Node):
 
     def __init__(self):
@@ -21,17 +24,10 @@ class CalibrationCaptureNode(Node):
         # =========================
         # Inicialización de Cámara
         # =========================
-        # Utilizamos la misma lógica de GStreamer de tu nodo original
-        self.cap = cv2.VideoCapture(
-            "nvarguscamerasrc sensor-id=0 ! "
-            "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
-            "nvvidconv ! video/x-raw, format=BGRx ! "
-            "videoconvert ! video/x-raw, format=BGR ! "
-            "appsink max-buffers=1 drop=true",
-            cv2.CAP_GSTREAMER
-        )
-
-        if not self.cap.isOpened():
+        # Captura CSI compartida (misma resolución que el runtime: 640x480).
+        self.cap = open_csi_capture(width=640, height=480, fps=30, downscale=True,
+                                    log=self.get_logger().info)
+        if self.cap is None:
             self.get_logger().error("No se pudo abrir la cámara.")
             return
 
