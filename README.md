@@ -28,6 +28,17 @@ docs/HANDOFF_CONTEXT.md
 - `archive/`: nodes/launch from earlier course modules, kept out of the build.
   See `archive/README.md`.
 
+## First-Time Setup
+
+New laptop? See **[docs/SETUP.md](docs/SETUP.md)**. Setup splits into two
+independent tracks — run whichever applies:
+
+```bash
+scripts/setup_laptop.sh        # A. libraries (every laptop)
+scripts/setup_robonet.sh       # B. network — only the laptop that hosts RoboNet
+scripts/check_setup.sh         # verify both (read-only checklist)
+```
+
 ## Jetson Defaults
 
 The scripts default to:

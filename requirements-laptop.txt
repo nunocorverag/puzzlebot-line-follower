@@ -1,0 +1,6 @@
+# Python deps for the LAPTOP-side tools (teleop GUI, offline calibrators,
+# H264 viewer helpers). Installed by scripts/setup_laptop.sh.
+# The Jetson already has its own ROS2 + OpenCV stack; this file is laptop-only.
+numpy
+opencv-python
+pygame
