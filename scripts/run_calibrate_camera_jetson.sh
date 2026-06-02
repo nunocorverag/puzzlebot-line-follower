@@ -18,7 +18,7 @@ SQUARE_MM="${SQUARE_MM:-1.0}"
 sync_repo
 run_remote_tool "python3 tools/calibrate_camera.py --pattern ${PATTERN} --square-size-mm ${SQUARE_MM}"
 
-echo "Trayendo resultados a la laptop..."
+echo "Fetching results to the laptop..."
 fetch_from_jetson "config/camera_params.npz"        "${REPO_DIR}/config/camera_params.npz"
 fetch_from_jetson "config/undistorted_preview.jpg"  "${REPO_DIR}/config/undistorted_preview.jpg" || true
-echo "Revisa config/undistorted_preview.jpg y commitea config/camera_params.npz."
+echo "Check config/undistorted_preview.jpg and commit config/camera_params.npz."

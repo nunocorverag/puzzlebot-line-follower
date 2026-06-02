@@ -23,7 +23,7 @@ EXTRA_ARGS=""
 [ "${AUTO_START}" = "1" ] && EXTRA_ARGS="--auto-start"
 run_remote_tool "python3 tools/illumination_calibrator.py --frames ${FRAMES} ${EXTRA_ARGS} --camera-params config/camera_params.npz --output config/illumination_flatfield.npz" || true
 
-echo "Trayendo resultado a la laptop..."
+echo "Fetching result to the laptop..."
 fetch_from_jetson "config/illumination_flatfield.npz" "${REPO_DIR}/config/illumination_flatfield.npz"
 fetch_from_jetson "config/illumination_preview.jpg"   "${REPO_DIR}/config/illumination_preview.jpg" || true
-echo "Revisa config/illumination_preview.jpg y commitea el .npz."
+echo "Check config/illumination_preview.jpg and commit the .npz."

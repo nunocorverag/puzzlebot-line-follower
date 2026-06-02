@@ -25,6 +25,6 @@ fi
 start_stream
 run_remote_tool "python3 tools/calib_capture_checkerboard.py --pattern ${PATTERN} --target ${TARGET}" || true
 
-echo "Trayendo imagenes capturadas a la laptop..."
+echo "Fetching captured images to the laptop..."
 fetch_from_jetson "calibration_images/" "${REPO_DIR}/calibration_images/"
-echo "Listo. Ahora corre: scripts/run_calibrate_camera_jetson.sh"
+echo "Done. Now run: scripts/run_calibrate_camera_jetson.sh"

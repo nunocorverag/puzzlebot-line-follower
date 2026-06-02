@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Auto-guided flat-field (illumination) calibration from a white surface.
 
-Point the camera at a uniform white banner/sheet ("la lona"). The tool checks
+Point the camera at a uniform white banner/sheet. The tool checks
 each frame for good exposure, no specular hotspots and no gross shadows, and
 when it has enough steady good frames it AVERAGES them (noise down), builds a
 per-channel gain map and saves it. The gain removes the reddish color cast and
@@ -54,16 +54,16 @@ def assess(frame: np.ndarray) -> tuple[bool, str]:
     luma = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     mean = float(luma.mean())
     if mean < 70:
-        return False, "muy oscuro: acerca o sube luz"
+        return False, "too dark: move closer or add light"
     if mean > 240:
-        return False, "muy brillante: baja la exposicion"
+        return False, "too bright: lower the exposure"
     clipped = float((luma > 250).mean())
     if clipped > 0.005:
-        return False, "brillo especular: cambia el angulo"
+        return False, "specular highlight: change the angle"
     # Gross shadow: a heavily blurred region far darker than the mean.
     small = cv2.resize(luma, (32, 24)).astype(np.float32)
     if small.min() < 0.55 * small.mean():
-        return False, "sombra detectada: ilumina parejo"
+        return False, "shadow detected: light it evenly"
     return True, "ok"
 
 
@@ -73,10 +73,10 @@ def residual_report(avg: np.ndarray, corrected: np.ndarray) -> list[str]:
     raw_mean = avg.reshape(-1, 3).mean(axis=0)
     cor_mean = corrected.reshape(-1, 3).mean(axis=0)
     return [
-        f"std BGR antes : {raw_std[0]:.1f} {raw_std[1]:.1f} {raw_std[2]:.1f}",
-        f"std BGR despues: {cor_std[0]:.1f} {cor_std[1]:.1f} {cor_std[2]:.1f}",
-        f"media BGR antes : {raw_mean[0]:.1f} {raw_mean[1]:.1f} {raw_mean[2]:.1f}",
-        f"media BGR despues: {cor_mean[0]:.1f} {cor_mean[1]:.1f} {cor_mean[2]:.1f}",
+        f"std BGR before: {raw_std[0]:.1f} {raw_std[1]:.1f} {raw_std[2]:.1f}",
+        f"std BGR after : {cor_std[0]:.1f} {cor_std[1]:.1f} {cor_std[2]:.1f}",
+        f"mean BGR before: {raw_mean[0]:.1f} {raw_mean[1]:.1f} {raw_mean[2]:.1f}",
+        f"mean BGR after : {cor_mean[0]:.1f} {cor_mean[1]:.1f} {cor_mean[2]:.1f}",
     ]
 
 
@@ -115,12 +115,12 @@ def main() -> int:
     armed = bool(args.auto_start)
     start_at = 0.0
     if armed:
-        print(f"[info] auto-start: juntando {args.frames} frames buenos de la lona blanca. Ctrl+C para abortar.")
+        print(f"[info] auto-start: collecting {args.frames} good frames of the white banner. Ctrl+C to abort.")
     else:
-        print("[info] acomoda la lona blanca llenando el cuadro.")
-        print("[info] presiona Enter para iniciar; luego espera "
-              f"{args.settle_seconds:.1f}s y se capturan {args.frames} frames buenos.")
-        print("[info] Ctrl+C aborta sin guardar.")
+        print("[info] position the white banner so it fills the frame.")
+        print("[info] press Enter to start; then wait "
+              f"{args.settle_seconds:.1f}s and {args.frames} good frames are captured.")
+        print("[info] Ctrl+C aborts without saving.")
     saved = False
     try:
         while len(buffer) < args.frames:
@@ -134,17 +134,17 @@ def main() -> int:
                 sys.stdin.readline()
                 armed = True
                 start_at = time.time() + max(0.0, args.settle_seconds)
-                print(f"[info] inicio armado; retira manos/sombras ({args.settle_seconds:.1f}s)...")
+                print(f"[info] start armed; remove hands/shadows ({args.settle_seconds:.1f}s)...")
 
             good, reason = assess(frame)
             if not armed:
-                status, color = "listo? Enter para iniciar | " + reason, (0, 255, 0) if good else (0, 200, 255)
+                status, color = "ready? Enter to start | " + reason, (0, 255, 0) if good else (0, 200, 255)
             elif time.time() < start_at:
                 remaining = max(0.0, start_at - time.time())
-                status, color = f"inicia en {remaining:.1f}s: retira manos/sombras", (0, 200, 255)
+                status, color = f"starting in {remaining:.1f}s: remove hands/shadows", (0, 200, 255)
             elif good:
                 buffer.append(frame.astype(np.float32))
-                status, color = f"capturando {len(buffer)}/{args.frames}", (0, 255, 0)
+                status, color = f"capturing {len(buffer)}/{args.frames}", (0, 255, 0)
             else:
                 status, color = reason, (0, 0, 255)
 
@@ -172,13 +172,13 @@ def main() -> int:
         print(f"\n[save] {args.output}")
         for line in residual_report(avg, corrected):
             print("   ", line)
-        print("   (std despues mas baja y medias BGR mas parejas = tinte rojizo removido)")
+        print("   (lower std afterwards and more even BGR means = reddish tint removed)")
         # Leave a side-by-side artifact for headless verification.
         cv2.imwrite(str(REPO_DIR / "config" / "illumination_preview.jpg"),
                     np.hstack([avg, corrected]))
         saved = True
     except KeyboardInterrupt:
-        print("\n[abort] sin guardar")
+        print("\n[abort] not saved")
     finally:
         cap.release()
         preview.close()

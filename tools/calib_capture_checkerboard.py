@@ -189,20 +189,20 @@ def next_index(folder: Path) -> int:
 def hint(dists, poses) -> str:
     """The single most useful thing to do next (advisory)."""
     if "far" not in dists:
-        return "aleja el tablero (vistas chicas cubren las esquinas del cuadro)"
+        return "move the board farther away (small views cover the frame corners)"
     if "near" not in dists:
-        return "acerca el tablero (que llene mas el cuadro)"
+        return "move the board closer (so it fills more of the frame)"
     missing_pose = [p for p in POSE_BUCKETS if p not in poses]
     if missing_pose:
         return {
-            "front": "front pitch/yaw entre -10 y +10 deg",
-            "yaw_left": f"front yaw <= -{ANGLE_MIN_DEG:.0f} deg (acerca borde izquierdo)",
-            "yaw_right": f"front yaw >= +{ANGLE_MIN_DEG:.0f} deg (acerca borde derecho)",
-            "pitch_up": f"front pitch <= -{ANGLE_MIN_DEG:.0f} deg (acerca borde superior)",
-            "pitch_down": f"front pitch >= +{ANGLE_MIN_DEG:.0f} deg (acerca borde inferior)",
-            "roll": f"roll2d >= +/-{ROLL_MIN_DEG:.0f} deg (rota el carton en el plano)",
+            "front": "front pitch/yaw between -10 and +10 deg",
+            "yaw_left": f"front yaw <= -{ANGLE_MIN_DEG:.0f} deg (bring the left edge closer)",
+            "yaw_right": f"front yaw >= +{ANGLE_MIN_DEG:.0f} deg (bring the right edge closer)",
+            "pitch_up": f"front pitch <= -{ANGLE_MIN_DEG:.0f} deg (bring the top edge closer)",
+            "pitch_down": f"front pitch >= +{ANGLE_MIN_DEG:.0f} deg (bring the bottom edge closer)",
+            "roll": f"roll2d >= +/-{ROLL_MIN_DEG:.0f} deg (rotate the board in-plane)",
         }[missing_pose[0]]
-    return "muevelo a otra zona del cuadro; angulos ya cubiertos"
+    return "move it to another area of the frame; angles already covered"
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
@@ -239,7 +239,7 @@ def main() -> int:
     last_capture = 0.0
     print(f"[info] target {args.target} captures, pattern {primary} (or its transpose). Ctrl+C to stop.")
 
-    status = "buscando tablero..."
+    status = "looking for board..."
     color = (0, 200, 255)
     last_corners = None
     last_pose = None
@@ -291,13 +291,13 @@ def main() -> int:
                     now = time.time()
 
                     if sharp < SHARPNESS_MIN:
-                        status, color = "borroso: detente un momento", (0, 0, 255)
+                        status, color = "blurry: hold still for a moment", (0, 0, 255)
                     elif steady < STABLE_FRAMES:
-                        status, color = "estabilizando... no muevas", (0, 200, 255)
+                        status, color = "stabilizing... don't move", (0, 200, 255)
                     elif not distinct:
-                        status, color = "falta: " + hint(dists, poses), (0, 200, 255)
+                        status, color = "need: " + hint(dists, poses), (0, 200, 255)
                     elif now - last_capture < MIN_CAPTURE_GAP:
-                        status, color = "espera...", (0, 200, 255)
+                        status, color = "wait...", (0, 200, 255)
                     else:
                         out = args.output_dir / f"calib_{saved:03d}.jpg"
                         cv2.imwrite(str(out), frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
@@ -305,14 +305,14 @@ def main() -> int:
                         saved += 1
                         last_capture = now
                         pose_label = "+".join(sorted(pose.buckets))
-                        status, color = f"CAPTURA #{saved} ({pose.dist},{pose_label})", (0, 255, 0)
+                        status, color = f"CAPTURE #{saved} ({pose.dist},{pose_label})", (0, 255, 0)
                         print(f"[save] {out.name}  dist={pose.dist} pose={pose_label} "
                               f"front_pitch={pose.pitch_deg:.0f} front_yaw={pose.yaw_deg:.0f} roll2d={pose.roll_deg:.0f} "
                               f"sharp={sharp:.0f}  [{len(dists)}/3 dist, {len(poses)}/6 pose]")
                 else:
                     prev_centroid = None
                     steady = 0
-                    status, color = "buscando tablero (que se vea completo)...", (0, 200, 255)
+                    status, color = "looking for board (must be fully visible)...", (0, 200, 255)
                     last_pose = None
 
             if last_corners is not None and locked_pattern is not None:
@@ -341,7 +341,7 @@ def main() -> int:
     print(f"\n[done] {saved} images in {args.output_dir}")
     print(f"       variety: {len(dists)}/3 distances, {len(poses)}/6 poses")
     enough = saved >= 12 and len(dists) >= 2 and len(poses) >= MIN_POSES
-    print("       quality:", "OK para calibrar" if enough else "POCA variedad — captura más")
+    print("       quality:", "OK to calibrate" if enough else "LOW variety - capture more")
     return 0
 
 

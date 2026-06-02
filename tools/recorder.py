@@ -98,13 +98,13 @@ class RecorderNode(Node):
         self.create_timer(1.0 / max(1, args.fps), self.tick)
 
         print(f"[info] Saving to: {args.output_dir}  interval={args.interval}s", flush=True)
-        print("[info] Presiona Enter para INICIAR/PAUSAR grabacion. Ctrl+C para salir.", flush=True)
-        print("[PAUSADO] Listo — presiona Enter cuando quieras grabar.", flush=True)
+        print("[info] Press Enter to START/PAUSE recording. Ctrl+C to quit.", flush=True)
+        print("[PAUSED] Ready - press Enter when you want to record.", flush=True)
 
     def toggle_recording(self):
         self.recording = not self.recording
-        status = "GRABANDO" if self.recording else "PAUSADO"
-        print(f"[{status}] frames guardados hasta ahora: {self.save_count}", flush=True)
+        status = "RECORDING" if self.recording else "PAUSED"
+        print(f"[{status}] frames saved so far: {self.save_count}", flush=True)
 
     def tick(self):
         if self.args.duration > 0 and (time.time() - self.start_time) >= self.args.duration:
@@ -125,11 +125,11 @@ class RecorderNode(Node):
 
         # Preview gets the status overlay; saved frames stay clean for training.
         preview = frame.copy()
-        status = "GRABANDO" if self.recording else "PAUSADO"
+        status = "RECORDING" if self.recording else "PAUSED"
         color = (0, 255, 0) if self.recording else (0, 100, 255)
-        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
+        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=quit",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
-        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=salir",
+        cv2.putText(preview, f"{status}  saved:{self.save_count}  Enter=toggle  Ctrl+C=quit",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
         self.preview.show(preview)
 

@@ -146,13 +146,13 @@ def main() -> int:
         print(f"[pass 2] dropped {len(dropped)} outlier(s) {dropped}; "
               f"{len(imgpts)} images, RMS={rms:.4f}")
 
-    print("\n--- Resultados ---")
+    print("\n--- Results ---")
     print("Camera matrix K:\n", K)
     print("dist coeffs:", dist.ravel())
     print(f"RMS reprojection error: {rms:.4f} px  (640x480)")
-    verdict = ("EXCELENTE" if rms < 0.5 else "OK" if rms < 1.0
-               else "ALTO — repite la captura con más variedad")
-    print(f"Veredicto: {verdict}")
+    verdict = ("EXCELLENT" if rms < 0.5 else "OK" if rms < 1.0
+               else "HIGH - recapture with more variety")
+    print(f"Verdict: {verdict}")
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     np.savez(
@@ -171,7 +171,7 @@ def main() -> int:
         undist = cv2.undistort(first_image, K, dist)
         side = np.hstack((first_image, undist))
         cv2.imwrite(str(DEFAULT_PREVIEW), side)
-        print(f"[save] {DEFAULT_PREVIEW} (izq: original | der: corregida)")
+        print(f"[save] {DEFAULT_PREVIEW} (left: original | right: undistorted)")
     return 0
 
 
