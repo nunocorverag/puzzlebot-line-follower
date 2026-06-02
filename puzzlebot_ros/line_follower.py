@@ -6,7 +6,7 @@ import rclpy
 from rclpy.duration import Duration
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 
 import cv2
 import numpy as np
@@ -14,7 +14,13 @@ import threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from puzzlebot_ros.perception.intersection import IntersectionParams, analyze_intersection
+from puzzlebot_ros.perception.intersection import (
+    IntersectionParams,
+    analyze_intersection,
+    load_intersection_params,
+)
+from puzzlebot_ros.perception.camera import open_csi_capture
+from puzzlebot_ros.perception.stream import H264Streamer
 
 
 # MJPEG server -------------------------------------------------
@@ -84,16 +90,9 @@ class AutonomousRacer(Node):
         # =========================================================
         # Camera Setup (Jetson)
         # =========================================================
-        self.cap = cv2.VideoCapture(
-            "nvarguscamerasrc sensor-id=0 ! "
-            "video/x-raw(memory:NVMM), width=640, height=480, framerate=30/1 ! "
-            "nvvidconv ! video/x-raw, format=BGRx ! "
-            "videoconvert ! video/x-raw, format=BGR ! "
-            "appsink max-buffers=1 drop=true",
-            cv2.CAP_GSTREAMER
-        )
-
-        if not self.cap.isOpened():
+        self.cap = open_csi_capture(width=640, height=480, fps=30, downscale=True,
+                                    log=self.get_logger().info)
+        if self.cap is None:
             self.get_logger().error("Could not open camera")
             return
 
@@ -124,13 +123,17 @@ class AutonomousRacer(Node):
         self._h264_host = str(self.get_parameter('h264_host').value).strip()
         self._h264_port = int(self.get_parameter('h264_port').value)
         self._h264_bitrate = int(self.get_parameter('h264_bitrate').value)
-        self._h264_writer = None
-        self._h264_init_failed = False
+        self._h264_streamer = None
         if self._stream_mode == 'h264' and not self._h264_host:
             self.get_logger().error(
                 'stream_mode=h264 needs h264_host (laptop IP). Falling back to MJPEG.'
             )
             self._stream_mode = 'mjpeg'
+        elif self._stream_mode == 'h264':
+            self._h264_streamer = H264Streamer(
+                self._h264_host, self._h264_port, self._h264_bitrate,
+                fps=stream_fps, log=self.get_logger().info,
+            )
 
         self.declare_parameter('show_window', False)
         requested_window = bool(self.get_parameter('show_window').value)
@@ -161,11 +164,14 @@ class AutonomousRacer(Node):
         self.max_jump_distance = 80
         self.time_line_lost = None
 
-        # Intersection detection now uses the shared perception module so the
-        # robot behaves exactly like what was tuned in the calibrator.
-        self.intersection_params = IntersectionParams()
+        # Intersection detection uses the shared perception module so the robot
+        # behaves exactly like what was tuned in the calibrator. The tuned values
+        # are loaded from the JSON the calibrator writes via 'save_calib'.
+        self.declare_parameter('intersection_params_path', '')
+        self.intersection_params = self._load_intersection_params()
         self.intersection_stable = 0          # consecutive-frame counter (threaded into the detector)
         self.intersection_result = None       # latest detector result while a prompt is pending
+        self.intersection_phase = None        # None | 'approach' | 'wait'
         self.intersection_pending = False
         self.intersection_options = []
         self.intersection_decision = None
@@ -173,6 +179,30 @@ class AutonomousRacer(Node):
         self.commit_direction = None
         self.commit_until = None
         self.intersection_cooldown_until = None
+
+        # Approach-and-center: when the intersection is first detected the robot
+        # keeps following the line at a slow creep until the entry zebra reaches
+        # the target depth AND is centered, so it always stops at the same spot.
+        # NOTE: the motors have a deadband ~0.08-0.10 m/s (0.05 does not move the
+        # robot, ~0.10 does). approach_speed must stay above it or the creep
+        # never actually drives.
+        self.declare_parameter('approach_target_entry_y_pct', 82)
+        self.declare_parameter('approach_speed', 0.10)
+        self._approach_target_entry_y_pct = float(self.get_parameter('approach_target_entry_y_pct').value)
+        self._approach_speed = float(self.get_parameter('approach_speed').value)
+
+        # Testing aid: ignore the traffic-light supervisor so the robot drives
+        # without needing to see a real GREEN light.
+        self.declare_parameter('ignore_traffic_light', False)
+        self._ignore_traffic_light = bool(self.get_parameter('ignore_traffic_light').value)
+
+        # Motion master switch for safe testing. Starts disabled so the robot
+        # never moves until you explicitly enable it from the terminal via
+        # /drive_enable (scripts/set_drive_jetson.sh on|off). Perception and the
+        # stream keep running while disabled, so you can watch detection.
+        self.declare_parameter('start_driving', False)
+        self._drive_enabled = bool(self.get_parameter('start_driving').value)
+        self.create_subscription(Bool, '/drive_enable', self._drive_enable_cb, 10)
 
         # ---------------------------------------------------------
         # Per-lane persistent anchors for the top ROI's 3 lines.
@@ -232,6 +262,23 @@ class AutonomousRacer(Node):
         self.get_logger().warn('Camera calibration not found; running without undistort.')
         return None, None
 
+    def _load_intersection_params(self):
+        configured_path = str(self.get_parameter('intersection_params_path').value).strip()
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(Path(configured_path).expanduser())
+        candidate_paths.extend([
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/intersection_params.json'),
+            Path(__file__).resolve().parents[1] / 'config' / 'intersection_params.json',
+        ])
+        for params_path in candidate_paths:
+            if params_path.exists():
+                params = load_intersection_params(params_path)
+                self.get_logger().info(f'Loaded intersection calibration: {params_path}')
+                return params
+        self.get_logger().warn('Intersection calibration JSON not found; using built-in defaults.')
+        return IntersectionParams()
+
     def _load_illumination_gain(self):
         if not bool(self.get_parameter('use_illumination_correction').value):
             self.get_logger().info('Illumination correction disabled.')
@@ -264,6 +311,10 @@ class AutonomousRacer(Node):
         corrected = frame.astype(np.float32) * gain
         return np.clip(corrected, 0, 255).astype(np.uint8)
 
+    def _drive_enable_cb(self, msg):
+        self._drive_enabled = bool(msg.data)
+        self.get_logger().info(f"[DRIVE] enabled={self._drive_enabled}")
+
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
         aliases = {
@@ -288,35 +339,6 @@ class AutonomousRacer(Node):
         self.intersection_decision = normalized
         self.get_logger().info(f"Intersection decision received: {normalized}")
 
-    def _ensure_h264_writer(self, frame):
-        """Lazily open the hardware H264 GStreamer writer once the frame size is known."""
-        if self._h264_writer is not None:
-            return self._h264_writer.isOpened()
-        if self._h264_init_failed:
-            return False
-        h, w = frame.shape[:2]
-        fps = max(1, int(round(1.0 / self._stream_min_period)))
-        pipeline = (
-            "appsrc is-live=true do-timestamp=true ! "
-            f"video/x-raw,format=BGR,width={w},height={h},framerate={fps}/1 ! "
-            "videoconvert ! video/x-raw,format=BGRx ! "
-            "nvvidconv ! video/x-raw(memory:NVMM),format=NV12 ! "
-            f"nvv4l2h264enc insert-sps-pps=1 idrinterval={fps} bitrate={self._h264_bitrate} maxperf-enable=1 ! "
-            "h264parse ! rtph264pay config-interval=1 pt=96 ! "
-            f"udpsink host={self._h264_host} port={self._h264_port} sync=false async=false"
-        )
-        writer = cv2.VideoWriter(pipeline, cv2.CAP_GSTREAMER, 0, float(fps), (w, h), True)
-        if not writer.isOpened():
-            self._h264_init_failed = True
-            self.get_logger().error('Could not open H264 GStreamer writer; check nvv4l2h264enc.')
-            return False
-        self._h264_writer = writer
-        self.get_logger().info(
-            f"H264 UDP stream -> {self._h264_host}:{self._h264_port} "
-            f"@ {fps}fps {self._h264_bitrate // 1000}kbps"
-        )
-        return True
-
     def _publish_stream_frame(self, frame):
         """Throttle and push the annotated frame to the active stream (MJPEG or H264)."""
         now = self.get_clock().now()
@@ -326,8 +348,7 @@ class AutonomousRacer(Node):
         self._last_stream_time = now
 
         if self._stream_mode == 'h264':
-            if self._ensure_h264_writer(frame):
-                self._h264_writer.write(frame)
+            if self._h264_streamer is not None and self._h264_streamer.write(frame):
                 return
             # Writer unavailable: degrade to MJPEG for the rest of the session.
             self._stream_mode = 'mjpeg'
@@ -377,18 +398,32 @@ class AutonomousRacer(Node):
         ry1 = int(h * self.intersection_params.roi_y1_pct / 100.0)
         cv2.rectangle(frame, (0, ry0), (w, ry1), (0, 0, 255), 2)
         if result.entry_y_pct is not None:
-            ey = int(h * result.entry_y_pct / 100.0)
-            cv2.line(frame, (0, ey), (w, ey), (0, 128, 255), 2)
-        # Option ROIs: green when geometrically validated, magenta otherwise.
-        for name, box in result.option_roi_boxes.items():
-            x0p, x1p, y0p, y1p = box
-            p0 = (int(w * x0p / 100.0), int(h * y0p / 100.0))
-            p1 = (int(w * x1p / 100.0), int(h * y1p / 100.0))
-            color = (0, 255, 0) if result.option_valid.get(name, False) else (255, 0, 255)
-            cv2.rectangle(frame, p0, p1, color, 2)
-        for x, y, bw, bh in result.dashed_boxes:
-            cv2.rectangle(frame, (x, y), (x + bw, y + bh), (0, 255, 255), 1)
-        cv2.putText(frame, f"dash:{result.dashed_count} L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}",
+            # Fitted zebra line the entry dashes align to; green once centered.
+            y_left = int(result.entry_intercept)
+            y_right = int(result.entry_slope * w + result.entry_intercept)
+            line_color = (0, 255, 0) if result.entry_centered else (0, 165, 255)
+            cv2.line(frame, (0, y_left), (w, y_right), line_color, 2)
+        # Option ROIs: green when geometrically validated, else each in its own
+        # color (left=magenta, straight=cyan, right=azure).
+        roi_colors = {'left': (255, 0, 255), 'straight': (255, 255, 0), 'right': (255, 160, 0)}
+        for name, poly in result.option_roi_polys.items():
+            pts = np.array(
+                [[int(w * x / 100.0), int(h * y / 100.0)] for x, y in poly],
+                dtype=np.int32,
+            )
+            color = (0, 255, 0) if result.option_valid.get(name, False) else roi_colors.get(name, (255, 0, 255))
+            cv2.polylines(frame, [pts], True, color, 2)
+        # Color each detected dash by the zone it was assigned to (matches the
+        # offline calibrator palette). Strays ('other') stay faint and thin.
+        zone_colors = {
+            'entry': (0, 165, 255), 'left': (255, 0, 255), 'straight': (255, 255, 0),
+            'right': (255, 160, 0), 'merged': (0, 0, 255), 'other': (90, 90, 90),
+        }
+        zones = result.box_zones or ['entry'] * len(result.dashed_boxes)
+        for (x, y, bw, bh), zone in zip(result.dashed_boxes, zones):
+            color = zone_colors.get(zone, zone_colors['other'])
+            cv2.rectangle(frame, (x, y), (x + bw, y + bh), color, 1 if zone == 'other' else 2)
+        cv2.putText(frame, f"dash:{result.dashed_count} L:{result.left_dash} S:{result.center_dash} R:{result.right_dash} centered:{int(result.entry_centered)}",
                     (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 2)
 
     # =============================================================
@@ -691,19 +726,40 @@ class AutonomousRacer(Node):
             result = self._analyze_intersection(frame)
             self.intersection_result = result
 
-        # The detector itself requires stable_frames_needed consecutive frames,
-        # so dashed_detected is already debounced.
-        if result is not None and result.dashed_detected and not self.intersection_pending:
-            self.intersection_pending = True
+        # The detector requires stable_frames_needed consecutive (and centered)
+        # frames, so dashed_detected is already debounced. The first time it
+        # fires we enter APPROACH: keep following the line at a creep until the
+        # zebra is close and centered, only then stop and ask for a decision.
+        if (result is not None and result.dashed_detected
+                and self.intersection_phase is None):
+            self.intersection_phase = 'approach'
             self.intersection_options = result.options
-            self.intersection_decision = None
-            self.last_prompt_time = None
+            self.get_logger().info('[INTERSECTION] detected -> APPROACH_CENTER')
 
-        if self.intersection_pending:
+        if self.intersection_phase in ('approach', 'wait') and self.intersection_result is not None:
+            self.intersection_options = self.intersection_result.options
+            self._draw_intersection_overlay(frame, self.intersection_result)
+
+        # APPROACH: arrived once the entry zebra is at the target depth and the
+        # fitted line is centered under the camera. Motion itself is handled by
+        # the line follower below (capped to a slow creep in the supervisor).
+        if self.intersection_phase == 'approach':
+            r = self.intersection_result
+            arrived = (
+                r is not None and r.entry_y_pct is not None
+                and r.entry_y_pct >= self._approach_target_entry_y_pct
+                and r.entry_centered
+            )
+            if arrived:
+                self.intersection_phase = 'wait'
+                self.intersection_pending = True
+                self.intersection_decision = None
+                self.last_prompt_time = None
+                self.get_logger().info('[INTERSECTION] centered -> WAIT for decision')
+
+        # WAIT: stopped at the intersection, prompting until a decision arrives.
+        if self.intersection_phase == 'wait':
             draw_result = self.intersection_result
-            if draw_result is not None:
-                self.intersection_options = draw_result.options
-                self._draw_intersection_overlay(frame, draw_result)
             should_prompt = self.last_prompt_time is None or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0
             if should_prompt and draw_result is not None:
                 self._publish_intersection_prompt(draw_result)
@@ -719,6 +775,7 @@ class AutonomousRacer(Node):
 
             self.commit_direction = self.intersection_decision
             self.commit_until = now + Duration(seconds=1.0)
+            self.intersection_phase = None
             self.intersection_pending = False
             self.intersection_options = []
             self.intersection_decision = None
@@ -843,16 +900,29 @@ class AutonomousRacer(Node):
                 self.commit_direction = None
                 self.commit_until = None
 
+        # During APPROACH keep steering (angular, for centering) but drive a
+        # fixed creep speed above the motor deadband so it actually closes on the
+        # zebra and stops at a repeatable spot.
+        if self.intersection_phase == 'approach':
+            base_linear_x = self._approach_speed
+            self.get_logger().info(
+                f"[INTERSECTION] APPROACH creep: V={base_linear_x:.3f} W={target_angular_z:.2f}"
+            )
+
         # ---------------------------------------------------------
         # 5. SUPERVISOR OVERRIDE (Traffic Light Scale)
         # ---------------------------------------------------------
         cmd = Twist()
 
-        if self.current_state == "RED":
+        # In testing, ignore_traffic_light forces a GREEN supervisor so the robot
+        # drives without needing to see a real light.
+        effective_state = "GREEN" if self._ignore_traffic_light else self.current_state
+
+        if effective_state == "RED":
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
             self.get_logger().info("[ACTION] Stopped for RED light.")
-        elif self.current_state == "YELLOW":
+        elif effective_state == "YELLOW":
             cmd.linear.x  = base_linear_x * 0.5
             cmd.angular.z = target_angular_z
             self.get_logger().info(
@@ -864,6 +934,12 @@ class AutonomousRacer(Node):
             self.get_logger().info(
                 f"[ACTION] Normal Drive (GREEN). Cmd -> V: {cmd.linear.x:.3f}, W: {cmd.angular.z:.3f}"
             )
+
+        # Master motion switch: if driving is disabled, hold still regardless of
+        # what the controller computed (perception keeps running below).
+        if not self._drive_enabled:
+            cmd = Twist()
+            self.get_logger().info("[DRIVE] disabled -> holding still")
 
         self.cmd_pub.publish(cmd)
 
@@ -880,8 +956,8 @@ class AutonomousRacer(Node):
 
     def destroy_node(self):
         self.cap.release()
-        if self._h264_writer is not None:
-            self._h264_writer.release()
+        if self._h264_streamer is not None:
+            self._h264_streamer.release()
         if self.show_window:
             cv2.destroyAllWindows()
         super().destroy_node()
