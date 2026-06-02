@@ -98,6 +98,7 @@ class IntersectionResult:
     dashed_boxes: list = field(default_factory=list)
     box_zones: list = field(default_factory=list)
     entry_centered: bool = False
+    entry_center_x: float | None = None
     entry_slope: float = 0.0
     entry_intercept: float = 0.0
     entry_y_pct: float | None = None
@@ -467,6 +468,7 @@ def analyze_intersection(
         dashed_boxes=boxes,
         box_zones=box_zones,
         entry_centered=entry_centered,
+        entry_center_x=entry_center_x if inlier_idx else None,
         entry_slope=entry_slope,
         entry_intercept=entry_intercept,
         entry_y_pct=entry_y_pct,

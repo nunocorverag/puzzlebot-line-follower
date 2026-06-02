@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
 set -u
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
+
 SESSION="${SESSION:-line_follower_demo}"
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
 ZERO_TWIST='{linear: {x: 0.0, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.0}}'
 
 safe_ssh() {
   timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=2 "${JETSON_USER}@${JETSON_HOST}" "$1" 2>/dev/null || true
 }
 
-echo "[1/4] Killing local tmux session..."
+echo "[1/5] Killing local tmux session and H264 receivers..."
 tmux kill-session -t "${SESSION}" 2>/dev/null || true
+pkill -f "run_line_calibrator_jetson.sh|run_line_follower_jetson.sh|view_h264_stream.sh|gst-launch-1.0 .*udpsrc port=${H264_PORT:-5000}|ffplay .*pb_h264" 2>/dev/null || true
 
-echo "[2/4] Killing Jetson line follower processes..."
-safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer' 2>/dev/null || true"
+echo "[2/5] Killing Jetson camera/perception processes..."
+safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer|line_vision_calibrator|tools/recorder.py|teleop_recorder|sign_detector|illumination_calibrator|focus_assist|calib_capture_checkerboard|nvarguscamerasrc|gst-launch|nvv4l2h264enc' 2>/dev/null || true"
 
-echo "[3/4] Publishing zero /cmd_vel burst from Jetson..."
+echo "[3/5] Publishing zero /cmd_vel burst from Jetson..."
 safe_ssh "
   source /opt/ros/humble/setup.bash 2>/dev/null || true
   export ROS_DOMAIN_ID=0
@@ -26,7 +28,7 @@ safe_ssh "
   timeout 3 ros2 topic pub --rate 20 /cmd_vel geometry_msgs/msg/Twist '${ZERO_TWIST}' 2>/dev/null || true
 "
 
-echo "[4/4] Stopping micro-ROS agent..."
+echo "[4/5] Stopping micro-ROS agent..."
 safe_ssh "pkill -f micro_ros_agent 2>/dev/null || true"
 
-echo "Stop sequence complete. If the robot still moves, cut motor power physically."
+echo "[5/5] Stop sequence complete. If the robot still moves, cut motor power physically."

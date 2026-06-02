@@ -14,13 +14,14 @@ case "${1:-}" in
   *) echo "Usage: $0 on|off" >&2; exit 2 ;;
 esac
 
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
-REMOTE_WS="${REMOTE_WS:-/home/${JETSON_USER}/ros2_ws}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
 
 ssh "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   source /opt/ros/humble/setup.bash
-  source \"${REMOTE_WS}/install/setup.bash\" 2>/dev/null || true
-  ros2 topic pub --once /drive_enable std_msgs/msg/Bool \"{data: ${VAL}}\"
+  source "${PACKAGES_WS}/install/local_setup.bash" 2>/dev/null || true
+  source "${REMOTE_WS}/install/local_setup.bash" 2>/dev/null || true
+  [ -f "${REMOTE_PKG}/env_jetson.sh" ] && source "${REMOTE_PKG}/env_jetson.sh"
+  ros2 topic pub --once --wait-matching-subscriptions 0 /drive_enable std_msgs/msg/Bool \"{data: ${VAL}}\" || true
 '"
 echo "drive_enable=${VAL} sent to ${JETSON_USER}@${JETSON_HOST}"

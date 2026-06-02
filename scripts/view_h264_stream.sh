@@ -11,15 +11,17 @@
 set -euo pipefail
 
 PORT="${1:-5000}"
+VIDEO_SINK="${VIDEO_SINK:-autovideosink}"
 CAPS="application/x-rtp,media=video,encoding-name=H264,payload=96"
 
 echo "Listening for H264/RTP on udp port ${PORT} (Ctrl+C to stop)..."
+echo "Video sink: ${VIDEO_SINK} (override with VIDEO_SINK=ximagesink if needed)"
 
 if command -v gst-launch-1.0 >/dev/null 2>&1; then
   exec gst-launch-1.0 -v \
     udpsrc port="${PORT}" caps="${CAPS}" ! \
     rtpjitterbuffer latency=50 ! rtph264depay ! avdec_h264 ! videoconvert ! \
-    autovideosink sync=false
+    "${VIDEO_SINK}" sync=false
 elif command -v ffplay >/dev/null 2>&1; then
   echo "gst-launch-1.0 not found, using ffplay (higher latency)."
   printf 'c=IN IP4 0.0.0.0\nm=video %s RTP/AVP 96\na=rtpmap:96 H264/90000\n' "${PORT}" > /tmp/pb_h264.sdp

@@ -14,6 +14,11 @@ import threading
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+try:
+    from ament_index_python.packages import get_package_share_directory
+except ImportError:
+    get_package_share_directory = None
+
 from puzzlebot_ros.perception.intersection import (
     IntersectionParams,
     analyze_intersection,
@@ -239,6 +244,14 @@ class AutonomousRacer(Node):
         self.get_logger().info("Autonomous Racer Started: Lines + Traffic Lights")
         self.get_logger().info("MJPEG stream available at http://10.10.0.100:8080")
 
+    def _package_config_path(self, filename):
+        if get_package_share_directory is None:
+            return None
+        try:
+            return Path(get_package_share_directory("puzzlebot_ros")) / "config" / filename
+        except Exception:
+            return None
+
     def _load_camera_params(self):
         if not bool(self.get_parameter('use_undistort').value):
             self.get_logger().info('Camera undistortion disabled.')
@@ -252,6 +265,9 @@ class AutonomousRacer(Node):
             Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/camera_params.npz'),
             Path(__file__).resolve().parents[1] / 'config' / 'camera_params.npz',
         ])
+        package_config = self._package_config_path('camera_params.npz')
+        if package_config is not None:
+            candidate_paths.append(package_config)
 
         for params_path in candidate_paths:
             if params_path.exists():
@@ -271,6 +287,9 @@ class AutonomousRacer(Node):
             Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/intersection_params.json'),
             Path(__file__).resolve().parents[1] / 'config' / 'intersection_params.json',
         ])
+        package_config = self._package_config_path('intersection_params.json')
+        if package_config is not None:
+            candidate_paths.append(package_config)
         for params_path in candidate_paths:
             if params_path.exists():
                 params = load_intersection_params(params_path)
@@ -292,6 +311,9 @@ class AutonomousRacer(Node):
             Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/illumination_flatfield.npz'),
             Path(__file__).resolve().parents[1] / 'config' / 'illumination_flatfield.npz',
         ])
+        package_config = self._package_config_path('illumination_flatfield.npz')
+        if package_config is not None:
+            candidate_paths.append(package_config)
 
         for params_path in candidate_paths:
             if params_path.exists():
@@ -403,6 +425,10 @@ class AutonomousRacer(Node):
             y_right = int(result.entry_slope * w + result.entry_intercept)
             line_color = (0, 255, 0) if result.entry_centered else (0, 165, 255)
             cv2.line(frame, (0, y_left), (w, y_right), line_color, 2)
+            if result.entry_center_x is not None:
+                entry_y = int(result.entry_slope * result.entry_center_x + result.entry_intercept)
+                entry_pt = (int(result.entry_center_x), entry_y)
+                cv2.circle(frame, entry_pt, 9, line_color, -1)
         # Option ROIs: green when geometrically validated, else each in its own
         # color (left=magenta, straight=cyan, right=azure).
         roi_colors = {'left': (255, 0, 255), 'straight': (255, 255, 0), 'right': (255, 160, 0)}
@@ -788,11 +814,25 @@ class AutonomousRacer(Node):
         # ---------------------------------------------------------
         bottom_y_start, bottom_y_end = int(h * 0.60), h
         bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
+        approach_entry_center_x = None
+        if (self.intersection_phase == "approach"
+                and self.intersection_result is not None
+                and self.intersection_result.entry_center_x is not None):
+            approach_entry_center_x = float(self.intersection_result.entry_center_x)
+            roi_width = bottom_x_end - bottom_x_start
+            roi_left = approach_entry_center_x - roi_width / 2.0
+            bottom_x_start = int(max(0, min(w - roi_width, roi_left)))
+            bottom_x_end = bottom_x_start + roi_width
+            cv2.line(frame, (int(approach_entry_center_x), bottom_y_start),
+                     (int(approach_entry_center_x), bottom_y_end), (0, 255, 255), 2)
 
         top_y_start, top_y_end = int(h * 0.25), int(h * 0.50)
         top_x_start, top_x_end = int(w * 0.10), int(w * 0.90)
 
-        bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
+        if approach_entry_center_x is not None:
+            bottom_reference_x = approach_entry_center_x
+        else:
+            bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
 
         bottom_candidate, bottom_mask = self.detect_line_in_roi(
             frame,
@@ -856,6 +896,13 @@ class AutonomousRacer(Node):
             else:
                 base_linear_x    = 0.0
                 target_angular_z = 0.0
+
+        if approach_entry_center_x is not None:
+            steering_center_x = approach_entry_center_x
+            self.time_line_lost = None
+            self.get_logger().info(
+                f"[INTERSECTION] Steering to entry center x={approach_entry_center_x:.1f}"
+            )
 
         # PD Math
         if steering_center_x is not None:

@@ -15,6 +15,9 @@ source "${SCRIPT_DIR}/lib/common.sh"
 LABEL="${LABEL:-sample}"
 
 sync_repo
+if [ "${HOLD_DRIVE_OFF:-1}" = "1" ]; then
+  "${SCRIPT_DIR}/set_drive_jetson.sh" off >/dev/null 2>&1 || true
+fi
 free_camera
 start_stream
 run_remote_tool "python3 tools/line_vision_calibrator.py --gstreamer --preview-mode ${STREAM} --camera-params config/camera_params.npz --output-dir debug_dataset --label ${LABEL}"

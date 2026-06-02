@@ -184,6 +184,18 @@ def apply_param_command(
         print(f"[cmd] ignored: {command}")
         return params
     name, raw_value = parsed
+    if name in ("s", "save"):
+        state["request_save_sample"] = "1"
+        return params
+    if name in ("q", "quit"):
+        state["request_quit"] = "1"
+        return params
+    if name in ("p", "pause"):
+        state["request_pause"] = "1"
+        return params
+    if name in ("u", "undistort"):
+        state["request_toggle_undistort"] = "1"
+        return params
     if name in ("save_calib", "save_params"):
         # Defer the actual write to the main loop (it owns the output path).
         state["request_save_calib"] = "1"
@@ -681,6 +693,16 @@ def main() -> int:
             state,
             params,
         )
+        if state.pop("request_save_sample", None):
+            save_requested = True
+        if state.pop("request_quit", None):
+            quit_requested = True
+        if state.pop("request_pause", None):
+            paused = not paused
+            print(f"[info] paused={paused}")
+        if state.pop("request_toggle_undistort", None):
+            undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
+            print(f"[info] undistort={undistort_enabled}")
         if local_preview:
             params = read_trackbars(controls_window, params)
         if state.pop("request_save_calib", None):
