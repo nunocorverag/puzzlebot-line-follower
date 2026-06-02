@@ -83,6 +83,14 @@ To go back to the old mode with OpenCV trackbars:
 STREAM=local scripts/run_line_calibrator_jetson.sh
 ```
 
+On WSL/X11, keep H264 but choose the X11 sink explicitly:
+
+```bash
+VIDEO_SINK=ximagesink scripts/run_line_calibrator_jetson.sh
+```
+
+Native Ubuntu can keep the default `autovideosink`.
+
 ---
 
 ## How to test the camera alone
@@ -159,6 +167,10 @@ scripts/set_calibrator_param.sh min_dash_count 6
 scripts/set_calibrator_param.sh roi_y0_pct 72
 scripts/set_calibrator_param.sh roi_skew 8
 scripts/set_calibrator_param.sh label sample
+scripts/set_calibrator_param.sh s 1
+scripts/set_calibrator_param.sh u 1
+scripts/set_calibrator_param.sh p 1
+scripts/set_calibrator_param.sh q 1
 ```
 
 Special commands:
@@ -224,6 +236,37 @@ What to look for visually:
   `max_aspect_x10` before changing the ROI.
 
 ---
+
+## Parking at an intersection for diagonal ROI tuning
+
+The calibrator never drives the robot. To tune the diagonal option ROIs, first let
+the follower drive to the intersection and center the bottom ROI on the detected
+entry center:
+
+```bash
+# Terminal 1: motor bridge
+scripts/run_motor_agent_jetson.sh
+
+# Terminal 2: follower without traffic-light gating
+IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh
+
+# Terminal 3: allow motion, then halt when it is centered/waiting
+scripts/set_drive_jetson.sh on
+scripts/set_drive_jetson.sh off
+```
+
+Then free the camera and open the calibrator from that parked pose:
+
+```bash
+scripts/stop_demo.sh
+LABEL=roi_diagonal_debug scripts/run_line_calibrator_jetson.sh
+scripts/set_calibrator_param.sh s 1
+scripts/pull_calibration_dataset.sh
+```
+
+Use `VIDEO_SINK=ximagesink` with the calibrator command on WSL. The follower
+uses `entry_center_x` during `APPROACH_CENTER`; if it is drifting toward a side
+branch, tune the entry band and dash filters before touching the controller.
 
 ## Files that DO get committed
 

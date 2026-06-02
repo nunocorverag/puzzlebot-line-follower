@@ -21,6 +21,14 @@ The shared boilerplate (SSH/sourcing, laptop-IP autodetection, camera freeing,
 H264 receiver) lives in **`scripts/lib/common.sh`**; the `run_*_jetson.sh`
 scripts source it so they all behave the same.
 
+Most H264 viewers use `VIDEO_SINK=autovideosink` by default. On WSL/X11 use
+`VIDEO_SINK=ximagesink` to avoid sink selection problems:
+
+```bash
+VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+VIDEO_SINK=ximagesink scripts/run_line_calibrator_jetson.sh
+```
+
 ### Preview / streaming: the `STREAM` variable
 
 Every camera tool honours one variable, `STREAM`:
@@ -53,16 +61,16 @@ single-owner, so run one at a time; the scripts free it before starting.
 | `build_on_jetson.sh` (canonical) | `colcon build --packages-select puzzlebot_ros` on the Jetson. | After syncing changed Python that ROS needs installed (entry points/launch). |
 | `run_line_follower_jetson.sh` | Runs `ros2 run puzzlebot_ros line_follower` (the autonomous racer). MJPEG at `http://10.10.0.100:8080`. Override node with `NODE=`. | Real autonomous run. Wheels-up first. |
 | `run_demo_tmux.sh` | tmux session: sync/build + micro-ROS agent + line follower + topic monitor. | Full demo orchestration. |
-| `stop_demo.sh` (canonical) | Kills tmux, kills `line_follower`/`autonomous_racer`, publishes a zero `/cmd_vel` burst, stops micro-ROS agent. | **Emergency stop / clean shutdown.** Keep it in a ready terminal. |
+| `stop_demo.sh` (canonical) | Kills tmux, local H264 receivers/runner scripts, Jetson camera/perception processes, publishes a zero `/cmd_vel` burst, stops micro-ROS agent. | **Emergency stop / clean shutdown.** Keep it in a ready terminal. |
 | `start_all_jetson.sh` | `nohup` launch of camera + recorder in background with logs in `/tmp`. | Headless data-collection sessions. |
 
 ## Calibration & perception tuning
 
 | Script / Tool | What it does | When to run |
 | --- | --- | --- |
-| `run_line_calibrator_jetson.sh` | Syncs, then runs `tools/line_vision_calibrator.py --gstreamer`. Default `STREAM=h264` shows a fast dashboard (overlay + Otsu mask + state panel). Use `STREAM=local` for the old OpenCV trackbars. | Tune intersection/mask params live. **Primary perception playground.** |
+| `run_line_calibrator_jetson.sh` | Syncs, sends `drive_enable=false`, frees the CSI camera, then runs `tools/line_vision_calibrator.py --gstreamer`. Default `STREAM=h264` shows a fast dashboard (overlay + Otsu mask + state panel). Use `STREAM=local` for the old OpenCV trackbars. Set `HOLD_DRIVE_OFF=0` only if you intentionally do not want the script to touch `/drive_enable`. | Tune intersection/mask params live. **Primary perception playground.** |
 | `tools/line_vision_calibrator.py` | The calibrator itself. Live trackbars, mask/overlay/state windows, saves labeled samples. Also runs offline on saved images: `--image path.jpg`. | Live on Jetson or offline tuning on the laptop. |
-| `set_calibrator_param.sh` | Writes `PARAM=VALUE` (or `label X`) into the calibrator command file the tool watches. | Adjust parameters while the H264 calibrator is running, e.g. `scripts/set_calibrator_param.sh min_dash_count 6`. |
+| `set_calibrator_param.sh` | Writes `PARAM=VALUE` (or `label X`) into the calibrator command file the tool watches. Also supports H264 control commands: `s 1` save, `p 1` pause, `u 1` undistort, `q 1` quit, `save_calib 1` persist detector params. | Adjust parameters while the H264 calibrator is running, e.g. `scripts/set_calibrator_param.sh min_dash_count 6`. |
 | `run_illumination_calibrator_jetson.sh` + `tools/illumination_calibrator.py` | Auto-guided flat-field capture over H264; averages good white-surface frames, writes `config/illumination_flatfield.npz`, pulls it back. | **Illumination calibration** — see [CALIBRATION_ILLUMINATION.md](CALIBRATION_ILLUMINATION.md). |
 | `run_focus_assist_jetson.sh` + `tools/focus_assist.py` | Live sharpness meter over H264 with peak-hold; twist the lens to maximize. | **Set focus first** (before camera calibration). |
 | `run_checkerboard_capture_jetson.sh` + `tools/calib_capture_checkerboard.py` | Auto-guided checkerboard capture over H264 (pose-diversity hints); pulls images to `calibration_images/`. | **Camera calibration, step 1** — see [CALIBRATION_CHECKERBOARD.md](CALIBRATION_CHECKERBOARD.md). |
@@ -93,16 +101,19 @@ single-owner, so run one at a time; the scripts free it before starting.
 | `run_motor_agent_jetson.sh` | Starts the micro-ROS agent (the `/cmd_vel` → motors bridge) via `~/start_robot.sh`. Foreground; Ctrl-C stops. | **Run this first** for any motion (teleop/jog/follower). Safe alongside the follower. |
 | `run_teleop_wasd_combo.sh` + `tools/teleop_wasd_gui.py` + `tools/cmd_vel_udp_bridge.py` | **True-combo** WASD: reads the **laptop** keyboard with real key state (pygame window) so holding `w`+`a` together is a genuine curve, and sends velocity over **UDP** to a Jetson bridge that republishes `/cmd_vel` (no ROS on the laptop; bridge has a 0.3 s watchdog). A terminal/SSH teleop physically *cannot* do simultaneous key holds — this can. Needs `python3-pygame` on the laptop (`sudo apt install python3-pygame`). Keys: `w/s` `a/d` `q/e`, space stop, `-`/`=` speed, ESC quit. | Manual driving when you need real simultaneous combos. |
 | `jog_forward_jetson.sh SPEED DURATION` | Publishes `/cmd_vel linear.x=SPEED` for `DURATION` s, then zero. Use ≥0.10 (deadband). e.g. `0.10 1.5`. | Move forward for visual ROI tests **without** the autonomous node. Never alongside `line_follower`. |
-| `set_drive_jetson.sh on\|off` | Toggles the follower's motion master switch via `/drive_enable` (Bool). The follower starts with driving **disabled**. | Enable/halt the follower's motion during testing without killing it. |
+| `set_drive_jetson.sh on\|off` | Toggles the follower's motion master switch via `/drive_enable` (Bool). The follower starts with driving **disabled**. It uses `--wait-matching-subscriptions 0`, so it returns even if the follower is not currently running. | Enable/halt the follower's motion during testing without killing it. |
 
 ### Testing the follower's approach-and-center
 
 The follower loads the tuned detection params the calibrator saves via
 `save_calib` (`config/intersection_params.json`); without it, built-in defaults.
-On detecting an intersection it enters `APPROACH_CENTER` — creeps forward
+On detecting an intersection it enters `APPROACH_CENTER` - creeps forward
 (`approach_speed`, default 0.10, **above the deadband**) while centering on the
-fitted entry line, until the zebra reaches `approach_target_entry_y_pct` (82) and
-is centered, then stops and waits for a `/intersection_decision`.
+detector's `entry_center_x`. The bottom line-following ROI is recentered around
+that same entry center during the approach, so the robot follows the straight
+entry instead of drifting toward a side branch. When the zebra reaches
+`approach_target_entry_y_pct` (82) and is centered, it stops and waits for a
+`/intersection_decision`.
 
 ```bash
 # 0. Tune the entry band in the calibrator, then persist it:
@@ -116,6 +127,16 @@ IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh
 # 3. When wheels are clear, allow motion (and halt anytime):
 scripts/set_drive_jetson.sh on
 scripts/set_drive_jetson.sh off
+```
+
+That stopped/centered pose is the useful place to run the calibrator for the
+diagonal option ROIs:
+
+```bash
+scripts/stop_demo.sh
+LABEL=roi_diagonal_debug scripts/run_line_calibrator_jetson.sh
+scripts/set_calibrator_param.sh s 1
+scripts/pull_calibration_dataset.sh
 ```
 
 ## Camera & data capture
@@ -138,9 +159,9 @@ There are two different things you can view; pick by intent:
 | **Raw camera, no overlays** | `scripts/run_camera_h264_jetson.sh` | Pure GStreamer (no ROS, no line follower). Just the camera. Lowest latency. |
 | **Line follower's annotated view** (ROI boxes, anchors, steering line) | `scripts/run_line_follower_h264.sh` | Runs the autonomous racer and streams the frame it draws on. For debugging perception. |
 
-> The CSI camera allows only ONE process at a time. Run either the follower or
-> the raw-camera preview, never both. Stop a running follower with
-> `scripts/stop_demo.sh` before switching.
+> The CSI camera allows only ONE process at a time. Run either the follower,
+> calibrator, recorder, sign detector, or raw-camera preview, never more than one
+> camera owner. Stop active tools with `scripts/stop_demo.sh` before switching.
 
 Transport options for the follower stream:
 
@@ -164,6 +185,16 @@ set it. Manual/split equivalent:
 STREAM=h264 scripts/run_line_follower_jetson.sh        # H264_HOST auto-detected
 scripts/view_h264_stream.sh                            # on the laptop (manual receiver)
 ```
+
+For WSL/X11 receivers:
+
+```bash
+VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+VIDEO_SINK=ximagesink STREAM=h264 scripts/run_line_calibrator_jetson.sh
+```
+
+Native Ubuntu can keep the default `autovideosink`. The receiver scripts keep
+`sync=false` for lower latency.
 
 Tuning ROS params (also work via the run-script env or `--ros-args`):
 `stream_fps` (15), `stream_quality` (60), `stream_max_width` (0=full),

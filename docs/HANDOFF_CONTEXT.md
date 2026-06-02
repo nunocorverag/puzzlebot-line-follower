@@ -1,6 +1,19 @@
 # Puzzlebot Line Follower - Handoff Context
 
-Last updated: 2026-05-31
+Last updated: 2026-06-02
+
+## Update 2026-06-02 - Line centering, calibrator controls, and stop scripts
+
+Development is on branch `develop` from commit `66bf150` (`Integrate intersection centering and calibrator controls`). Done:
+
+- `line_follower.py` loads shared config from the installed package when needed, can run with `IGNORE_TRAFFIC_LIGHT=1`, and uses the intersection detector's `entry_center_x` during `APPROACH_CENTER` to recenter the bottom line ROI while parking at the intersection.
+- `tools/line_vision_calibrator.py` accepts H264 command-file controls: `s=1` save, `p=1` pause, `u=1` undistort, `q=1` quit, and `save_calib=1` persist params.
+- `run_line_calibrator_jetson.sh` syncs, sends `drive_enable=false` by default, frees the CSI camera, starts H264 preview, and runs the calibrator directly on the Jetson camera.
+- `set_drive_jetson.sh` now returns even if the follower is not running, so it can be used safely before/after calibrator sessions.
+- `stop_demo.sh` is the canonical cleanup: it stops local H264 receivers and Jetson camera/perception processes, sends zero `/cmd_vel`, and stops micro-ROS.
+- H264 viewing defaults to `VIDEO_SINK=autovideosink`; WSL users should run with `VIDEO_SINK=ximagesink`. Keep `sync=false` for lower latency.
+
+Validated in this session: Jetson build succeeded, H264 calibrator opened the CSI camera, saved a `roi_diagonal_debug` sample, and `stop_demo.sh` cleaned leftover camera/H264/calibrator processes.
 
 ## Update 2026-05-31 — Perception unified + repo cleanup
 
