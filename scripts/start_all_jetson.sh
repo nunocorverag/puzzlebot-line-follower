@@ -45,19 +45,14 @@ case "${1:-start}" in
       # 1) Robot
       nohup bash -c '${ROS} && bash ~/start_robot.sh' > /tmp/robot.log 2>&1 &
       echo \$! > /tmp/robot.pid
-      echo '[1/3] micro_ros_agent starting...'
+      echo '[1/2] micro_ros_agent starting...'
       sleep 4
 
-      # 2) Camera
-      nohup bash -c '${ROS} && ros2 launch puzzlebot_ros camera_jetson.launch.py' > /tmp/cam.log 2>&1 &
-      echo \$! > /tmp/cam.pid
-      echo '[2/3] camera starting...'
-      sleep 4
-
-      # 3) Recorder
-      nohup bash -c '${ROS} && cd ${REMOTE_PKG} && python3 tools/recorder.py --interval 0.5 --output-dir dataset' > /tmp/rec.log 2>&1 &
+      # 2) Recorder (opens the CSI camera directly; no separate camera node, or
+      #    the two would fight over the single-owner CSI). Headless = STREAM=none.
+      nohup bash -c '${ROS} && cd ${REMOTE_PKG} && STREAM=none python3 tools/recorder.py --interval 0.5 --output-dir dataset --headless' > /tmp/rec.log 2>&1 &
       echo \$! > /tmp/rec.pid
-      echo '[3/3] recorder starting...'
+      echo '[2/2] recorder starting (owns the camera)...'
     "
 
     echo ""

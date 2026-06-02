@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
-# Runs teleop_recorder directly on the Jetson via interactive SSH.
+# Drive + record on the Jetson. Keys are read from THIS terminal (tty), so the
+# preview can stream over H264 to the laptop.
 # Controls: W=forward S=back A=left D=right Q=quit
+#
+#   scripts/run_teleop_recorder_jetson.sh               # H264 preview (default)
+#   STREAM=local scripts/run_teleop_recorder_jetson.sh  # window via ssh -X
 set -euo pipefail
 
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
-REMOTE_WS="${REMOTE_WS:-/home/${JETSON_USER}/ros2_ws}"
-REMOTE_PKG="${REMOTE_WS}/src/puzzlebot_ros"
-
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-"${SCRIPT_DIR}/sync_to_jetson.sh"
+source "${SCRIPT_DIR}/lib/common.sh"
 
 echo "Controls: W=forward  S=back  A=left  D=right  Q=quit"
 echo ""
 
-xhost +local: >/dev/null 2>&1 || true
-ssh -X -t "${JETSON_USER}@${JETSON_HOST}" "source /opt/ros/humble/setup.bash && source /home/puzzlebot/ros2_packages_ws/install/local_setup.bash && source ${REMOTE_WS}/install/local_setup.bash && cd ${REMOTE_PKG} && python3 tools/teleop_recorder.py"
+sync_repo
+free_camera
+start_stream
+run_remote_tool "python3 tools/teleop_recorder.py"

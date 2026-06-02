@@ -1,38 +1,40 @@
 #!/usr/bin/env bash
+# Run the autonomous line follower (ros2 run, uses the BUILT package — run
+# build_on_jetson.sh after changing node code). Wheels-up first.
+#
+#   scripts/run_line_follower_jetson.sh                 # H264 to laptop (default)
+#   STREAM=local scripts/run_line_follower_jetson.sh    # MJPEG at http://10.10.0.100:8080
+#   STREAM=none  scripts/run_line_follower_jetson.sh    # MJPEG server only, no receiver
+#   NODE=autonomous_racer scripts/run_line_follower_jetson.sh
+#   IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh   # drive w/o needing a GREEN light (testing)
 set -euo pipefail
 
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
-REMOTE_WS="${REMOTE_WS:-/home/${JETSON_USER}/ros2_ws}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
+
 NODE="${NODE:-line_follower}"
 
-# Optional H264 stream: STREAM_MODE=h264 [H264_HOST=auto] [H264_PORT=5000]
-# H264_HOST defaults to this laptop's IP on the robot network (auto-detected),
-# so on RoboNet you normally never set it.
-STREAM_MODE="${STREAM_MODE:-}"
-H264_HOST="${H264_HOST:-}"
-H264_PORT="${H264_PORT:-5000}"
+# Map the unified STREAM knob onto the node's ROS params. h264 streams to the
+# laptop; anything else uses the built-in MJPEG server (browser at :8080).
+start_stream            # launches the H264 receiver locally when STREAM=h264
+PARAMS=""
+if [ "${STREAM}" = "h264" ]; then
+  PARAMS="${PARAMS} -p stream_mode:=h264 -p h264_host:=${H264_HOST} -p h264_port:=${H264_PORT} -p h264_bitrate:=${H264_BITRATE}"
+fi
+if [ "${IGNORE_TRAFFIC_LIGHT:-0}" = "1" ]; then
+  PARAMS="${PARAMS} -p ignore_traffic_light:=true"
+fi
 ROS_ARGS=""
-if [ "${STREAM_MODE}" = "h264" ]; then
-  if [ -z "${H264_HOST}" ]; then
-    H264_HOST="$(ip route get "${JETSON_HOST}" 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1)"
-  fi
-  if [ -z "${H264_HOST}" ]; then
-    echo "Could not auto-detect laptop IP; set H264_HOST=<ip>." >&2; exit 1
-  fi
-  echo "H264 stream -> ${H264_HOST}:${H264_PORT}"
-  ROS_ARGS="--ros-args -p stream_mode:=h264 -p h264_host:=${H264_HOST} -p h264_port:=${H264_PORT}"
-elif [ -n "${STREAM_MODE}" ]; then
-  ROS_ARGS="--ros-args -p stream_mode:=${STREAM_MODE}"
+if [ -n "${PARAMS}" ]; then
+  ROS_ARGS="--ros-args${PARAMS}"
 fi
 
 xhost +local: >/dev/null 2>&1 || true
-
 ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
-  cd "${REMOTE_WS}"
+  cd \"${REMOTE_WS}\"
   source /opt/ros/humble/setup.bash
   source src/puzzlebot_ros/env_jetson.sh
   source install/setup.bash
   export PYTHONNOUSERSITE=1
-  ros2 run puzzlebot_ros "${NODE}" ${ROS_ARGS}
+  ros2 run puzzlebot_ros \"${NODE}\" ${ROS_ARGS}
 '"

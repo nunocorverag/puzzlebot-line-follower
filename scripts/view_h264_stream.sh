@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # Receive the Jetson hardware-encoded H264/RTP stream on the laptop.
 #
-# Start the follower in H264 mode first (sends UDP to this laptop):
-#   STREAM_MODE=h264 H264_HOST=<this-laptop-ip> scripts/run_line_follower_jetson.sh
-# then run this receiver:
+# Usually launched automatically by the run scripts (start_stream in
+# scripts/lib/common.sh). To run it manually as a standalone receiver:
 #   scripts/view_h264_stream.sh [port]
+# paired with e.g.:
+#   STREAM=h264 scripts/run_line_follower_jetson.sh
 #
 # Find this laptop's IP on the robot network with:  ip -4 addr show | grep 10.10
 set -euo pipefail

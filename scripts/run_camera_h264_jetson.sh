@@ -2,40 +2,29 @@
 # Raw CSI camera preview over hardware H264 -- NO line follower, NO overlays.
 # Pure GStreamer on the Jetson (camera -> nvv4l2h264enc -> UDP) + local viewer.
 #
-# The CSI camera allows only ONE user at a time, so this stops any running
-# follower first (via stop_demo.sh, in its own SSH session). The laptop IP is
-# auto-detected. Ctrl+C stops both ends.
+# The CSI camera allows only ONE user at a time, so this frees it first. The
+# laptop IP is auto-detected. Ctrl+C stops both ends.
 #
 #   scripts/run_camera_h264_jetson.sh
 set -euo pipefail
 
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
-H264_PORT="${H264_PORT:-5000}"
+STREAM=h264   # this script is inherently an H264 stream
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
+
 WIDTH="${WIDTH:-640}"
 HEIGHT="${HEIGHT:-480}"
 FPS="${FPS:-30}"
 BITRATE="${BITRATE:-4000000}"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-H264_HOST="${H264_HOST:-$(ip route get "${JETSON_HOST}" 2>/dev/null | grep -oP 'src \K[0-9.]+' | head -1)}"
 
-if [ -z "${H264_HOST}" ]; then
-  echo "Could not auto-detect laptop IP; set H264_HOST=<ip>." >&2; exit 1
-fi
-echo "Raw camera H264 -> ${H264_HOST}:${H264_PORT}"
+echo "Freeing camera..."
+free_camera
 
-# Free the camera: stop any running follower (separate SSH session; also sends a
-# safety zero /cmd_vel). Doing this here avoids a pkill self-kill race.
-echo "Freeing camera (stopping any follower)..."
-"${SCRIPT_DIR}/stop_demo.sh" >/dev/null 2>&1 || true
-
-# Start the receiver on the laptop.
-"${SCRIPT_DIR}/view_h264_stream.sh" "${H264_PORT}" &
-RX_PID=$!
-trap 'kill "${RX_PID}" 2>/dev/null || true' EXIT
+start_stream   # auto-detects H264_HOST, launches the local receiver
 
 # Pure GStreamer pipeline on the Jetson: capture -> downscale -> HW H264 -> UDP.
-# The leading sleep lets the camera fully release after the follower stopped.
+# The leading sleep lets the camera fully release after anything was stopped.
 ssh "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   sleep 1.5
   gst-launch-1.0 -e nvarguscamerasrc sensor-id=0 ! \

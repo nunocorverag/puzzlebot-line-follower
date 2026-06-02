@@ -1,24 +1,20 @@
 #!/usr/bin/env bash
+# Live line/intersection calibrator on the Jetson. Default is H264 dashboard
+# (overlay + Otsu mask + state panel). Use STREAM=local for OpenCV trackbars.
+#
+#   scripts/run_line_calibrator_jetson.sh
+#   STREAM=local scripts/run_line_calibrator_jetson.sh   # old trackbar UI
+#   LABEL=curve_left scripts/run_line_calibrator_jetson.sh
 set -euo pipefail
 
-JETSON_USER="${JETSON_USER:-puzzlebot}"
-JETSON_HOST="${JETSON_HOST:-10.10.0.100}"
-REMOTE_WS="${REMOTE_WS:-/home/${JETSON_USER}/ros2_ws}"
-REMOTE_PACKAGE="${REMOTE_WS}/src/puzzlebot_ros"
-LABEL="${LABEL:-sample}"
+STREAM="${STREAM:-h264}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/lib/common.sh"
 
-"${SCRIPT_DIR}/sync_to_jetson.sh"
+LABEL="${LABEL:-sample}"
 
-xhost +local: >/dev/null 2>&1 || true
-
-ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
-  cd "${REMOTE_PACKAGE}"
-  export PYTHONNOUSERSITE=1
-  python3 tools/line_vision_calibrator.py \
-    --gstreamer \
-    --camera-params config/camera_params.npz \
-    --output-dir debug_dataset \
-    --label "${LABEL}"
-'"
+sync_repo
+free_camera
+start_stream
+run_remote_tool "python3 tools/line_vision_calibrator.py --gstreamer --preview-mode ${STREAM} --camera-params config/camera_params.npz --output-dir debug_dataset --label ${LABEL}"
