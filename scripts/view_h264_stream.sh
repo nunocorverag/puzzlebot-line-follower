@@ -19,7 +19,15 @@
 # Find this laptop's IP on the robot network with:  ip -4 addr show | grep 10.10
 set -euo pipefail
 
-PORT="${1:-5000}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -f "${SCRIPT_DIR}/local.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/local.env"
+  set +a
+fi
+
+PORT="${1:-${H264_PORT:-5000}}"
 VIDEO_SINK="${VIDEO_SINK:-autovideosink}"
 CAPS="application/x-rtp,media=video,encoding-name=H264,payload=96"
 

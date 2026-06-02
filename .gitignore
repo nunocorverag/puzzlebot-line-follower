@@ -25,3 +25,6 @@ debug_dataset/
 dataset*.zip
 dataset_traffic_light/
 dataset_signs/
+
+# Per-laptop script overrides. Copy scripts/local.env.example to scripts/local.env.
+scripts/local.env

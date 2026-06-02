@@ -21,13 +21,20 @@ The shared boilerplate (SSH/sourcing, laptop-IP autodetection, camera freeing,
 H264 receiver) lives in **`scripts/lib/common.sh`**; the `run_*_jetson.sh`
 scripts source it so they all behave the same.
 
-Most H264 viewers use `VIDEO_SINK=autovideosink` by default. On WSL/X11 use
-`VIDEO_SINK=ximagesink` to avoid sink selection problems:
+Most H264 viewers use `VIDEO_SINK=autovideosink` by default. For a per-laptop
+setting, configure `scripts/local.env` once:
 
 ```bash
-VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
-VIDEO_SINK=ximagesink scripts/run_line_calibrator_jetson.sh
+# Native Ubuntu
+scripts/set_local_video_sink.sh autovideosink
+
+# WSL/Windows with X11
+scripts/set_local_video_sink.sh ximagesink
 ```
+
+After that, run camera tools normally. For example, WSL teammates can run the
+line calibrator with just `scripts/run_line_calibrator_jetson.sh`; the receiver
+will use `ximagesink` automatically.
 
 ### Preview / streaming: the `STREAM` variable
 
@@ -186,15 +193,7 @@ STREAM=h264 scripts/run_line_follower_jetson.sh        # H264_HOST auto-detected
 scripts/view_h264_stream.sh                            # on the laptop (manual receiver)
 ```
 
-For WSL/X11 receivers:
-
-```bash
-VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
-VIDEO_SINK=ximagesink STREAM=h264 scripts/run_line_calibrator_jetson.sh
-```
-
-Native Ubuntu can keep the default `autovideosink`. The receiver scripts keep
-`sync=false` for lower latency.
+For WSL/X11 receivers, run `scripts/set_local_video_sink.sh ximagesink` once. Native Ubuntu can run `scripts/set_local_video_sink.sh autovideosink` or simply keep the default. The receiver scripts keep `sync=false` for lower latency.
 
 Tuning ROS params (also work via the run-script env or `--ros-args`):
 `stream_fps` (15), `stream_quality` (60), `stream_max_width` (0=full),
@@ -220,7 +219,8 @@ Use these from the repo root on the laptop unless noted otherwise. Most Jetson s
 | `set_calibrator_param.sh` | `scripts/set_calibrator_param.sh roi_y0_pct 72` | Live H264 calibrator controls and params; also `s 1`, `p 1`, `u 1`, `q 1`. |
 | `pull_calibration_dataset.sh` | `scripts/pull_calibration_dataset.sh` | Pulls Jetson `debug_dataset/` to the laptop. |
 | `run_camera_h264_jetson.sh` | `scripts/run_camera_h264_jetson.sh` | Raw CSI camera over H264, no ROS overlays. |
-| `view_h264_stream.sh` | `VIDEO_SINK=ximagesink scripts/view_h264_stream.sh` | Manual laptop receiver. Native Ubuntu can omit `VIDEO_SINK`; WSL should use `ximagesink`. |
+| `set_local_video_sink.sh` | `scripts/set_local_video_sink.sh ximagesink` | One-time laptop config for the H264 viewer sink. Use `autovideosink` on native Ubuntu, `ximagesink` on WSL/X11. |
+| `view_h264_stream.sh` | `scripts/view_h264_stream.sh` | Manual laptop receiver. It reads `scripts/local.env` if present. |
 | `run_camera_jetson.sh` | `scripts/run_camera_jetson.sh` | ROS camera topic launcher. Most tools do not need it because they open CSI directly. |
 | `run_recorder_jetson.sh` | `scripts/run_recorder_jetson.sh` | Camera preview/dataset recorder. |
 | `run_teleop_recorder_jetson.sh` | `scripts/run_teleop_recorder_jetson.sh` | Manual drive plus recording. |
@@ -232,13 +232,16 @@ Use these from the repo root on the laptop unless noted otherwise. Most Jetson s
 | `run_illumination_calibrator_jetson.sh` | `scripts/run_illumination_calibrator_jetson.sh` | Captures flat-field illumination calibration. |
 | `start_all_jetson.sh` | `scripts/start_all_jetson.sh` | Legacy/headless background camera + recorder launcher; avoid when using other CSI tools. |
 
-For WSL/Windows teammates, the important H264 receiver command is:
+For WSL/Windows teammates, configure the receiver once:
 
 ```bash
-VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+scripts/set_local_video_sink.sh ximagesink
 ```
 
-If that line does not work in their copy, they are running an older checkout. They should pull the latest branch and rerun the script from this repo. The current receiver uses this GStreamer path:
+That creates `scripts/local.env` locally. Then every H264 tool, including the
+line calibrator, can be run normally. If that helper or `scripts/local.env` does
+not exist in their copy, they are running an older checkout. The current receiver
+uses this GStreamer path:
 
 ```bash
 VIDEO_SINK="${VIDEO_SINK:-autovideosink}"
