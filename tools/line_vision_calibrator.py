@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import queue
 import sys
 import threading
@@ -41,7 +42,18 @@ from puzzlebot_ros.perception.intersection import (  # noqa: E402
     IntersectionResult as DetectionResult,
     analyze_intersection,
     black_mask,
+    save_intersection_params,
 )
+# Camera capture / preprocessing helpers also live in the package now. Re-export
+# them so other tools that historically imported from this module keep working.
+from puzzlebot_ros.perception.camera import (  # noqa: E402,F401
+    apply_illumination_gain,
+    build_gstreamer_pipeline,
+    load_camera_params,
+    load_illumination_gain,
+    preprocess_frame,
+)
+from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 
 
 @dataclass
@@ -49,44 +61,6 @@ class CalibrationParams(IntersectionParams):
     """Detection params (inherited) plus calibrator UI-only fields."""
 
     show_state_panel: int = 1
-
-
-def build_gstreamer_pipeline(width: int = 640, height: int = 480, fps: int = 30) -> str:
-    # Capture at native 1280x720 — caller must cv2.resize to target resolution.
-    return (
-        "nvarguscamerasrc sensor-id=0 ! "
-        "video/x-raw(memory:NVMM), width=1280, height=720, format=NV12, framerate=30/1 ! "
-        "nvvidconv ! video/x-raw, format=BGRx ! "
-        "videoconvert ! video/x-raw, format=BGR ! "
-        "appsink max-buffers=1 drop=true"
-    )
-
-
-def load_camera_params(path: Path) -> tuple[np.ndarray | None, np.ndarray | None]:
-    if not path.exists():
-        print(f"[warn] camera params not found: {path}")
-        return None, None
-    data = np.load(str(path))
-    print(f"[info] loaded camera params: {path}")
-    return data["camera_matrix"], data["dist_coeffs"]
-
-
-def load_illumination_gain(path: Path) -> np.ndarray | None:
-    if not path.exists():
-        print(f"[warn] illumination params not found: {path}")
-        return None
-    data = np.load(str(path))
-    print(f"[info] loaded illumination params: {path}")
-    return data["gain"].astype(np.float32)
-
-
-def apply_illumination_gain(frame: np.ndarray, gain: np.ndarray | None) -> np.ndarray:
-    if gain is None:
-        return frame
-    if gain.shape[:2] != frame.shape[:2]:
-        gain = cv2.resize(gain, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_LINEAR)
-    corrected = frame.astype(np.float32) * gain
-    return np.clip(corrected, 0, 255).astype(np.uint8)
 
 
 def open_capture(args: argparse.Namespace) -> cv2.VideoCapture | None:
@@ -136,6 +110,13 @@ TRACKBAR_BINDINGS = {
     "split_option_rois": ("split_option_rois", 0, 1),
     "option_gap_pct": ("option_gap_pct", 0, 20),
     "straight_option_width_pct": ("straight_option_width_pct", 6, 60),
+    "option_roi_skew_pct": ("option_roi_skew_pct", 0, 30),
+    "roi_skew": ("option_roi_skew_pct", 0, 30),
+    "entry_line_tol_pct": ("entry_line_tol_pct", 0, 20),
+    "entry_max_slope_x10": ("entry_max_slope_x10", 0, 30),
+    "center_tol_pct": ("center_tol_pct", 0, 50),
+    "merge_width_factor_x10": ("merge_width_factor_x10", 10, 50),
+    "require_centered": ("require_centered", 0, 1),
     "show_state_panel": ("show_state_panel", 0, 1),
     "ratio_fallback": ("ratio_fallback", 0, 1),
     "enable_ratio_fallback": ("ratio_fallback", 0, 1),
@@ -144,6 +125,24 @@ TRACKBAR_BINDINGS = {
     "side_y0_pct": ("side_y0_pct", 0, 100),
     "side_y1_pct": ("side_y1_pct", 1, 100),
 }
+
+
+PARAM_ALIASES = {
+    "rect_pct": "rectangularity_pct",
+    "stable_frames": "stable_frames_needed",
+    "option_dash_count": "option_min_dash_count",
+    "ratio_fallback": "enable_ratio_fallback",
+    "roi_skew": "option_roi_skew_pct",
+}
+
+
+def set_param_direct(params: CalibrationParams, name: str, value: int) -> CalibrationParams:
+    field_name = PARAM_ALIASES.get(name, name)
+    if not hasattr(params, field_name):
+        return params
+    updated = CalibrationParams(**asdict(params))
+    setattr(updated, field_name, int(value))
+    return updated
 
 
 def start_stdin_command_thread(command_queue: queue.Queue[str]) -> None:
@@ -174,47 +173,67 @@ def parse_param_command(command: str) -> tuple[str, str] | None:
     return name.strip(), value.strip()
 
 
-def apply_param_command(controls_window: str, command: str, state: dict[str, str]) -> bool:
+def apply_param_command(
+    controls_window: str | None,
+    command: str,
+    state: dict[str, str],
+    params: CalibrationParams | None = None,
+) -> CalibrationParams | None:
     parsed = parse_param_command(command)
     if parsed is None:
         print(f"[cmd] ignored: {command}")
-        return False
+        return params
     name, raw_value = parsed
+    if name in ("save_calib", "save_params"):
+        # Defer the actual write to the main loop (it owns the output path).
+        state["request_save_calib"] = "1"
+        return params
     if name == "label":
         label = raw_value.strip().replace(" ", "_")
         if not label:
             print("[cmd] ignored empty label")
-            return False
+            return params
         state["label"] = label
         print(f"[cmd] label={label}")
-        return True
+        return params
 
     binding = TRACKBAR_BINDINGS.get(name)
     if binding is None:
         known = ", ".join(["label"] + sorted(TRACKBAR_BINDINGS))
         print(f"[cmd] unknown parameter '{name}'. Known: {known}")
-        return False
+        return params
     try:
         value = int(float(raw_value))
     except ValueError:
         print(f"[cmd] invalid numeric value for {name}: {raw_value}")
-        return False
+        return params
     trackbar_name, min_value, max_value = binding
     clamped = max(min_value, min(max_value, value))
-    cv2.setTrackbarPos(trackbar_name, controls_window, clamped)
+    if controls_window is not None:
+        cv2.setTrackbarPos(trackbar_name, controls_window, clamped)
+    if params is not None:
+        params = set_param_direct(params, name, clamped)
     print(f"[cmd] {name}={clamped}")
-    return True
+    return params
 
 
-def apply_command_file(controls_window: str, command_file: Path, last_mtime: float | None, state: dict[str, str]) -> float | None:
+def apply_command_file(
+    controls_window: str | None,
+    command_file: Path,
+    last_mtime: int | None,
+    state: dict[str, str],
+    params: CalibrationParams | None = None,
+) -> tuple[int | None, CalibrationParams | None]:
     if not command_file.exists():
-        return last_mtime
-    mtime = command_file.stat().st_mtime
-    if last_mtime is not None and mtime <= last_mtime:
-        return last_mtime
+        return last_mtime, params
+    stat = command_file.stat()
+    mtime_ns = stat.st_mtime_ns
+    if last_mtime is not None and mtime_ns <= last_mtime:
+        return last_mtime, params
     for line in command_file.read_text().splitlines():
-        apply_param_command(controls_window, line, state)
-    return mtime
+        params = apply_param_command(controls_window, line, state, params)
+    return mtime_ns, params
+
 
 def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
     def noop(_: int) -> None:
@@ -245,6 +264,12 @@ def create_trackbars(controls_window: str, params: CalibrationParams) -> None:
         ("split_option_rois", params.split_option_rois, 1),
         ("option_gap_pct", params.option_gap_pct, 20),
         ("straight_option_width_pct", params.straight_option_width_pct, 60),
+        ("option_roi_skew_pct", params.option_roi_skew_pct, 30),
+        ("entry_line_tol_pct", params.entry_line_tol_pct, 20),
+        ("entry_max_slope_x10", params.entry_max_slope_x10, 30),
+        ("center_tol_pct", params.center_tol_pct, 50),
+        ("merge_width_factor_x10", params.merge_width_factor_x10, 50),
+        ("require_centered", params.require_centered, 1),
         ("show_state_panel", params.show_state_panel, 1),
         ("ratio_fallback", params.enable_ratio_fallback, 1),
         ("ahead_ratio_pct", params.ahead_ratio_pct, 30),
@@ -281,6 +306,12 @@ def read_trackbars(controls_window: str, params: CalibrationParams) -> Calibrati
     updated.split_option_rois = cv2.getTrackbarPos("split_option_rois", controls_window)
     updated.option_gap_pct = cv2.getTrackbarPos("option_gap_pct", controls_window)
     updated.straight_option_width_pct = max(6, cv2.getTrackbarPos("straight_option_width_pct", controls_window))
+    updated.option_roi_skew_pct = cv2.getTrackbarPos("option_roi_skew_pct", controls_window)
+    updated.entry_line_tol_pct = cv2.getTrackbarPos("entry_line_tol_pct", controls_window)
+    updated.entry_max_slope_x10 = cv2.getTrackbarPos("entry_max_slope_x10", controls_window)
+    updated.center_tol_pct = cv2.getTrackbarPos("center_tol_pct", controls_window)
+    updated.merge_width_factor_x10 = max(10, cv2.getTrackbarPos("merge_width_factor_x10", controls_window))
+    updated.require_centered = cv2.getTrackbarPos("require_centered", controls_window)
     updated.show_state_panel = cv2.getTrackbarPos("show_state_panel", controls_window)
     updated.enable_ratio_fallback = cv2.getTrackbarPos("ratio_fallback", controls_window)
     updated.ahead_ratio_pct = cv2.getTrackbarPos("ahead_ratio_pct", controls_window)
@@ -301,36 +332,106 @@ def draw_box_pct(frame: np.ndarray, x0_pct: int, x1_pct: int, y0_pct: int, y1_pc
     cv2.rectangle(frame, p0, p1, color, 2)
 
 
-def draw_overlay(frame: np.ndarray, result: DetectionResult, params: CalibrationParams, undistort_enabled: bool, label: str) -> np.ndarray:
+def draw_box_pct_alpha(
+    frame: np.ndarray,
+    x0_pct: int,
+    x1_pct: int,
+    y0_pct: int,
+    y1_pct: int,
+    color: tuple[int, int, int],
+    alpha: float = 0.18,
+    border: int = 2,
+) -> None:
+    h, w = frame.shape[:2]
+    p0 = (int(w * x0_pct / 100.0), int(h * y0_pct / 100.0))
+    p1 = (int(w * x1_pct / 100.0), int(h * y1_pct / 100.0))
+    fill = frame.copy()
+    cv2.rectangle(fill, p0, p1, color, -1)
+    cv2.addWeighted(fill, alpha, frame, 1.0 - alpha, 0, frame)
+    cv2.rectangle(frame, p0, p1, color, border)
+
+
+def draw_poly_pct_alpha(
+    frame: np.ndarray,
+    poly_pct: list,
+    color: tuple[int, int, int],
+    alpha: float = 0.16,
+    border: int = 2,
+) -> None:
+    h, w = frame.shape[:2]
+    pts = np.array([[int(w * x / 100.0), int(h * y / 100.0)] for x, y in poly_pct], dtype=np.int32)
+    fill = frame.copy()
+    cv2.fillPoly(fill, [pts], color)
+    cv2.addWeighted(fill, alpha, frame, 1.0 - alpha, 0, frame)
+    cv2.polylines(frame, [pts], True, color, border)
+
+
+# Per-zone dash colors (BGR). These match the option-ROI fills so a dash and
+# the ROI it was assigned to read as the same color.
+ZONE_COLORS = {
+    "entry": (0, 165, 255),     # orange  - aligned entry-zebra dashes
+    "left": (255, 0, 255),      # magenta - left option
+    "straight": (255, 255, 0),  # cyan    - straight option
+    "right": (255, 160, 0),     # azure   - right option
+    "merged": (0, 0, 255),      # red     - oversized/merged blob (rejected)
+    "other": (90, 90, 90),      # gray    - detected but outside any ROI
+}
+
+
+def draw_overlay(
+    frame: np.ndarray,
+    result: DetectionResult,
+    params: CalibrationParams,
+    undistort_enabled: bool,
+    label: str,
+    show_header: bool = True,
+) -> np.ndarray:
     overlay = frame.copy()
     h, w = overlay.shape[:2]
 
     # Red: active entry/dash detection band. It stays low and does not define options.
-    draw_box_pct(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255))
+    draw_box_pct_alpha(overlay, 0, 100, params.roi_y0_pct, params.roi_y1_pct, (0, 0, 255), 0.10)
     if result.entry_y_pct is not None:
-        entry_y = int(h * result.entry_y_pct / 100.0)
-        cv2.line(overlay, (0, entry_y), (w, entry_y), (0, 128, 255), 2)
+        # The actual fitted zebra line (cy = slope*cx + intercept) that the entry
+        # dashes are aligned to. Green when centered enough to read options.
+        y_left = int(result.entry_intercept)
+        y_right = int(result.entry_slope * w + result.entry_intercept)
+        line_color = (0, 255, 0) if result.entry_centered else (0, 165, 255)
+        cv2.line(overlay, (0, y_left), (w, y_right), line_color, 2)
 
     if result.dashed_detected and params.split_option_rois:
         colors = {
             "left": (255, 0, 255),
             "straight": (255, 255, 0),
-            "right": (255, 0, 255),
+            "right": (255, 160, 0),
         }
-        for name, box in result.option_roi_boxes.items():
+        for name, poly in result.option_roi_polys.items():
             color = (0, 255, 0) if result.option_valid.get(name, False) else colors[name]
-            draw_box_pct(overlay, *box, color)
+            alpha = 0.22 if result.option_valid.get(name, False) else 0.12
+            draw_poly_pct_alpha(overlay, poly, color, alpha)
     elif result.dashed_detected:
-        draw_box_pct(overlay, *result.option_box_pct, (255, 0, 0))
+        draw_box_pct_alpha(overlay, *result.option_box_pct, (255, 0, 0), 0.12)
 
-    for x, y, bw, bh in result.dashed_boxes:
-        cv2.rectangle(overlay, (x, y), (x + bw, y + bh), (0, 255, 255), 2)
+    zones = result.box_zones or ["entry"] * len(result.dashed_boxes)
+    for (x, y, bw, bh), zone in zip(result.dashed_boxes, zones):
+        color = ZONE_COLORS.get(zone, ZONE_COLORS["other"])
+        if zone == "other":
+            # Stray dashes outside any ROI: draw faint and thin so they no longer
+            # clutter the view (they are not part of any detection).
+            cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color, 1)
+            continue
+        border = 3 if zone == "merged" else 2
+        fill = overlay.copy()
+        cv2.rectangle(fill, (x, y), (x + bw, y + bh), color, -1)
+        cv2.addWeighted(fill, 0.22, overlay, 0.78, 0, overlay)
+        cv2.rectangle(overlay, (x, y), (x + bw, y + bh), color, border)
 
-    status = "INTERSECTION" if result.dashed_detected else "normal"
-    options = ",".join(result.options) if result.options else "none"
-    line = f"{result.state_name} | {status} | opt:{options} | dash:{result.dashed_count} | area:{result.dash_min_area_range[0]}->{result.dash_min_area_range[1]}"
-    cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
-    cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
+    if show_header:
+        status = "INTERSECTION" if result.dashed_detected else "normal"
+        options = ",".join(result.options) if result.options else "none"
+        line = f"{result.state_name} | {status} | opt:{options} | dash:{result.dashed_count} | area:{result.dash_min_area_range[0]}->{result.dash_min_area_range[1]}"
+        cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 3)
+        cv2.putText(overlay, line, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1)
     cv2.line(overlay, (w // 2, 0), (w // 2, h), (0, 255, 255), 1)
     return overlay
 
@@ -360,6 +461,72 @@ def draw_state_panel(result: DetectionResult, params: CalibrationParams, undisto
         cv2.putText(panel, f"{key}: {value}", (14, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 1)
         y += 22
     return panel
+
+
+def draw_stream_debug_panel(
+    width: int,
+    result: DetectionResult,
+    params: CalibrationParams,
+    undistort_enabled: bool,
+    label: str,
+    paused: bool,
+) -> np.ndarray:
+    panel = np.zeros((168, width, 3), dtype=np.uint8)
+
+    def put(text: str, x: int, y: int, color: tuple[int, int, int], scale: float = 0.52) -> int:
+        cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, (0, 0, 0), 3)
+        cv2.putText(panel, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1)
+        return x + int(len(text) * scale * 17)
+
+    entry_y = f"{result.entry_y_pct:.0f}" if result.entry_y_pct is not None else "--"
+    state_color = (0, 255, 0) if result.state_name == "READ_OPTIONS" else (
+        (0, 200, 255) if result.state_name == "APPROACH_ENTRY" else (180, 180, 180))
+
+    # Row 1: state + the gate that controls when options open.
+    x = put(f"{result.state_name}", 12, 26, state_color, 0.6)
+    x = put(f"centered={int(result.entry_centered)}", x + 14, 26, (0, 255, 0) if result.entry_centered else (0, 140, 255))
+    x = put(f"slope={result.entry_slope:+.2f}", x + 14, 26, (0, 255, 255))
+    put(f"entry_y={entry_y}  stable={result.stable_frames}/{params.stable_frames_needed}", x + 14, 26, (0, 255, 255))
+
+    # Row 2: entry-dash count (aligned inliers) + label/flags.
+    x = put(f"entry dashes {result.dashed_count}/{params.min_dash_count}", 12, 56, ZONE_COLORS["entry"])
+    put(f"label={label}  paused={int(paused)}  undistort={int(undistort_enabled)}", x + 14, 56, (0, 255, 255))
+
+    # Row 3: per-ROI counts, each in its own color (only meaningful once reading).
+    x = put("ROI counts:", 12, 86, (200, 200, 200))
+    x = put(f"L {result.left_dash}", x + 10, 86, ZONE_COLORS["left"])
+    x = put(f"S {result.center_dash}", x + 12, 86, ZONE_COLORS["straight"])
+    x = put(f"R {result.right_dash}", x + 12, 86, ZONE_COLORS["right"])
+    valid = result.option_valid or {}
+    put("valid " + " ".join(f"{k[0].upper()}:{int(valid.get(k, False))}" for k in ("left", "straight", "right")),
+        x + 18, 86, (0, 255, 0))
+
+    # Row 4: chosen options + key geometry knobs.
+    opts = ",".join(result.options) if result.options else "none"
+    put(f"options={opts}   skew={params.option_roi_skew_pct}  gap={params.option_gap_pct}  "
+        f"opt_h={params.dynamic_option_height_pct}  margin={params.entry_margin_pct}", 12, 116, (0, 255, 255))
+
+    put("cmd: min_dash_count=3 | roi_skew=12 | center_tol_pct=12 | save_calib=1 (save for robot) | s=1 img | q=1 quit",
+        12, 150, (160, 160, 160), 0.46)
+    return panel
+
+
+def compose_stream_dashboard(
+    overlay: np.ndarray,
+    mask: np.ndarray,
+    result: DetectionResult,
+    params: CalibrationParams,
+    undistort_enabled: bool,
+    label: str,
+    paused: bool,
+) -> np.ndarray:
+    """Single H264-friendly view: overlay + Otsu mask + compact debug panel."""
+    h, w = overlay.shape[:2]
+    mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    mask_bgr = cv2.resize(mask_bgr, (w, h), interpolation=cv2.INTER_NEAREST)
+    top = np.hstack([overlay, mask_bgr])
+    panel = draw_stream_debug_panel(w * 2, result, params, undistort_enabled, label, paused)
+    return np.vstack([top, panel])
 
 def save_sample(
     output_dir: Path,
@@ -415,6 +582,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--label", default="sample", help="Label used when saving samples")
     parser.add_argument("--command-file", type=Path, default=DEFAULT_OUTPUT_DIR / "calibrator_commands.txt")
+    parser.add_argument("--params-out", type=Path, default=REPO_DIR / "config" / "intersection_params.json",
+                        help="Where 'save_calib' writes the tuned detection params for the runtime to load")
+    parser.add_argument("--preview-mode", choices=("local", "h264", "none"),
+                        default=os.environ.get("STREAM", "local"),
+                        help="local uses OpenCV windows/trackbars; h264 streams dashboard and uses commands")
     return parser.parse_args()
 
 
@@ -436,26 +608,31 @@ def main() -> int:
     controls_window = "Controls"
     mask_window = "Mask"
     state_window = "State"
-    cv2.namedWindow(image_window, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(mask_window, cv2.WINDOW_NORMAL)
-    cv2.namedWindow(state_window, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(image_window, args.width, args.height)
-    cv2.resizeWindow(mask_window, args.width, args.height)
-    cv2.resizeWindow(controls_window, 760, 520)
-    cv2.resizeWindow(state_window, 560, 360)
-    # Fixed window layout: mask top-left, calibrator below it, controls to the right, state bottom-right
-    cv2.moveWindow(mask_window,    0,   0)
-    cv2.moveWindow(image_window,   0,   args.height + 30)
-    cv2.moveWindow(controls_window, args.width + 10,  0)
-    cv2.moveWindow(state_window,   args.width + 10,  args.height + 30)
+    local_preview = args.preview_mode == "local"
+    stream_preview = None if local_preview else Preview.from_env("Line Vision Calibrator", fps=args.fps)
     params = CalibrationParams()
-    create_trackbars(controls_window, params)
+    if local_preview:
+        cv2.namedWindow(image_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(controls_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(mask_window, cv2.WINDOW_NORMAL)
+        cv2.namedWindow(state_window, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(image_window, args.width, args.height)
+        cv2.resizeWindow(mask_window, args.width, args.height)
+        cv2.resizeWindow(controls_window, 760, 520)
+        cv2.resizeWindow(state_window, 560, 360)
+        # Fixed window layout: mask top-left, calibrator below it, controls to the right, state bottom-right
+        cv2.moveWindow(mask_window,    0,   0)
+        cv2.moveWindow(image_window,   0,   args.height + 30)
+        cv2.moveWindow(controls_window, args.width + 10,  0)
+        cv2.moveWindow(state_window,   args.width + 10,  args.height + 30)
+        create_trackbars(controls_window, params)
     command_queue: queue.Queue[str] = queue.Queue()
     start_stdin_command_thread(command_queue)
     command_file_mtime = None
     state = {"label": args.label}
     print("[cmd] type commands here, e.g. min_dash_count=6, label=true_intersection, or set roi_y0_pct 42")
+    if not local_preview:
+        print("[cmd] H264 mode: use commands; examples: s=1 save, p=1 pause, q=1 quit, u=1 toggle undistort")
     print(f"[cmd] also watching command file: {args.command_file}")
 
     paused = False
@@ -478,10 +655,37 @@ def main() -> int:
         if raw.shape[1] != args.width or raw.shape[0] != args.height:
             raw = cv2.resize(raw, (args.width, args.height), interpolation=cv2.INTER_AREA)
 
+        save_requested = False
+        quit_requested = False
         while not command_queue.empty():
-            apply_param_command(controls_window, command_queue.get_nowait(), state)
-        command_file_mtime = apply_command_file(controls_window, args.command_file, command_file_mtime, state)
-        params = read_trackbars(controls_window, params)
+            command = command_queue.get_nowait().strip()
+            if not local_preview and command in ("q", "quit", "q=1"):
+                quit_requested = True
+                continue
+            if not local_preview and command in ("s", "save", "s=1", "save=1"):
+                save_requested = True
+                continue
+            if not local_preview and command in ("p", "pause", "p=1", "pause=1"):
+                paused = not paused
+                print(f"[info] paused={paused}")
+                continue
+            if not local_preview and command in ("u", "undistort", "u=1", "undistort=1"):
+                undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
+                print(f"[info] undistort={undistort_enabled}")
+                continue
+            params = apply_param_command(controls_window if local_preview else None, command, state, params)
+        command_file_mtime, params = apply_command_file(
+            controls_window if local_preview else None,
+            args.command_file,
+            command_file_mtime,
+            state,
+            params,
+        )
+        if local_preview:
+            params = read_trackbars(controls_window, params)
+        if state.pop("request_save_calib", None):
+            save_intersection_params(params, args.params_out)
+            print(f"[calib] saved tuned params -> {args.params_out}")
         processed = raw.copy()
         if undistort_enabled:
             processed = cv2.undistort(processed, camera_matrix, dist_coeffs)
@@ -490,35 +694,47 @@ def main() -> int:
         result = analyze_intersection(processed, params, stable_frames)
         stable_frames = result.stable_frames
         mask = black_mask(processed)
-        overlay = draw_overlay(processed, result, params, undistort_enabled, state["label"])
-        cv2.imshow(image_window, overlay)
-        cv2.imshow(mask_window, mask)
-        if params.show_state_panel:
-            cv2.imshow(state_window, draw_state_panel(result, params, undistort_enabled, state["label"], paused))
+        overlay = draw_overlay(processed, result, params, undistort_enabled, state["label"], show_header=local_preview)
+        state_panel = draw_state_panel(result, params, undistort_enabled, state["label"], paused)
+        if local_preview:
+            cv2.imshow(image_window, overlay)
+            cv2.imshow(mask_window, mask)
+            if params.show_state_panel:
+                cv2.imshow(state_window, state_panel)
 
-        key = cv2.waitKey(0 if frames else 1) & 0xFF
-        if key in (ord("q"), 27):
-            break
-        if key == ord("s"):
-            save_sample(args.output_dir, raw, processed, mask, overlay, params, result, state["label"])
-        elif key == ord("u"):
-            undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
-            print(f"[info] undistort={undistort_enabled}")
-        elif key == ord("p"):
-            paused = not paused
-            print(f"[info] paused={paused}")
-        elif key == ord("h"):
-            cv2.setTrackbarPos("show_state_panel", controls_window, 0 if params.show_state_panel else 1)
-        elif frames and key in (ord("n"), ord(" ")):
-            frame_index = (frame_index + 1) % len(frames)
-            stable_frames = 0
-        elif frames and key == ord("b"):
-            frame_index = (frame_index - 1) % len(frames)
-            stable_frames = 0
+            key = cv2.waitKey(0 if frames else 1) & 0xFF
+            if key in (ord("q"), 27):
+                break
+            if key == ord("s"):
+                save_sample(args.output_dir, raw, processed, mask, overlay, params, result, state["label"])
+            elif key == ord("u"):
+                undistort_enabled = not undistort_enabled and camera_matrix is not None and dist_coeffs is not None
+                print(f"[info] undistort={undistort_enabled}")
+            elif key == ord("p"):
+                paused = not paused
+                print(f"[info] paused={paused}")
+            elif key == ord("h"):
+                cv2.setTrackbarPos("show_state_panel", controls_window, 0 if params.show_state_panel else 1)
+            elif frames and key in (ord("n"), ord(" ")):
+                frame_index = (frame_index + 1) % len(frames)
+                stable_frames = 0
+            elif frames and key == ord("b"):
+                frame_index = (frame_index - 1) % len(frames)
+                stable_frames = 0
+        else:
+            dashboard = compose_stream_dashboard(overlay, mask, result, params, undistort_enabled, state["label"], paused)
+            stream_preview.show(dashboard)
+            if save_requested:
+                save_sample(args.output_dir, raw, processed, mask, overlay, params, result, state["label"])
+            if quit_requested:
+                break
 
     if cap is not None:
         cap.release()
-    cv2.destroyAllWindows()
+    if stream_preview is not None:
+        stream_preview.close()
+    if local_preview:
+        cv2.destroyAllWindows()
     return 0
 
 
