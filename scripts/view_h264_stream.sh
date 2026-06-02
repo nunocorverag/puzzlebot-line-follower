@@ -7,6 +7,15 @@
 # paired with e.g.:
 #   STREAM=h264 scripts/run_line_follower_jetson.sh
 #
+# Native Ubuntu can keep the default sink:
+#   scripts/view_h264_stream.sh
+#
+# WSL/X11 users should select the X image sink explicitly:
+#   VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+#
+# The GStreamer path is intentionally:
+#   udpsrc -> rtpjitterbuffer -> rtph264depay -> avdec_h264 -> videoconvert -> ${VIDEO_SINK} sync=false
+#
 # Find this laptop's IP on the robot network with:  ip -4 addr show | grep 10.10
 set -euo pipefail
 

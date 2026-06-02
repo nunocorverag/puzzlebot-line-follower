@@ -201,6 +201,57 @@ Tuning ROS params (also work via the run-script env or `--ros-args`):
 `h264_bitrate` (2000000 bits/s), `h264_port` (5000). If the H264 writer fails to
 open it falls back to MJPEG automatically.
 
+## Script invocation cheat sheet
+
+Use these from the repo root on the laptop unless noted otherwise. Most Jetson scripts sync first or rely on the shared SSH defaults from the top of this file.
+
+| Script | Typical command | Notes |
+| --- | --- | --- |
+| `build_on_jetson.sh` | `scripts/build_on_jetson.sh` | Builds `puzzlebot_ros` on the Jetson after sync. |
+| `sync_to_jetson.sh` | `scripts/sync_to_jetson.sh` | Copies this repo to the Jetson package directory. |
+| `stop_demo.sh` | `scripts/stop_demo.sh` | Full cleanup: local H264 receivers, Jetson camera/perception processes, zero `/cmd_vel`, micro-ROS. |
+| `run_demo_tmux.sh` | `scripts/run_demo_tmux.sh` | Full tmux demo orchestration. |
+| `run_motor_agent_jetson.sh` | `scripts/run_motor_agent_jetson.sh` | Starts the micro-ROS motor bridge. Required for wheel motion. |
+| `set_drive_jetson.sh` | `scripts/set_drive_jetson.sh on` or `off` | Enables/disables only the follower motion gate. |
+| `jog_forward_jetson.sh` | `scripts/jog_forward_jetson.sh 0.10 1.5` | Simple forward jog; do not run alongside the follower. |
+| `run_line_follower_jetson.sh` | `IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh` | Runs the autonomous follower. Default stream is H264 unless overridden. |
+| `run_line_follower_h264.sh` | `scripts/run_line_follower_h264.sh` | Shortcut for follower with H264 receiver. |
+| `run_line_calibrator_jetson.sh` | `LABEL=roi_diagonal_debug scripts/run_line_calibrator_jetson.sh` | Perception-only calibrator; sends drive off and opens CSI camera directly. |
+| `set_calibrator_param.sh` | `scripts/set_calibrator_param.sh roi_y0_pct 72` | Live H264 calibrator controls and params; also `s 1`, `p 1`, `u 1`, `q 1`. |
+| `pull_calibration_dataset.sh` | `scripts/pull_calibration_dataset.sh` | Pulls Jetson `debug_dataset/` to the laptop. |
+| `run_camera_h264_jetson.sh` | `scripts/run_camera_h264_jetson.sh` | Raw CSI camera over H264, no ROS overlays. |
+| `view_h264_stream.sh` | `VIDEO_SINK=ximagesink scripts/view_h264_stream.sh` | Manual laptop receiver. Native Ubuntu can omit `VIDEO_SINK`; WSL should use `ximagesink`. |
+| `run_camera_jetson.sh` | `scripts/run_camera_jetson.sh` | ROS camera topic launcher. Most tools do not need it because they open CSI directly. |
+| `run_recorder_jetson.sh` | `scripts/run_recorder_jetson.sh` | Camera preview/dataset recorder. |
+| `run_teleop_recorder_jetson.sh` | `scripts/run_teleop_recorder_jetson.sh` | Manual drive plus recording. |
+| `run_teleop_wasd_combo.sh` | `scripts/run_teleop_wasd_combo.sh` | Laptop pygame WASD combo teleop via UDP bridge. |
+| `run_sign_detector_jetson.sh` | `scripts/run_sign_detector_jetson.sh` | YOLO sign/traffic-light detector with preview. |
+| `run_focus_assist_jetson.sh` | `scripts/run_focus_assist_jetson.sh` | Focus metric over H264. |
+| `run_checkerboard_capture_jetson.sh` | `scripts/run_checkerboard_capture_jetson.sh` | Auto-guided checkerboard image capture. |
+| `run_calibrate_camera_jetson.sh` | `scripts/run_calibrate_camera_jetson.sh` | Computes camera intrinsics and pulls results. |
+| `run_illumination_calibrator_jetson.sh` | `scripts/run_illumination_calibrator_jetson.sh` | Captures flat-field illumination calibration. |
+| `start_all_jetson.sh` | `scripts/start_all_jetson.sh` | Legacy/headless background camera + recorder launcher; avoid when using other CSI tools. |
+
+For WSL/Windows teammates, the important H264 receiver command is:
+
+```bash
+VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+```
+
+If that line does not work in their copy, they are running an older checkout. They should pull the latest branch and rerun the script from this repo. The current receiver uses this GStreamer path:
+
+```bash
+VIDEO_SINK="${VIDEO_SINK:-autovideosink}"
+
+exec gst-launch-1.0 -v \
+  udpsrc port="${PORT}" caps="${CAPS}" ! \
+  rtpjitterbuffer latency=50 ! \
+  rtph264depay ! \
+  avdec_h264 ! \
+  videoconvert ! \
+  "${VIDEO_SINK}" sync=false
+```
+
 ## Camera & illumination calibration (recommended)
 
 The current `config/camera_params.npz` was calibrated from a **different

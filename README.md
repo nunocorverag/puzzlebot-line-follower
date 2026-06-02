@@ -130,6 +130,16 @@ STREAM=local scripts/run_line_calibrator_jetson.sh
 VIDEO_SINK=ximagesink scripts/run_line_calibrator_jetson.sh   # WSL/X11
 ```
 
+For the manual H264 viewer, native Ubuntu uses the default `autovideosink`;
+WSL/Windows teammates should run:
+
+```bash
+VIDEO_SINK=ximagesink scripts/view_h264_stream.sh
+```
+
+If their script does not support `VIDEO_SINK`, they are on an older checkout and
+should pull the latest branch before testing.
+
 Full current workflow: **[docs/PERCEPTION_TUNING.md](docs/PERCEPTION_TUNING.md)**.
 
 Optional label for saved samples:
