@@ -30,16 +30,6 @@ COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPTS_DIR="$(cd "${COMMON_DIR}/.." && pwd)"
 REPO_DIR="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
-# Optional per-laptop config. Keep scripts/local.env untracked; use
-# scripts/local.env.example as the template. Values loaded here are exported so
-# child scripts like sync_to_jetson.sh and view_h264_stream.sh inherit them.
-if [ -f "${SCRIPTS_DIR}/local.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  source "${SCRIPTS_DIR}/local.env"
-  set +a
-fi
-
 H264_RX_PID=""
 
 sync_repo() {

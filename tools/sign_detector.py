@@ -1,27 +1,20 @@
 #!/usr/bin/env python3
 """Combined traffic sign (YOLO) + traffic light (HSV) detector.
 
-Opens the CSI camera directly, runs both detectors on each frame,
-draws overlays on a single preview window, and publishes to:
-  /sign_detection       (String) — YOLO sign class name
-  /traffic_light_state  (String) — RED / YELLOW / GREEN / NONE
-
-Classes detected by YOLO:
-  0: give-way
-  1: stop
-  2: straight
-  3: trabajadores
-  4: vuelta-derecha
-  5: vuelta-izquierda
-
-Usage:
-  python3 tools/sign_detector.py
-  python3 tools/sign_detector.py --confidence 0.4
+Captures natively from the CSI camera using a GStreamer pipeline, 
+runs both detectors, draws overlays, and outputs an H264 UDP stream.
 """
+import os
 import sys
 import time
 from pathlib import Path
 from collections import deque, Counter
+
+# --- THE JETSON TLS FIX ---
+# Force PyTorch to load its massive OpenMP library BEFORE OpenCV takes the memory slots
+import torch
+from ultralytics import YOLO
+# --------------------------
 
 import cv2
 import numpy as np
@@ -31,13 +24,13 @@ from std_msgs.msg import String
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
+
+# Removed open_csi_capture and Preview; keeping calibration helpers
 from puzzlebot_ros.perception.camera import (  # noqa: E402
     load_camera_params,
     load_illumination_gain,
-    open_csi_capture,
     preprocess_frame,
 )
-from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 MODEL_PATH = REPO_DIR / "config" / "best.pt"
 
 # BGR colors for YOLO sign classes
@@ -64,6 +57,14 @@ class SignDetectorNode(Node):
     def __init__(self, conf_threshold: float = 0.45):
         super().__init__("sign_detector")
 
+        # --- Environment & Stream Settings ---
+        self.h264_host = os.environ.get("H264_HOST", "127.0.0.1")
+        self.h264_port = os.environ.get("H264_PORT", "5000")
+        self.fps = int(os.environ.get("FPS", "30"))
+        self.width = int(os.environ.get("WIDTH", "640"))
+        self.height = int(os.environ.get("HEIGHT", "480"))
+        self.bitrate = int(os.environ.get("BITRATE", "4000000"))
+
         # --- YOLO model ---
         try:
             from ultralytics import YOLO
@@ -84,35 +85,50 @@ class SignDetectorNode(Node):
         )
 
         # --- Traffic light parameters ---
-        self.tl_min_detect_area = 30       # Minimum area just to see it exists (far away)
-        self.tl_min_action_area = 350      # Minimum area to consider it "close enough" to trigger a stop
-        self.tl_min_circularity = 0.60     # Slightly relaxed for distant blobs
+        self.tl_min_detect_area = 30
+        self.tl_min_action_area = 350
+        self.tl_min_circularity = 0.60
         self.tl_kernel = np.ones((5, 5), np.uint8)
-        
-        # Temporal filtering to avoid flickering
-        self.tl_history = deque(maxlen=5)  # Stores the state of the last 5 frames
+        self.tl_history = deque(maxlen=5)
         self.tl_last_published_state = "NONE"
 
-        # --- Camera (direct CSI capture; self-contained, no separate node) ---
-        self.cap = open_csi_capture(width=640, height=480, fps=30,
-                                    log=self.get_logger().info)
-        if self.cap is None:
-            self.get_logger().error("Could not open CSI camera.")
+        # --- Camera (Direct GStreamer CSI capture) ---
+        # --- Camera (Direct GStreamer CSI capture) ---
+        # Notice the explicit (int), (fraction), and (string) casts so OpenCV's parser doesn't crash
+        gst_in = (
+            f"nvarguscamerasrc sensor-id=0 ! "
+            f"video/x-raw(memory:NVMM), width=(int)1280, height=(int)720, framerate=(fraction){self.fps}/1 ! "
+            f"nvvidconv ! video/x-raw, width=(int){self.width}, height=(int){self.height}, format=(string)BGRx ! "
+            f"videoconvert ! video/x-raw, format=(string)BGR ! appsink"
+        )
+        self.cap = cv2.VideoCapture(gst_in, cv2.CAP_GSTREAMER)
+        if not self.cap.isOpened():
+            self.get_logger().error("Could not open CSI camera via GStreamer.")
             raise RuntimeError("camera unavailable")
 
         # --- Publishers ---
         self.sign_pub = self.create_publisher(String, "/sign_detection", 10)
         self.tl_pub   = self.create_publisher(String, "/traffic_light_state", 10)
 
-        # --- Preview (h264 | local | none via $STREAM) ---
-        self.preview = Preview.from_env("Detector", fps=10, log=self.get_logger().info)
+        # --- Output Stream (Hardware H264 UDP Sink) ---
+        gst_out = (
+            f"appsrc ! video/x-raw, format=(string)BGR ! videoconvert ! video/x-raw, format=(string)BGRx ! "
+            f"nvvidconv ! video/x-raw(memory:NVMM) ! "
+            f"nvv4l2h264enc insert-sps-pps=1 idrinterval={self.fps} bitrate={self.bitrate} maxperf-enable=1 ! "
+            f"h264parse ! rtph264pay config-interval=1 pt=96 ! "
+            f"udpsink host={self.h264_host} port={self.h264_port} sync=false async=false"
+        )
+        # fourcc '0' skips generic encoding and delegates directly to the Gstreamer backend
+        self.out = cv2.VideoWriter(gst_out, cv2.CAP_GSTREAMER, 0, self.fps, (self.width, self.height))
+        if not self.out.isOpened():
+            self.get_logger().error("Could not start GStreamer UDP sink.")
 
         # --- Inference timer (10 Hz) ---
         self.create_timer(0.1, self._loop)
 
         self.frame_count = 0
         self.fps_time = time.time()
-        self.get_logger().info(f"Detector ready — YOLO conf: {conf_threshold}")
+        self.get_logger().info(f"Detector ready — Streaming to {self.h264_host}:{self.h264_port}")
 
     # ------------------------------------------------------------------
     # Camera grab
@@ -126,11 +142,11 @@ class SignDetectorNode(Node):
             camera_matrix=self.camera_matrix,
             dist_coeffs=self.dist_coeffs,
             gain=self.illumination_gain,
-            size=(640, 480),
+            size=(self.width, self.height),
         )
 
     # ------------------------------------------------------------------
-    # Traffic light helpers
+    # Traffic light helpers (Unchanged)
     # ------------------------------------------------------------------
     def _find_best_blob(self, mask: np.ndarray):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self.tl_kernel)
@@ -180,7 +196,6 @@ class SignDetectorNode(Node):
 
         best_color, best_area = candidates[0]
         
-        # Determine if it's visible, and if it's close enough to matter
         if best_area > self.tl_min_detect_area:
             is_actionable = best_area >= self.tl_min_action_area
             return best_color, best_area, is_actionable
@@ -222,10 +237,7 @@ class SignDetectorNode(Node):
         # --- Traffic light detection & smoothing ---
         raw_color, tl_area, is_actionable = self._detect_traffic_light(frame)
         
-        # If it's not actionable (too far), the controller should treat it as NONE
         current_state = raw_color if is_actionable else "NONE"
-        
-        # Push to history buffer and calculate the most common state (majority vote)
         self.tl_history.append(current_state)
         smoothed_state = Counter(self.tl_history).most_common(1)[0][0]
 
@@ -237,17 +249,14 @@ class SignDetectorNode(Node):
             self.tl_last_published_state = smoothed_state
 
         # --- Traffic light indicator (top-right) ---
-        # Visually distinct indicator: Show if it's FAR vs ACTIONABLE
         display_color = TL_INDICATOR[raw_color]
         cx, cy, r = 590, 38, 28
         
         cv2.circle(display, (cx, cy), r + 3, (30, 30, 30), -1)
         if raw_color != "NONE" and not is_actionable:
-            # Draw an outlined circle if the light is visible but far away
             cv2.circle(display, (cx, cy), r, display_color, 4)
             tl_display_text = f"{raw_color} (FAR)"
         else:
-            # Draw a solid circle if the light is close/actionable
             cv2.circle(display, (cx, cy), r, display_color, -1)
             tl_display_text = raw_color
 
@@ -269,10 +278,13 @@ class SignDetectorNode(Node):
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        self.preview.show(display)
+        # Stream directly to UDP via GStreamer
+        if self.out.isOpened():
+            self.out.write(display)
 
     def destroy_node(self):
-        self.preview.close()
+        if hasattr(self, 'out') and self.out.isOpened():
+            self.out.release()
         if self.cap is not None:
             self.cap.release()
         super().destroy_node()
