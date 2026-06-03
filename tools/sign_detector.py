@@ -21,6 +21,7 @@ Usage:
 import sys
 import time
 from pathlib import Path
+from collections import deque, Counter
 
 import cv2
 import numpy as np
@@ -82,11 +83,15 @@ class SignDetectorNode(Node):
             REPO_DIR / "config" / "illumination_flatfield.npz"
         )
 
-        # --- Traffic light parameters (tune via calibrator if needed) ---
-        self.tl_min_area = 200
-        self.tl_min_circularity = 0.65
+        # --- Traffic light parameters ---
+        self.tl_min_detect_area = 30       # Minimum area just to see it exists (far away)
+        self.tl_min_action_area = 350      # Minimum area to consider it "close enough" to trigger a stop
+        self.tl_min_circularity = 0.60     # Slightly relaxed for distant blobs
         self.tl_kernel = np.ones((5, 5), np.uint8)
-        self.tl_last_state = "NONE"
+        
+        # Temporal filtering to avoid flickering
+        self.tl_history = deque(maxlen=5)  # Stores the state of the last 5 frames
+        self.tl_last_published_state = "NONE"
 
         # --- Camera (direct CSI capture; self-contained, no separate node) ---
         self.cap = open_csi_capture(width=640, height=480, fps=30,
@@ -113,11 +118,6 @@ class SignDetectorNode(Node):
     # Camera grab
     # ------------------------------------------------------------------
     def _grab_frame(self):
-        """Read + condition one frame from the direct CSI capture.
-
-        Direct nvarguscamerasrc capture is upright (no rotate-180 quirk like the
-        old ros_deep_learning node), so the orientation matches the calibrator.
-        """
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return None
@@ -140,7 +140,7 @@ class SignDetectorNode(Node):
         best_area, best_center = 0, None
         for cnt in contours:
             area = cv2.contourArea(cnt)
-            if area < self.tl_min_area:
+            if area < self.tl_min_detect_area:
                 continue
             perimeter = cv2.arcLength(cnt, True)
             if perimeter == 0:
@@ -159,7 +159,7 @@ class SignDetectorNode(Node):
 
         return best_area, best_center
 
-    def _detect_traffic_light(self, frame: np.ndarray) -> str:
+    def _detect_traffic_light(self, frame: np.ndarray):
         h = frame.shape[0]
         roi = frame[0:int(h * 0.75), :]
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
@@ -178,9 +178,14 @@ class SignDetectorNode(Node):
         ]
         candidates.sort(key=lambda x: x[1], reverse=True)
 
-        if candidates[0][1] > self.tl_min_area:
-            return candidates[0][0]
-        return "NONE"
+        best_color, best_area = candidates[0]
+        
+        # Determine if it's visible, and if it's close enough to matter
+        if best_area > self.tl_min_detect_area:
+            is_actionable = best_area >= self.tl_min_action_area
+            return best_color, best_area, is_actionable
+        
+        return "NONE", 0, False
 
     # ------------------------------------------------------------------
     # Main inference loop
@@ -214,24 +219,41 @@ class SignDetectorNode(Node):
             msg = String(); msg.data = sign_detections[0]
             self.sign_pub.publish(msg)
 
-        # --- Traffic light detection ---
-        tl_state = self._detect_traffic_light(frame)
+        # --- Traffic light detection & smoothing ---
+        raw_color, tl_area, is_actionable = self._detect_traffic_light(frame)
+        
+        # If it's not actionable (too far), the controller should treat it as NONE
+        current_state = raw_color if is_actionable else "NONE"
+        
+        # Push to history buffer and calculate the most common state (majority vote)
+        self.tl_history.append(current_state)
+        smoothed_state = Counter(self.tl_history).most_common(1)[0][0]
 
-        tl_msg = String(); tl_msg.data = tl_state
+        tl_msg = String(); tl_msg.data = smoothed_state
         self.tl_pub.publish(tl_msg)
 
-        if tl_state != self.tl_last_state:
-            self.get_logger().info(f"Traffic light: {tl_state}")
-            self.tl_last_state = tl_state
+        if smoothed_state != self.tl_last_published_state:
+            self.get_logger().info(f"Traffic light changed to: {smoothed_state}")
+            self.tl_last_published_state = smoothed_state
 
         # --- Traffic light indicator (top-right) ---
-        ind_color = TL_INDICATOR[tl_state]
+        # Visually distinct indicator: Show if it's FAR vs ACTIONABLE
+        display_color = TL_INDICATOR[raw_color]
         cx, cy, r = 590, 38, 28
+        
         cv2.circle(display, (cx, cy), r + 3, (30, 30, 30), -1)
-        cv2.circle(display, (cx, cy), r, ind_color, -1)
+        if raw_color != "NONE" and not is_actionable:
+            # Draw an outlined circle if the light is visible but far away
+            cv2.circle(display, (cx, cy), r, display_color, 4)
+            tl_display_text = f"{raw_color} (FAR)"
+        else:
+            # Draw a solid circle if the light is close/actionable
+            cv2.circle(display, (cx, cy), r, display_color, -1)
+            tl_display_text = raw_color
+
         cv2.circle(display, (cx, cy), r, (200, 200, 200), 2)
-        cv2.putText(display, tl_state, (cx - 28, cy + r + 18),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, ind_color, 2)
+        cv2.putText(display, tl_display_text, (cx - 45, cy + r + 18),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, display_color, 2)
 
         # --- Status bar ---
         self.frame_count += 1
@@ -242,10 +264,10 @@ class SignDetectorNode(Node):
         fps_val = getattr(self, "_fps", 0.0)
 
         sign_text = ",".join(sign_detections) if sign_detections else "none"
-        fps_val = getattr(self, "_fps", 0.0)
-        status = f"sign: {sign_text}   light: {tl_state}   fps: {fps_val:.1f}"
-        cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 0, 0), 4)
-        cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2)
+        status = f"sign: {sign_text}   light: {smoothed_state} (area: {tl_area})  fps: {fps_val:.1f}"
+        
+        cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+        cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         self.preview.show(display)
 
