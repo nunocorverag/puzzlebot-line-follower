@@ -211,6 +211,9 @@ class SignDetectorNode(Node):
             return
 
         display = frame.copy()
+        
+        # Create a dedicated frame for the traffic light detector
+        tl_frame = frame.copy()
 
         # --- YOLO sign detection ---
         results = self.model(frame, conf=self.conf, verbose=False)
@@ -224,18 +227,24 @@ class SignDetectorNode(Node):
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 color = CLASS_COLORS.get(cls_name, (0, 255, 255))
 
+                # Draw overlays for the viewer
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 label = f"{cls_name} {conf:.2f}"
                 cv2.putText(display, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
                 cv2.putText(display, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
                 sign_detections.append(cls_name)
 
+                # THE FIX: Black out the detected sign's bounding box on the tl_frame
+                # This makes the stop sign completely invisible to the HSV color detector
+                cv2.rectangle(tl_frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+
         if sign_detections:
             msg = String(); msg.data = sign_detections[0]
             self.sign_pub.publish(msg)
 
         # --- Traffic light detection & smoothing ---
-        raw_color, tl_area, is_actionable = self._detect_traffic_light(frame)
+        # Pass the masked tl_frame instead of the raw frame
+        raw_color, tl_area, is_actionable = self._detect_traffic_light(tl_frame)
         
         current_state = raw_color if is_actionable else "NONE"
         self.tl_history.append(current_state)
