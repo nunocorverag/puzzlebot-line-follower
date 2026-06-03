@@ -169,6 +169,17 @@ class AutonomousRacer(Node):
         self.max_jump_distance = 80
         self.time_line_lost = None
 
+        # Detection validation (robustness). Otsu always binarizes *something*,
+        # so a uniform / low-contrast ROI (just floor, or a soft shadow) produces
+        # phantom contours that yank the steering. Before trusting any candidate
+        # we require the ROI to have enough contrast AND a sane foreground fill.
+        self.declare_parameter('line_min_contrast', 18.0)   # min std-dev of ROI gray
+        self.declare_parameter('line_min_fill_pct', 0.4)    # min % of ROI that is "line"
+        self.declare_parameter('line_max_fill_pct', 70.0)   # above this it's noise/shadow
+        self._line_min_contrast = float(self.get_parameter('line_min_contrast').value)
+        self._line_min_fill_pct = float(self.get_parameter('line_min_fill_pct').value)
+        self._line_max_fill_pct = float(self.get_parameter('line_max_fill_pct').value)
+
         # Intersection detection uses the shared perception module so the robot
         # behaves exactly like what was tuned in the calibrator. The tuned values
         # are loaded from the JSON the calibrator writes via 'save_calib'.
@@ -235,6 +246,17 @@ class AutonomousRacer(Node):
 
         self.max_v = 0.08
         self.max_w = 0.6
+
+        # Line-lost recovery (robustness). When both ROIs lose the line we no
+        # longer drive blindly straight (that runs off the track on a curve).
+        # Instead we pivot toward the side the line was last seen, encoded by the
+        # sign of the last PD error, until it re-acquires or the search times out.
+        self.declare_parameter('recover_seconds', 3.0)  # search this long, then stop
+        self.declare_parameter('recover_turn', 0.4)      # angular speed while searching
+        self.declare_parameter('recover_speed', 0.03)    # tiny forward creep while searching
+        self._recover_seconds = float(self.get_parameter('recover_seconds').value)
+        self._recover_turn = float(self.get_parameter('recover_turn').value)
+        self._recover_speed = float(self.get_parameter('recover_speed').value)
 
         # Timer (30 Hz)
         self.timer = self.create_timer(0.033, self.control_loop)
@@ -568,6 +590,18 @@ class AutonomousRacer(Node):
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
+        # Robustness guard: bail out before trusting Otsu on a ROI that has no
+        # real line. Low contrast => uniform surface; an out-of-range fill ratio
+        # => either nothing (noise speckle) or a big shadow/over-binarized blob.
+        # In either case we return no candidate so the caller freezes its last
+        # known position instead of chasing a phantom.
+        roi_contrast = float(blurred.std())
+        fill_pct = 100.0 * float(np.count_nonzero(mask)) / float(mask.size)
+        if (roi_contrast < self._line_min_contrast
+                or not (self._line_min_fill_pct <= fill_pct <= self._line_max_fill_pct)):
+            cv2.rectangle(frame, (x_start, y_start), (x_end, y_end), draw_color, 1)
+            return None, mask
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
         valid_candidates = []
@@ -711,7 +745,8 @@ class AutonomousRacer(Node):
 
         self.get_logger().info(
             f"[VISION] Areas -> R:{red_area:.0f} Y:{yellow_area:.0f} G:{green_area:.0f} "
-            f"| Raw Detect: {detected_color} | Active State: {self.current_state}"
+            f"| Raw Detect: {detected_color} | Active State: {self.current_state}",
+            throttle_duration_sec=1.0,
         )
 
         if detected_color == "RED":
@@ -859,7 +894,10 @@ class AutonomousRacer(Node):
 
         bot_str = f"({bottom_candidate[0]}, {bottom_candidate[1]})" if bottom_candidate else "NONE"
         top_str = f"({top_candidate[0]},    {top_candidate[1]})"    if top_candidate    else "NONE"
-        self.get_logger().info(f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}")
+        self.get_logger().info(
+            f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}",
+            throttle_duration_sec=1.0,
+        )
 
         # ---------------------------------------------------------
         # 4. BASE CONTROL CALCULATION (Line Follower)
@@ -882,26 +920,41 @@ class AutonomousRacer(Node):
             self.time_line_lost = None
             steering_center_x = top_candidate[0]
             base_linear_x = 0.04
-            self.get_logger().info("[CONTROL] Using top candidate only (bottom lost).")
+            self.get_logger().info(
+                "[CONTROL] Using top candidate only (bottom lost).",
+                throttle_duration_sec=1.0,
+            )
 
         else:
             if self.time_line_lost is None:
                 self.time_line_lost = now
             elapsed_time = (now - self.time_line_lost).nanoseconds * 1e-9
-            self.get_logger().warn(f"[CONTROL] LINE LOST! Elapsed time: {elapsed_time:.2f}s")
 
-            if elapsed_time < 5.0:
-                base_linear_x    = 0.04
-                target_angular_z = 0.0
+            # Turn toward the side the line was last seen instead of driving
+            # straight off the track. The PD error sign encodes that side:
+            # error>0 => line was left of center => turn left (+w); <0 => right.
+            recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
+            if elapsed_time < self._recover_seconds:
+                base_linear_x    = self._recover_speed
+                target_angular_z = self._recover_turn * recover_dir
+                self.get_logger().warn(
+                    f"[CONTROL] LINE LOST {elapsed_time:.1f}s -> searching dir={recover_dir:+.0f}",
+                    throttle_duration_sec=0.5,
+                )
             else:
                 base_linear_x    = 0.0
                 target_angular_z = 0.0
+                self.get_logger().warn(
+                    "[CONTROL] LINE LOST -> stopped (search timed out)",
+                    throttle_duration_sec=2.0,
+                )
 
         if approach_entry_center_x is not None:
             steering_center_x = approach_entry_center_x
             self.time_line_lost = None
             self.get_logger().info(
-                f"[INTERSECTION] Steering to entry center x={approach_entry_center_x:.1f}"
+                f"[INTERSECTION] Steering to entry center x={approach_entry_center_x:.1f}",
+                throttle_duration_sec=1.0,
             )
 
         # PD Math
@@ -923,7 +976,8 @@ class AutonomousRacer(Node):
 
                 self.get_logger().info(
                     f"[MATH] Error: {line_error:.1f} | Deriv: {derivative:.1f} | "
-                    f"Curve Fact: {curve_factor:.2f} -> Raw W: {w_out:.3f}"
+                    f"Curve Fact: {curve_factor:.2f} -> Raw W: {w_out:.3f}",
+                    throttle_duration_sec=1.0,
                 )
 
                 self.last_error      = line_error
@@ -953,7 +1007,8 @@ class AutonomousRacer(Node):
         if self.intersection_phase == 'approach':
             base_linear_x = self._approach_speed
             self.get_logger().info(
-                f"[INTERSECTION] APPROACH creep: V={base_linear_x:.3f} W={target_angular_z:.2f}"
+                f"[INTERSECTION] APPROACH creep: V={base_linear_x:.3f} W={target_angular_z:.2f}",
+                throttle_duration_sec=1.0,
             )
 
         # ---------------------------------------------------------
@@ -968,29 +1023,31 @@ class AutonomousRacer(Node):
         if effective_state == "RED":
             cmd.linear.x  = 0.0
             cmd.angular.z = 0.0
-            self.get_logger().info("[ACTION] Stopped for RED light.")
+            self.get_logger().info("[ACTION] Stopped for RED light.", throttle_duration_sec=1.0)
         elif effective_state == "YELLOW":
             cmd.linear.x  = base_linear_x * 0.5
             cmd.angular.z = target_angular_z
             self.get_logger().info(
-                f"[ACTION] Throttled for YELLOW. Cmd -> V: {cmd.linear.x:.3f}, W: {cmd.angular.z:.3f}"
+                f"[ACTION] Throttled for YELLOW. Cmd -> V: {cmd.linear.x:.3f}, W: {cmd.angular.z:.3f}",
+                throttle_duration_sec=1.0,
             )
         else:  # GREEN
             cmd.linear.x  = base_linear_x
             cmd.angular.z = target_angular_z
             self.get_logger().info(
-                f"[ACTION] Normal Drive (GREEN). Cmd -> V: {cmd.linear.x:.3f}, W: {cmd.angular.z:.3f}"
+                f"[ACTION] Normal Drive (GREEN). Cmd -> V: {cmd.linear.x:.3f}, W: {cmd.angular.z:.3f}",
+                throttle_duration_sec=1.0,
             )
 
         # Master motion switch: if driving is disabled, hold still regardless of
         # what the controller computed (perception keeps running below).
         if not self._drive_enabled:
             cmd = Twist()
-            self.get_logger().info("[DRIVE] disabled -> holding still")
+            self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
 
         self.cmd_pub.publish(cmd)
 
-        self.get_logger().info("-" * 50)
+        self.get_logger().debug("-" * 50)
 
         # Debug Visuals
         cv2.line(frame, (int(frame_center_x), 0), (int(frame_center_x), h), (0, 255, 255), 2)

@@ -14,10 +14,13 @@ source "${SCRIPT_DIR}/lib/common.sh"
 CONFIDENCE="${CONFIDENCE:-0.45}"
 
 sync_repo
-# Make sure ultralytics is available on the Jetson.
+# Make sure ultralytics is available on the Jetson. This script runs the
+# detector with the user site enabled because ultralytics is normally installed
+# with --user on the Jetson; common.sh keeps it disabled for the calibrator and
+# ROS runtime tools to avoid user-site package conflicts.
 ssh "${JETSON_USER}@${JETSON_HOST}" \
-  "python3 -c 'import ultralytics' 2>/dev/null || pip3 install ultralytics --quiet" || true
+  "python3 -c 'import ultralytics' 2>/dev/null || python3 -m pip install --user ultralytics --quiet" || true
 
 free_camera
 start_stream
-run_remote_tool "python3 tools/sign_detector.py --confidence ${CONFIDENCE}"
+run_remote_tool "env -u PYTHONNOUSERSITE python3 tools/sign_detector.py --confidence ${CONFIDENCE}"

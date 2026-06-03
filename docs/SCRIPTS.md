@@ -60,6 +60,17 @@ single-owner, so run one at a time; the scripts free it before starting.
 
 ---
 
+## First-time setup
+
+One-off, per laptop. Two independent tracks — see [SETUP.md](SETUP.md) for the
+full walkthrough.
+
+| Script | What it does | When to run |
+| --- | --- | --- |
+| `setup_laptop.sh` | Installs laptop deps: GStreamer H264 receiver, `ssh`/`rsync`, and the Python packages in `requirements-laptop.txt` (`numpy`, `opencv-python`, `pygame`); seeds `scripts/local.env`. `NO_APT=1` = pip only. | New laptop, libraries track. |
+| `setup_robonet.sh` | Recreates the **RoboNet** WiFi AP via `nmcli` (laptop hosts it at `10.10.0.1`, Jetson joins at `10.10.0.100`). Defaults `ROBONET_SSID`/`ROBONET_PSK`/`WIFI_IFACE` overridable. | Only the laptop that hosts the robot WiFi. |
+| `check_setup.sh` | Read-only preflight checklist; reports **LIBRARIES** and **NETWORK** blocks separately with the fix for anything missing. | After setup, or to debug "nothing connects". |
+
 ## Daily line-follower workflow
 
 | Script | What it does | When to run |
