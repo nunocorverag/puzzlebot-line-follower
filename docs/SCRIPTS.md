@@ -87,6 +87,8 @@ full walkthrough.
 | Script / Tool | What it does | When to run |
 | --- | --- | --- |
 | `run_line_calibrator_jetson.sh` | Syncs, sends `drive_enable=false`, frees the CSI camera, then runs `tools/line_vision_calibrator.py --gstreamer`. Default `STREAM=h264` shows a fast dashboard (overlay + Otsu mask + state panel). Use `STREAM=local` for the old OpenCV trackbars. Set `HOLD_DRIVE_OFF=0` only if you intentionally do not want the script to touch `/drive_enable`. | Tune intersection/mask params live. **Primary perception playground.** |
+| `run_warp_calibrator_jetson.sh` + `tools/warp_calibrator.py` | H264 dashboard for the **bird's-eye lane follower**: original + warp trapezoid beside the top-down view with sliding windows + fit. Tune the four warp points + mask with `set_warp_param.sh` until a straight line is vertical, then `save_lane 1` writes `config/lane_params.json` (loaded by the follower's bird's-eye path). Runs offline on a dataset frame with `--image`. | **Calibrate the lane warp** (after the camera moves height). |
+| `set_warp_param.sh` | Writes `PARAM VALUE` into the warp calibrator's command file. Any `LaneParams` field, plus `save_lane 1`, `q 1`, `p 1` (pause), `u 1` (undistort), `reset 1`. e.g. `scripts/set_warp_param.sh src_top_half_w_pct 16`. | Adjust the warp live. |
 | `tools/line_vision_calibrator.py` | The calibrator itself. Live trackbars, mask/overlay/state windows, saves labeled samples. Also runs offline on saved images: `--image path.jpg`. | Live on Jetson or offline tuning on the laptop. |
 | `set_calibrator_param.sh` | Writes `PARAM=VALUE` (or `label X`) into the calibrator command file the tool watches. Also supports H264 control commands: `s 1` save, `p 1` pause, `u 1` undistort, `q 1` quit, `save_calib 1` persist detector params. | Adjust parameters while the H264 calibrator is running, e.g. `scripts/set_calibrator_param.sh min_dash_count 6`. |
 | `run_illumination_calibrator_jetson.sh` + `tools/illumination_calibrator.py` | Auto-guided flat-field capture over H264; averages good white-surface frames, writes `config/illumination_flatfield.npz`, pulls it back. | **Illumination calibration** — see [CALIBRATION_ILLUMINATION.md](CALIBRATION_ILLUMINATION.md). |
@@ -175,7 +177,7 @@ There are two different things you can view; pick by intent:
 | What you see | Script | Notes |
 | --- | --- | --- |
 | **Raw camera, no overlays** | `scripts/run_camera_h264_jetson.sh` | Pure GStreamer (no ROS, no line follower). Just the camera. Lowest latency. |
-| **Line follower's annotated view** (ROI boxes, anchors, steering line) | `scripts/run_line_follower_h264.sh` | Runs the autonomous racer and streams the frame it draws on. For debugging perception. |
+| **Line follower's annotated view** (ROI boxes, anchors, steering line) | `scripts/run_line_follower_jetson.sh` | Runs the autonomous racer and streams the frame it draws on (H264 by default). For debugging perception. |
 
 > The CSI camera allows only ONE process at a time. Run either the follower,
 > calibrator, recorder, sign detector, or raw-camera preview, never more than one
@@ -192,7 +194,8 @@ H264 workflow (one command, IP auto-detected):
 
 ```bash
 # Starts follower in H264 mode AND opens the receiver window. Ctrl+C stops both.
-scripts/run_line_follower_h264.sh
+# H264 is already the default, so the bare script is enough.
+scripts/run_line_follower_jetson.sh
 ```
 
 The laptop IP is auto-detected from the route to the Jetson. On the `RoboNet`
@@ -223,12 +226,20 @@ Use these from the repo root on the laptop unless noted otherwise. Most Jetson s
 | `run_demo_tmux.sh` | `scripts/run_demo_tmux.sh` | Full tmux demo orchestration. |
 | `run_motor_agent_jetson.sh` | `scripts/run_motor_agent_jetson.sh` | Starts the micro-ROS motor bridge. Required for wheel motion. |
 | `set_drive_jetson.sh` | `scripts/set_drive_jetson.sh on` or `off` | Enables/disables only the follower motion gate. |
+| `run_param_tuner_jetson.sh` | `scripts/run_param_tuner_jetson.sh` | **Interactive** PD + warp tuner (curses TUI) for the running follower: nudge gains/warp live, watch `/lane_status`, `s` saves to JSON. No ROS/X on the laptop. |
+| `run_param_gui_jetson.sh` | `scripts/run_param_gui_jetson.sh` | Official `rqt_reconfigure` sliders for every live param, via `ssh -X`. Use the TUI tuner if X over WiFi is laggy. |
+| `set_gain_jetson.sh` | `scripts/set_gain_jetson.sh kp 0.0025` | One-shot live PD/curve tuning (scriptable): `kp`, `kd`, `max_v`, `max_w`, `curve_slow_gain`, `curve_min_scale`. |
+| `set_intersection_jetson.sh` | `scripts/set_intersection_jetson.sh left` | Answer the intersection prompt (`left`/`right`/`straight`) or `reset` the state machine if stuck in WAIT. |
 | `jog_forward_jetson.sh` | `scripts/jog_forward_jetson.sh 0.10 1.5` | Simple forward jog; do not run alongside the follower. |
-| `run_line_follower_jetson.sh` | `IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh` | Runs the autonomous follower. Default stream is H264 unless overridden. |
-| `run_line_follower_h264.sh` | `scripts/run_line_follower_h264.sh` | Shortcut for follower with H264 receiver. |
+| `run_line_follower_jetson.sh` | `IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh` | Runs the autonomous follower (HUD overlay shows state/gains/metrics). H264 by default; `CONTROLLER_LOG=1` logs a tuning CSV. |
 | `run_line_calibrator_jetson.sh` | `LABEL=roi_diagonal_debug scripts/run_line_calibrator_jetson.sh` | Perception-only calibrator; sends drive off and opens CSI camera directly. |
 | `set_calibrator_param.sh` | `scripts/set_calibrator_param.sh roi_y0_pct 72` | Live H264 calibrator controls and params; also `s 1`, `p 1`, `u 1`, `q 1`. |
-| `pull_calibration_dataset.sh` | `scripts/pull_calibration_dataset.sh` | Pulls Jetson `debug_dataset/` to the laptop. |
+| `run_warp_calibrator_jetson.sh` | `scripts/run_warp_calibrator_jetson.sh` | Bird's-eye warp calibrator for the lane follower; saves `config/lane_params.json`. |
+| `set_warp_param.sh` | `scripts/set_warp_param.sh src_top_y_pct 55` | Live warp params; also `save_lane 1`, `q 1`, `p 1`, `u 1`, `reset 1`. |
+| `run_tilt_assistant_jetson.sh` | `scripts/run_tilt_assistant_jetson.sh` | Live camera pitch (deg) from the lane vanishing point + ground/far bands. |
+| `set_tilt_param.sh` | `scripts/set_tilt_param.sh start 1` | `start`/`stop` capture, `mark`, `save` (camera_pose.json), `u`, `q`. |
+| `pull_calibration_dataset.sh` | `scripts/pull_calibration_dataset.sh` | Pulls Jetson `debug_dataset/` to the laptop under `datasets/calibration/`. |
+| `pull_follower_snapshots.sh` | `scripts/pull_follower_snapshots.sh` | Pulls the follower's recorded snapshots to `datasets/follower_session/`. |
 | `run_camera_h264_jetson.sh` | `scripts/run_camera_h264_jetson.sh` | Raw CSI camera over H264, no ROS overlays. |
 | `set_local_video_sink.sh` | `scripts/set_local_video_sink.sh ximagesink` | One-time laptop config for the H264 viewer sink. Use `autovideosink` on native Ubuntu, `ximagesink` on WSL/X11. |
 | `view_h264_stream.sh` | `scripts/view_h264_stream.sh` | Manual laptop receiver. It reads `scripts/local.env` if present. |

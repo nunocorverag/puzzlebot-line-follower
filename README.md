@@ -162,6 +162,8 @@ If their script does not support `scripts/local.env` or `VIDEO_SINK`, they are
 on an older checkout and should pull the latest branch before testing.
 
 Full current workflow: **[docs/PERCEPTION_TUNING.md](docs/PERCEPTION_TUNING.md)**.
+Bird's-eye lane following, track measurements and camera tilt:
+**[docs/LANE_FOLLOWING.md](docs/LANE_FOLLOWING.md)**.
 
 Optional label for saved samples:
 

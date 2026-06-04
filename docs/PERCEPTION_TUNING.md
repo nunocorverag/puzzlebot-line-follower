@@ -5,6 +5,10 @@ Puzzlebot. The general idea is: direct CSI camera over GStreamer, fast H264
 preview, and a single source of truth for geometry, illumination and
 intersection detection.
 
+> For the bird's-eye **lane follower** (the robust primary line-following path),
+> its warp calibration, the track measurements and the camera tilt
+> recommendation, see **[LANE_FOLLOWING.md](LANE_FOLLOWING.md)**.
+
 ---
 
 ## Recommended order
