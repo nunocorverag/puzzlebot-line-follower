@@ -26,7 +26,8 @@ free_camera
 
 start_stream # Auto-detects H264_HOST and launches the local receiver
 
-# Inject the necessary streaming variables explicitly into the remote env command
+# Inyectamos las variables y corremos YOLO en el fondo (&) y el State Machine en primer plano.
+# Cuando presiones Ctrl+C, el script matará el proceso de YOLO automáticamente.
 run_remote_tool "env -u PYTHONNOUSERSITE \
   H264_HOST=${H264_HOST} \
   H264_PORT=${H264_PORT:-5000} \
@@ -34,5 +35,9 @@ run_remote_tool "env -u PYTHONNOUSERSITE \
   WIDTH=${WIDTH} \
   HEIGHT=${HEIGHT} \
   BITRATE=${BITRATE} \
-  LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 \
-  python3 tools/sign_detector.py --confidence ${CONFIDENCE}"
+  bash -c '
+    LD_PRELOAD=/usr/lib/aarch64-linux-gnu/libgomp.so.1 python3 tools/sign_detector.py --confidence ${CONFIDENCE} &
+    YOLO_PID=\$!
+    python3 tools/sign_state_machine.py
+    kill \$YOLO_PID 2>/dev/null || true
+  '"

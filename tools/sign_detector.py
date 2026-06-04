@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Combined traffic sign (YOLO) + traffic light (HSV) detector.
 
-Captures natively from the CSI camera using a GStreamer pipeline, 
-runs both detectors, draws overlays, and outputs an H264 UDP stream.
+Captures natively from the CSI camera using an asynchronous GStreamer pipeline, 
+runs both detectors, draws overlays, and outputs a zero-latency H264 UDP stream.
 """
 import os
 import sys
 import time
+import threading
 from pathlib import Path
 from collections import deque, Counter
 
 # --- THE JETSON TLS FIX ---
-# Force PyTorch to load its massive OpenMP library BEFORE OpenCV takes the memory slots
 import torch
 from ultralytics import YOLO
 # --------------------------
@@ -25,7 +25,6 @@ from std_msgs.msg import String
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
 
-# Removed open_csi_capture and Preview; keeping calibration helpers
 from puzzlebot_ros.perception.camera import (  # noqa: E402
     load_camera_params,
     load_illumination_gain,
@@ -33,7 +32,6 @@ from puzzlebot_ros.perception.camera import (  # noqa: E402
 )
 MODEL_PATH = REPO_DIR / "config" / "best.pt"
 
-# BGR colors for YOLO sign classes
 CLASS_COLORS = {
     "give-way":         (0, 165, 255),
     "stop":             (0, 0, 255),
@@ -43,7 +41,6 @@ CLASS_COLORS = {
     "vuelta-izquierda": (255, 255, 0),
 }
 
-# BGR colors for traffic light overlay indicator
 TL_INDICATOR = {
     "RED":    (0, 0, 255),
     "YELLOW": (0, 220, 255),
@@ -57,7 +54,6 @@ class SignDetectorNode(Node):
     def __init__(self, conf_threshold: float = 0.45):
         super().__init__("sign_detector")
 
-        # --- Environment & Stream Settings ---
         self.h264_host = os.environ.get("H264_HOST", "127.0.0.1")
         self.h264_port = os.environ.get("H264_PORT", "5000")
         self.fps = int(os.environ.get("FPS", "30"))
@@ -65,7 +61,6 @@ class SignDetectorNode(Node):
         self.height = int(os.environ.get("HEIGHT", "480"))
         self.bitrate = int(os.environ.get("BITRATE", "4000000"))
 
-        # --- YOLO model ---
         try:
             from ultralytics import YOLO
             self.model = YOLO(str(MODEL_PATH))
@@ -76,7 +71,6 @@ class SignDetectorNode(Node):
 
         self.conf = conf_threshold
 
-        # --- Camera calibration ---
         self.camera_matrix, self.dist_coeffs = load_camera_params(
             REPO_DIR / "config" / "camera_params.npz"
         )
@@ -84,7 +78,6 @@ class SignDetectorNode(Node):
             REPO_DIR / "config" / "illumination_flatfield.npz"
         )
 
-        # --- Traffic light parameters ---
         self.tl_min_detect_area = 30
         self.tl_min_action_area = 350
         self.tl_min_circularity = 0.60
@@ -92,9 +85,7 @@ class SignDetectorNode(Node):
         self.tl_history = deque(maxlen=5)
         self.tl_last_published_state = "NONE"
 
-        # --- Camera (Direct GStreamer CSI capture) ---
-        # --- Camera (Direct GStreamer CSI capture) ---
-        # Notice the explicit (int), (fraction), and (string) casts so OpenCV's parser doesn't crash
+        # --- Camera Input ---
         gst_in = (
             f"nvarguscamerasrc sensor-id=0 ! "
             f"video/x-raw(memory:NVMM), width=(int)1280, height=(int)720, framerate=(fraction){self.fps}/1 ! "
@@ -106,37 +97,52 @@ class SignDetectorNode(Node):
             self.get_logger().error("Could not open CSI camera via GStreamer.")
             raise RuntimeError("camera unavailable")
 
-        # --- Publishers ---
+        # --- Async Camera Threading ---
+        # This prevents YOLO inference time from causing frame buffering and lag
+        self.latest_frame = None
+        self.thread_running = True
+        self.camera_thread = threading.Thread(target=self._camera_read_loop, daemon=True)
+        self.camera_thread.start()
+
         self.sign_pub = self.create_publisher(String, "/sign_detection", 10)
         self.tl_pub   = self.create_publisher(String, "/traffic_light_state", 10)
 
-        # --- Output Stream (Hardware H264 UDP Sink) ---
+        # --- Output Stream ---
+        # Added preset-level=1 (UltraFast) to nvv4l2h264enc to kill hardware encoding latency
         gst_out = (
             f"appsrc ! video/x-raw, format=(string)BGR ! videoconvert ! video/x-raw, format=(string)BGRx ! "
             f"nvvidconv ! video/x-raw(memory:NVMM) ! "
-            f"nvv4l2h264enc insert-sps-pps=1 idrinterval={self.fps} bitrate={self.bitrate} maxperf-enable=1 ! "
+            f"nvv4l2h264enc insert-sps-pps=1 idrinterval=15 preset-level=1 bitrate={self.bitrate} maxperf-enable=1 ! "
             f"h264parse ! rtph264pay config-interval=1 pt=96 ! "
             f"udpsink host={self.h264_host} port={self.h264_port} sync=false async=false"
         )
-        # fourcc '0' skips generic encoding and delegates directly to the Gstreamer backend
         self.out = cv2.VideoWriter(gst_out, cv2.CAP_GSTREAMER, 0, self.fps, (self.width, self.height))
-        if not self.out.isOpened():
-            self.get_logger().error("Could not start GStreamer UDP sink.")
-
-        # --- Inference timer (10 Hz) ---
-        self.create_timer(0.1, self._loop)
+        
+        # Run inference loop faster (30Hz instead of 10Hz) to process frames as quickly as YOLO allows
+        self.create_timer(0.033, self._loop)
 
         self.frame_count = 0
         self.fps_time = time.time()
-        self.get_logger().info(f"Detector ready — Streaming to {self.h264_host}:{self.h264_port}")
+        self.get_logger().info(f"Detector ready — Streaming ZERO-LATENCY to {self.h264_host}:{self.h264_port}")
 
     # ------------------------------------------------------------------
-    # Camera grab
+    # Async Camera Read Loop
     # ------------------------------------------------------------------
+    def _camera_read_loop(self):
+        """Runs in the background, constantly pulling the freshest frame."""
+        while self.thread_running and rclpy.ok():
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                self.latest_frame = frame
+
     def _grab_frame(self):
-        ok, frame = self.cap.read()
-        if not ok or frame is None:
+        """Preprocesses the most recently grabbed frame from the background thread."""
+        if self.latest_frame is None:
             return None
+        
+        # Copy to avoid race conditions with the background thread
+        frame = self.latest_frame.copy()
+        
         return preprocess_frame(
             frame,
             camera_matrix=self.camera_matrix,
@@ -146,7 +152,7 @@ class SignDetectorNode(Node):
         )
 
     # ------------------------------------------------------------------
-    # Traffic light helpers (Unchanged)
+    # Traffic light helpers
     # ------------------------------------------------------------------
     def _find_best_blob(self, mask: np.ndarray):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  self.tl_kernel)
@@ -211,8 +217,6 @@ class SignDetectorNode(Node):
             return
 
         display = frame.copy()
-        
-        # Create a dedicated frame for the traffic light detector
         tl_frame = frame.copy()
 
         # --- YOLO sign detection ---
@@ -227,15 +231,13 @@ class SignDetectorNode(Node):
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 color = CLASS_COLORS.get(cls_name, (0, 255, 255))
 
-                # Draw overlays for the viewer
                 cv2.rectangle(display, (x1, y1), (x2, y2), color, 2)
                 label = f"{cls_name} {conf:.2f}"
                 cv2.putText(display, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 3)
                 cv2.putText(display, label, (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1)
                 sign_detections.append(cls_name)
 
-                # THE FIX: Black out the detected sign's bounding box on the tl_frame
-                # This makes the stop sign completely invisible to the HSV color detector
+                # Black out the detected sign's bounding box on the tl_frame
                 cv2.rectangle(tl_frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
 
         if sign_detections:
@@ -243,7 +245,6 @@ class SignDetectorNode(Node):
             self.sign_pub.publish(msg)
 
         # --- Traffic light detection & smoothing ---
-        # Pass the masked tl_frame instead of the raw frame
         raw_color, tl_area, is_actionable = self._detect_traffic_light(tl_frame)
         
         current_state = raw_color if is_actionable else "NONE"
@@ -287,11 +288,15 @@ class SignDetectorNode(Node):
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
         cv2.putText(display, status, (8, 32), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # Stream directly to UDP via GStreamer
         if self.out.isOpened():
             self.out.write(display)
 
     def destroy_node(self):
+        # Gracefully shut down the capture thread
+        self.thread_running = False
+        if self.camera_thread.is_alive():
+            self.camera_thread.join(timeout=1.0)
+
         if hasattr(self, 'out') and self.out.isOpened():
             self.out.release()
         if self.cap is not None:
