@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
 
+import csv
+import json
 import os
+from datetime import datetime
 
 import rclpy
 from rclpy.duration import Duration
+from rclpy.logging import LoggingSeverity
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from geometry_msgs.msg import Twist
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Float32MultiArray, String
 
 import cv2
 import numpy as np
@@ -24,6 +29,15 @@ from puzzlebot_ros.perception.intersection import (
     analyze_intersection,
     load_intersection_params,
 )
+from puzzlebot_ros.perception.lane import (
+    LaneParams,
+    analyze_lane,
+    compute_homography,
+    draw_lane_overlay,
+    load_lane_params,
+    save_lane_params,
+)
+from dataclasses import fields as dataclass_fields
 from puzzlebot_ros.perception.camera import open_csi_capture
 from puzzlebot_ros.perception.stream import H264Streamer
 
@@ -235,17 +249,32 @@ class AutonomousRacer(Node):
         self.anchor_max_jump = 100
 
         # =========================================================
-        # PD Controller
+        # PD Controller (live-tunable via the param tuner / rqt_reconfigure /
+        # scripts/set_gain_jetson.sh). Saved gains persist in control_params.json.
         # =========================================================
-        self.kp = 0.003
-        self.kd = 0.008
+        self._control_params_path = self._config_save_path('control_params.json')
+        saved = {}
+        found = self._find_config('control_params.json')
+        if found is not None:
+            try:
+                saved = json.loads(found.read_text())
+                self.get_logger().info(f'Loaded control gains: {found}')
+            except (OSError, json.JSONDecodeError) as exc:
+                self.get_logger().warn(f'control_params.json unreadable ({exc})')
+        else:
+            self.get_logger().warn('control_params.json not found; using defaults')
+        self.declare_parameter('kp', float(saved.get('kp', 0.003)))
+        self.declare_parameter('kd', float(saved.get('kd', 0.008)))
+        self.declare_parameter('max_v', float(saved.get('max_v', 0.08)))
+        self.declare_parameter('max_w', float(saved.get('max_w', 0.6)))
+        self.kp = float(self.get_parameter('kp').value)
+        self.kd = float(self.get_parameter('kd').value)
+        self.max_v = float(self.get_parameter('max_v').value)
+        self.max_w = float(self.get_parameter('max_w').value)
 
         self.last_error = 0.0
         self.last_derivative = 0.0
         self.last_time = self.get_clock().now()
-
-        self.max_v = 0.08
-        self.max_w = 0.6
 
         # Line-lost recovery (robustness). When both ROIs lose the line we no
         # longer drive blindly straight (that runs off the track on a curve).
@@ -258,6 +287,81 @@ class AutonomousRacer(Node):
         self._recover_turn = float(self.get_parameter('recover_turn').value)
         self._recover_speed = float(self.get_parameter('recover_speed').value)
 
+        # =========================================================
+        # Bird's-eye lane follower (robust primary path)
+        # =========================================================
+        # Warps the ground to a top-down view and tracks the center line with a
+        # center-restricted sliding window, so parallel floor seams / off-lane
+        # lines can't hijack steering. Falls back to the legacy two-ROI detector
+        # when disabled or not confident (e.g. warp not tuned yet), so the robot
+        # always follows *something*. Tune the warp live in the calibrator.
+        self.declare_parameter('use_birdseye', True)
+        self.declare_parameter('lane_params_path', '')
+        self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
+        self.declare_parameter('curve_min_scale', 0.4)   # never below this fraction
+        self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
+        self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
+        self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
+        self.lane_params = self._load_lane_params()
+        # Expose every LaneParams field as a live ROS param (lane.<field>) so the
+        # warp can be tuned live (param tuner / rqt) and saved back to JSON.
+        self._lane_param_names = []
+        for f in dataclass_fields(LaneParams):
+            name = f"lane.{f.name}"
+            self.declare_parameter(name, int(getattr(self.lane_params, f.name)))
+            self._lane_param_names.append(name)
+        self._lane_M = None              # cached homography (lazy, per frame size)
+        self._lane_Minv = None
+        self._lane_frame_size = None
+
+        # ---------------------------------------------------------
+        # Diagnostics: status HUD + optional controller CSV log.
+        # ---------------------------------------------------------
+        self._last_lane_result = None    # latest LaneResult for the HUD/CSV
+        self.declare_parameter('controller_log', False)
+        self.declare_parameter('controller_log_path', '')
+        self._csv_fp = None
+        self._csv_writer = None
+        self._t0 = self.get_clock().now()
+        if bool(self.get_parameter('controller_log').value):
+            log_path = str(self.get_parameter('controller_log_path').value).strip() or \
+                str(Path(__file__).resolve().parent / 'controller_data.csv')
+            try:
+                self._csv_fp = open(log_path, 'w', newline='')
+                self._csv_writer = csv.writer(self._csv_fp)
+                self._csv_writer.writerow(
+                    ['t', 'state', 'off', 'conf', 'curv', 'error', 'deriv', 'v', 'w', 'kp', 'kd'])
+                self.get_logger().info(f'[LOG] controller CSV -> {log_path}')
+            except OSError as exc:
+                self.get_logger().error(f'[LOG] could not open CSV ({exc}); disabled')
+                self._csv_fp = self._csv_writer = None
+
+        # Operator reset for the intersection state machine
+        # (scripts/set_intersection_jetson.sh reset): clears phase/decision/commit.
+        self.create_subscription(Bool, '/intersection_reset',
+                                 self._intersection_reset_cb, 10)
+
+        # Live lane metrics for the tuner / Foxglove / PlotJuggler:
+        # [off, conf, curv, v, w].
+        self.lane_status_pub = self.create_publisher(Float32MultiArray, '/lane_status', 10)
+        # Persist current tunables to JSON on demand (tuner 'save' key).
+        self.create_subscription(Bool, '/save_params', self._save_params_cb, 10)
+
+        # Periodic snapshot recorder (tuner 'r' -> /recorder_enable). Saves the
+        # annotated frame every snapshot_interval s for offline review; pull with
+        # scripts/pull_follower_snapshots.sh.
+        self.declare_parameter('snapshot_interval', 2.0)
+        self.declare_parameter('record_on_start', False)
+        self._snapshot_interval = float(self.get_parameter('snapshot_interval').value)
+        self._recording = bool(self.get_parameter('record_on_start').value)
+        self._last_snap_t = self.get_clock().now()
+        self._snap_count = 0
+        self.create_subscription(Bool, '/recorder_enable', self._recorder_cb, 10)
+
+        # Live PD/warp tuning via ros2 param set (param tuner / rqt_reconfigure /
+        # scripts/set_gain_jetson.sh). Registered LAST so it sees all declarations.
+        self.add_on_set_parameters_callback(self._on_set_params)
+
         # Timer (30 Hz)
         self.timer = self.create_timer(0.033, self.control_loop)
 
@@ -266,6 +370,13 @@ class AutonomousRacer(Node):
         self.get_logger().info("Autonomous Racer Started: Lines + Traffic Lights")
         self.get_logger().info("MJPEG stream available at http://10.10.0.100:8080")
 
+        # Quiet the per-frame INFO spam ([VISION]/[MATH]/[LANE]/[TRACKING]/[ACTION])
+        # unless verbose; warnings (line lost, intersection, transitions) still show.
+        # The video HUD is the live state display.
+        self.declare_parameter('verbose', False)
+        if not bool(self.get_parameter('verbose').value):
+            self.get_logger().set_level(LoggingSeverity.WARN)
+
     def _package_config_path(self, filename):
         if get_package_share_directory is None:
             return None
@@ -273,6 +384,26 @@ class AutonomousRacer(Node):
             return Path(get_package_share_directory("puzzlebot_ros")) / "config" / filename
         except Exception:
             return None
+
+    def _find_config(self, filename):
+        """First existing config path (source tree, then installed/share)."""
+        candidates = [
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config') / filename,
+            Path(__file__).resolve().parents[1] / 'config' / filename,
+        ]
+        pkg = self._package_config_path(filename)
+        if pkg is not None:
+            candidates.append(pkg)
+        for c in candidates:
+            if c.exists():
+                return c
+        return None
+
+    def _config_save_path(self, filename):
+        """Where to WRITE config: the source tree (persists + gets synced)."""
+        src = Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config')
+        base = src if src.is_dir() else (Path(__file__).resolve().parents[1] / 'config')
+        return base / filename
 
     def _load_camera_params(self):
         if not bool(self.get_parameter('use_undistort').value):
@@ -319,6 +450,30 @@ class AutonomousRacer(Node):
                 return params
         self.get_logger().warn('Intersection calibration JSON not found; using built-in defaults.')
         return IntersectionParams()
+
+    def _load_lane_params(self):
+        configured_path = str(self.get_parameter('lane_params_path').value).strip()
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(Path(configured_path).expanduser())
+        candidate_paths.extend([
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/lane_params.json'),
+            Path(__file__).resolve().parents[1] / 'config' / 'lane_params.json',
+        ])
+        package_config = self._package_config_path('lane_params.json')
+        if package_config is not None:
+            candidate_paths.append(package_config)
+        for params_path in candidate_paths:
+            if params_path.exists():
+                params = load_lane_params(params_path)
+                self.get_logger().info(f'Loaded lane calibration: {params_path}')
+                return params
+        self.get_logger().warn(
+            'Lane calibration JSON not found; using built-in warp defaults '
+            '(tune in the calibrator). Bird\'s-eye falls back to legacy ROIs '
+            'until confident.'
+        )
+        return LaneParams()
 
     def _load_illumination_gain(self):
         if not bool(self.get_parameter('use_illumination_correction').value):
@@ -382,6 +537,166 @@ class AutonomousRacer(Node):
             return
         self.intersection_decision = normalized
         self.get_logger().info(f"Intersection decision received: {normalized}")
+
+    def _intersection_reset_cb(self, msg):
+        """Operator escape hatch: clear the whole intersection state machine so
+        the robot drops back to plain line following (e.g. stuck in WAIT)."""
+        if not msg.data:
+            return
+        self.intersection_phase = None
+        self.intersection_decision = None
+        self.intersection_pending = False
+        self.intersection_options = []
+        self.commit_direction = None
+        self.commit_until = None
+        self.intersection_result = None
+        self.intersection_stable = 0
+        self.last_prompt_time = None
+        self.intersection_cooldown_until = None
+        self.get_logger().warn('[INTERSECTION] state RESET by operator -> FOLLOW')
+
+    def _on_set_params(self, params):
+        """Apply live PD/curve/warp tuning from ros2 param set without a restart."""
+        lane_changed = False
+        for p in params:
+            if p.name == 'kp':
+                self.kp = float(p.value)
+            elif p.name == 'kd':
+                self.kd = float(p.value)
+            elif p.name == 'max_v':
+                self.max_v = float(p.value)
+            elif p.name == 'max_w':
+                self.max_w = float(p.value)
+            elif p.name == 'curve_slow_gain':
+                self._curve_slow_gain = float(p.value)
+            elif p.name == 'curve_min_scale':
+                self._curve_min_scale = float(p.value)
+            elif p.name.startswith('lane.'):
+                field = p.name[len('lane.'):]
+                if hasattr(self.lane_params, field):
+                    setattr(self.lane_params, field, int(p.value))
+                    lane_changed = True
+        if lane_changed:
+            # Trapezoid/size may have moved -> rebuild the homography next frame.
+            self._lane_M = None
+            self._lane_frame_size = None
+        return SetParametersResult(successful=True)
+
+    def _save_params_cb(self, msg):
+        """Persist current tunables to config JSON (warp + control gains)."""
+        if not msg.data:
+            return
+        try:
+            lane_path = self._config_save_path('lane_params.json')
+            save_lane_params(self.lane_params, lane_path)
+            self._control_params_path.parent.mkdir(parents=True, exist_ok=True)
+            self._control_params_path.write_text(json.dumps({
+                'kp': self.kp, 'kd': self.kd,
+                'max_v': self.max_v, 'max_w': self.max_w,
+                'curve_slow_gain': self._curve_slow_gain,
+                'curve_min_scale': self._curve_min_scale,
+            }, indent=2))
+            self.get_logger().warn(
+                f'[SAVE] wrote {lane_path.name} + {self._control_params_path.name}')
+        except OSError as exc:
+            self.get_logger().error(f'[SAVE] failed: {exc}')
+
+    def _phase_label(self):
+        """High-level state for the HUD/CSV: (text, BGR color)."""
+        if not self._drive_enabled:
+            return ("HOLD: drive OFF", (0, 165, 255))
+        effective = "GREEN" if self._ignore_traffic_light else self.current_state
+        if effective == "RED":
+            return ("STOP: red light", (0, 0, 255))
+        if self.intersection_phase == 'wait':
+            return ("WAIT: decision", (0, 0, 255))
+        if self.intersection_phase == 'approach':
+            return ("APPROACH", (0, 255, 255))
+        if self.commit_direction is not None:
+            return (f"COMMIT {self.commit_direction}", (255, 160, 0))
+        if self.time_line_lost is not None:
+            return ("RECOVER: line lost", (0, 128, 255))
+        return ("FOLLOW", (0, 255, 0))
+
+    def _draw_status_hud(self, frame, cmd):
+        """Translucent top banner: state, drive/light, lane metrics, gains, cmd."""
+        h, w = frame.shape[:2]
+        label, color = self._phase_label()
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 54), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.45, frame, 0.55, 0, frame)
+
+        lr = self._last_lane_result
+        src = "BEV" if lr is not None else "legacy"
+        off = lr.offset_norm if lr is not None else 0.0
+        conf = lr.confidence if lr is not None else 0.0
+        curv = lr.curvature_norm if lr is not None else 0.0
+        light = "IGN" if self._ignore_traffic_light else self.current_state
+
+        cv2.putText(frame, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        line2 = (f"drive:{'ON' if self._drive_enabled else 'off'}  light:{light}  "
+                 f"{src} off:{off:+.2f} conf:{conf:.2f} curv:{curv:+.2f}  "
+                 f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}")
+        cv2.putText(frame, line2, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (255, 255, 255), 1)
+        gains = f"kp:{self.kp:.4f} kd:{self.kd:.4f} mv:{self.max_v:.2f} mw:{self.max_w:.2f}"
+        cv2.putText(frame, gains, (max(10, w - 360), 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
+        if self._recording:
+            cv2.putText(frame, f"REC {self._snap_count}", (max(10, w - 110), 44),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+    def _recorder_cb(self, msg):
+        self._recording = bool(msg.data)
+        self.get_logger().warn(
+            f'[REC] recording {"ON" if self._recording else "off"} '
+            f'(total snaps: {self._snap_count})')
+
+    def _snapshot_dir(self):
+        base = Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros')
+        if not base.is_dir():
+            base = Path(__file__).resolve().parents[1]
+        return base / 'debug_dataset' / 'follower_session'
+
+    def _maybe_snapshot(self, now, frame):
+        if not self._recording or self._snapshot_interval <= 0:
+            return
+        if (now - self._last_snap_t).nanoseconds * 1e-9 < self._snapshot_interval:
+            return
+        self._last_snap_t = now
+        try:
+            d = self._snapshot_dir()
+            d.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
+            state = self._phase_label()[0].split(':')[0].replace(' ', '')
+            cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'), frame)
+            self._snap_count += 1
+        except OSError as exc:
+            self.get_logger().error(f'[REC] snapshot failed: {exc}')
+
+    def _publish_lane_status(self, cmd):
+        lr = self._last_lane_result
+        msg = Float32MultiArray()
+        msg.data = [
+            float(lr.offset_norm) if lr else 0.0,
+            float(lr.confidence) if lr else 0.0,
+            float(lr.curvature_norm) if lr else 0.0,
+            float(cmd.linear.x), float(cmd.angular.z)]
+        self.lane_status_pub.publish(msg)
+
+    def _log_controller_row(self, now, cmd):
+        if self._csv_writer is None:
+            return
+        t = (now - self._t0).nanoseconds * 1e-9
+        lr = self._last_lane_result
+        self._csv_writer.writerow([
+            f"{t:.3f}", self._phase_label()[0],
+            f"{(lr.offset_norm if lr else 0.0):+.3f}",
+            f"{(lr.confidence if lr else 0.0):.2f}",
+            f"{(lr.curvature_norm if lr else 0.0):+.3f}",
+            f"{self.last_error:.1f}", f"{self.last_derivative:.1f}",
+            f"{cmd.linear.x:.3f}", f"{cmd.angular.z:+.3f}",
+            f"{self.kp:.4f}", f"{self.kd:.4f}"])
 
     def _publish_stream_frame(self, frame):
         """Throttle and push the annotated frame to the active stream (MJPEG or H264)."""
@@ -828,6 +1143,8 @@ class AutonomousRacer(Node):
 
             if self.intersection_decision is None:
                 self.cmd_pub.publish(Twist())
+                self._draw_status_hud(frame, Twist())
+                self._log_controller_row(now, Twist())
                 self._publish_stream_frame(frame)
                 if self.show_window:
                     cv2.imshow("Frame", frame)
@@ -845,117 +1162,142 @@ class AutonomousRacer(Node):
             self.intersection_cooldown_until = now + Duration(seconds=3.0)
 
         # ---------------------------------------------------------
-        # 3. LINE PERCEPTION
-        # ---------------------------------------------------------
-        bottom_y_start, bottom_y_end = int(h * 0.60), h
-        bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
-        approach_entry_center_x = None
-        if (self.intersection_phase == "approach"
-                and self.intersection_result is not None
-                and self.intersection_result.entry_center_x is not None):
-            approach_entry_center_x = float(self.intersection_result.entry_center_x)
-            roi_width = bottom_x_end - bottom_x_start
-            roi_left = approach_entry_center_x - roi_width / 2.0
-            bottom_x_start = int(max(0, min(w - roi_width, roi_left)))
-            bottom_x_end = bottom_x_start + roi_width
-            cv2.line(frame, (int(approach_entry_center_x), bottom_y_start),
-                     (int(approach_entry_center_x), bottom_y_end), (0, 255, 255), 2)
-
-        top_y_start, top_y_end = int(h * 0.25), int(h * 0.50)
-        top_x_start, top_x_end = int(w * 0.10), int(w * 0.90)
-
-        if approach_entry_center_x is not None:
-            bottom_reference_x = approach_entry_center_x
-        else:
-            bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
-
-        bottom_candidate, bottom_mask = self.detect_line_in_roi(
-            frame,
-            bottom_x_start, bottom_x_end, bottom_y_start, bottom_y_end,
-            self.last_bottom_center, reference_x=bottom_reference_x,
-            draw_color=(0, 255, 0), force_middle_of_three=False
-        )
-
-        if bottom_candidate:
-            top_reference_x = bottom_candidate[0]
-        else:
-            top_reference_x = self.last_top_center[0] if self.last_top_center else frame_center_x
-
-        top_candidate, top_mask = self.detect_line_in_roi(
-            frame,
-            top_x_start, top_x_end, top_y_start, top_y_end,
-            self.last_top_center, reference_x=top_reference_x,
-            draw_color=(0, 0, 255),
-            force_middle_of_three=True
-        )
-
-        if bottom_candidate is not None: self.last_bottom_center = bottom_candidate
-        if top_candidate    is not None: self.last_top_center    = top_candidate
-
-        bot_str = f"({bottom_candidate[0]}, {bottom_candidate[1]})" if bottom_candidate else "NONE"
-        top_str = f"({top_candidate[0]},    {top_candidate[1]})"    if top_candidate    else "NONE"
-        self.get_logger().info(
-            f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}",
-            throttle_duration_sec=1.0,
-        )
-
-        # ---------------------------------------------------------
-        # 4. BASE CONTROL CALCULATION (Line Follower)
+        # 3. LINE PERCEPTION + BASE CONTROL
         # ---------------------------------------------------------
         base_linear_x  = 0.0
         target_angular_z = 0.0
         steering_center_x = None
+        lane_curvature = 0.0
+        bottom_candidate = top_candidate = None
+        self._last_lane_result = None    # set below when the bird's-eye path runs
 
-        if bottom_candidate is not None:
-            self.time_line_lost = None
-            bottom_cx, bottom_cy = bottom_candidate
-            steering_center_x = bottom_cx
-
-            if top_candidate is not None:
-                top_cx, top_cy = top_candidate
-                steering_center_x += (top_cx - bottom_cx) * 0.15
-                cv2.line(frame, (bottom_cx, bottom_cy), (top_cx, top_cy), (255, 255, 0), 2)
-
-        elif top_candidate is not None:
-            self.time_line_lost = None
-            steering_center_x = top_candidate[0]
-            base_linear_x = 0.04
-            self.get_logger().info(
-                "[CONTROL] Using top candidate only (bottom lost).",
-                throttle_duration_sec=1.0,
-            )
-
-        else:
-            if self.time_line_lost is None:
-                self.time_line_lost = now
-            elapsed_time = (now - self.time_line_lost).nanoseconds * 1e-9
-
-            # Turn toward the side the line was last seen instead of driving
-            # straight off the track. The PD error sign encodes that side:
-            # error>0 => line was left of center => turn left (+w); <0 => right.
-            recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
-            if elapsed_time < self._recover_seconds:
-                base_linear_x    = self._recover_speed
-                target_angular_z = self._recover_turn * recover_dir
-                self.get_logger().warn(
-                    f"[CONTROL] LINE LOST {elapsed_time:.1f}s -> searching dir={recover_dir:+.0f}",
-                    throttle_duration_sec=0.5,
+        # Primary path: bird's-eye lane follower. Only while normally following;
+        # during an intersection approach/commit we keep the legacy ROI logic
+        # that centers on the zebra entry.
+        lane_ok = False
+        if (self._use_birdseye and self.intersection_phase is None
+                and self.commit_direction is None):
+            if self._lane_M is None or self._lane_frame_size != (w, h):
+                self._lane_M, self._lane_Minv = compute_homography(self.lane_params, w, h)
+                self._lane_frame_size = (w, h)
+            lane_result = analyze_lane(frame, self.lane_params, self._lane_M, self._lane_Minv)
+            self._last_lane_result = lane_result
+            draw_lane_overlay(frame, self.lane_params, lane_result)
+            if lane_result.detected and lane_result.lane_center_x_orig is not None:
+                lane_ok = True
+                steering_center_x = lane_result.lane_center_x_orig
+                lane_curvature = abs(lane_result.curvature_norm)
+                self.time_line_lost = None
+                self.get_logger().info(
+                    f"[LANE] off={lane_result.offset_norm:+.2f} "
+                    f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
+                    throttle_duration_sec=1.0,
                 )
+
+        # Fallback path: legacy two-ROI detector. Also used during approach and
+        # whenever the bird's-eye view is not confident (e.g. warp not yet tuned).
+        if not lane_ok:
+            bottom_y_start, bottom_y_end = int(h * 0.60), h
+            bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
+            approach_entry_center_x = None
+            if (self.intersection_phase == "approach"
+                    and self.intersection_result is not None
+                    and self.intersection_result.entry_center_x is not None):
+                approach_entry_center_x = float(self.intersection_result.entry_center_x)
+                roi_width = bottom_x_end - bottom_x_start
+                roi_left = approach_entry_center_x - roi_width / 2.0
+                bottom_x_start = int(max(0, min(w - roi_width, roi_left)))
+                bottom_x_end = bottom_x_start + roi_width
+                cv2.line(frame, (int(approach_entry_center_x), bottom_y_start),
+                         (int(approach_entry_center_x), bottom_y_end), (0, 255, 255), 2)
+
+            top_y_start, top_y_end = int(h * 0.25), int(h * 0.50)
+            top_x_start, top_x_end = int(w * 0.10), int(w * 0.90)
+
+            if approach_entry_center_x is not None:
+                bottom_reference_x = approach_entry_center_x
             else:
-                base_linear_x    = 0.0
-                target_angular_z = 0.0
-                self.get_logger().warn(
-                    "[CONTROL] LINE LOST -> stopped (search timed out)",
-                    throttle_duration_sec=2.0,
-                )
+                bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
 
-        if approach_entry_center_x is not None:
-            steering_center_x = approach_entry_center_x
-            self.time_line_lost = None
+            bottom_candidate, bottom_mask = self.detect_line_in_roi(
+                frame,
+                bottom_x_start, bottom_x_end, bottom_y_start, bottom_y_end,
+                self.last_bottom_center, reference_x=bottom_reference_x,
+                draw_color=(0, 255, 0), force_middle_of_three=False
+            )
+
+            if bottom_candidate:
+                top_reference_x = bottom_candidate[0]
+            else:
+                top_reference_x = self.last_top_center[0] if self.last_top_center else frame_center_x
+
+            top_candidate, top_mask = self.detect_line_in_roi(
+                frame,
+                top_x_start, top_x_end, top_y_start, top_y_end,
+                self.last_top_center, reference_x=top_reference_x,
+                draw_color=(0, 0, 255),
+                force_middle_of_three=True
+            )
+
+            if bottom_candidate is not None: self.last_bottom_center = bottom_candidate
+            if top_candidate    is not None: self.last_top_center    = top_candidate
+
+            bot_str = f"({bottom_candidate[0]}, {bottom_candidate[1]})" if bottom_candidate else "NONE"
+            top_str = f"({top_candidate[0]},    {top_candidate[1]})"    if top_candidate    else "NONE"
             self.get_logger().info(
-                f"[INTERSECTION] Steering to entry center x={approach_entry_center_x:.1f}",
+                f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}",
                 throttle_duration_sec=1.0,
             )
+
+            if bottom_candidate is not None:
+                self.time_line_lost = None
+                bottom_cx, bottom_cy = bottom_candidate
+                steering_center_x = bottom_cx
+                if top_candidate is not None:
+                    top_cx, top_cy = top_candidate
+                    steering_center_x += (top_cx - bottom_cx) * 0.15
+                    cv2.line(frame, (bottom_cx, bottom_cy), (top_cx, top_cy), (255, 255, 0), 2)
+
+            elif top_candidate is not None:
+                self.time_line_lost = None
+                steering_center_x = top_candidate[0]
+                base_linear_x = 0.04
+                self.get_logger().info(
+                    "[CONTROL] Using top candidate only (bottom lost).",
+                    throttle_duration_sec=1.0,
+                )
+
+            else:
+                if self.time_line_lost is None:
+                    self.time_line_lost = now
+                elapsed_time = (now - self.time_line_lost).nanoseconds * 1e-9
+
+                # Turn toward the side the line was last seen instead of driving
+                # straight off the track. The PD error sign encodes that side:
+                # error>0 => line was left of center => turn left (+w); <0 => right.
+                recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
+                if elapsed_time < self._recover_seconds:
+                    base_linear_x    = self._recover_speed
+                    target_angular_z = self._recover_turn * recover_dir
+                    self.get_logger().warn(
+                        f"[CONTROL] LINE LOST {elapsed_time:.1f}s -> searching dir={recover_dir:+.0f}",
+                        throttle_duration_sec=0.5,
+                    )
+                else:
+                    base_linear_x    = 0.0
+                    target_angular_z = 0.0
+                    self.get_logger().warn(
+                        "[CONTROL] LINE LOST -> stopped (search timed out)",
+                        throttle_duration_sec=2.0,
+                    )
+
+            if approach_entry_center_x is not None:
+                steering_center_x = approach_entry_center_x
+                self.time_line_lost = None
+                self.get_logger().info(
+                    f"[INTERSECTION] Steering to entry center x={approach_entry_center_x:.1f}",
+                    throttle_duration_sec=1.0,
+                )
 
         # PD Math
         if steering_center_x is not None:
@@ -983,6 +1325,13 @@ class AutonomousRacer(Node):
                 self.last_error      = line_error
                 self.last_derivative = derivative
                 self.last_time       = now
+
+        # Slow down proportionally to the path curvature. The bird's-eye fit
+        # gives a real curvature estimate; it is 0 on the legacy path, so this
+        # is a no-op there and the legacy curve_factor still applies.
+        if lane_curvature > 0.0:
+            base_linear_x *= max(self._curve_min_scale,
+                                 1.0 - self._curve_slow_gain * lane_curvature)
 
         if self.commit_direction is not None:
             if self.commit_until is not None and now < self.commit_until:
@@ -1051,6 +1400,10 @@ class AutonomousRacer(Node):
 
         # Debug Visuals
         cv2.line(frame, (int(frame_center_x), 0), (int(frame_center_x), h), (0, 255, 255), 2)
+        self._draw_status_hud(frame, cmd)
+        self._log_controller_row(now, cmd)
+        self._publish_lane_status(cmd)
+        self._maybe_snapshot(now, frame)
         if self.show_window:
             cv2.imshow("Frame", frame)
             cv2.waitKey(1)
@@ -1062,6 +1415,8 @@ class AutonomousRacer(Node):
         self.cap.release()
         if self._h264_streamer is not None:
             self._h264_streamer.release()
+        if self._csv_fp is not None:
+            self._csv_fp.close()
         if self.show_window:
             cv2.destroyAllWindows()
         super().destroy_node()

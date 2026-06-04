@@ -1,0 +1,8 @@
+{
+  "kp": 0.0018,
+  "kd": 0.0,
+  "max_v": 0.08,
+  "max_w": 0.6,
+  "curve_slow_gain": 0.6,
+  "curve_min_scale": 0.4
+}

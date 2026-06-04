@@ -7,6 +7,7 @@
 #   STREAM=none  scripts/run_line_follower_jetson.sh    # MJPEG server only, no receiver
 #   NODE=autonomous_racer scripts/run_line_follower_jetson.sh
 #   IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh   # drive w/o needing a GREEN light (testing)
+#   CONTROLLER_LOG=1 scripts/run_line_follower_jetson.sh         # log control CSV (puzzlebot_ros/controller_data.csv)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,12 +25,30 @@ fi
 if [ "${IGNORE_TRAFFIC_LIGHT:-0}" = "1" ]; then
   PARAMS="${PARAMS} -p ignore_traffic_light:=true"
 fi
+if [ "${CONTROLLER_LOG:-0}" = "1" ]; then
+  PARAMS="${PARAMS} -p controller_log:=true"   # CSV -> puzzlebot_ros/controller_data.csv
+fi
 ROS_ARGS=""
 if [ -n "${PARAMS}" ]; then
   ROS_ARGS="--ros-args${PARAMS}"
 fi
 
 xhost +local: >/dev/null 2>&1 || true
+
+# Kill any follower still running on the Jetson (plain ssh doesn't forward Ctrl-C,
+# so a previous run can be orphaned). Used both before launch (no pile-up, no
+# camera/cmd_vel fights) and on exit (so Ctrl-C here cleans up the remote node).
+remote_kill_follower() {
+  ssh "${JETSON_USER}@${JETSON_HOST}" \
+    "pkill -f 'puzzlebot_ros (line_follower|autonomous_racer)|lib/puzzlebot_ros/line_follower' 2>/dev/null; true" \
+    >/dev/null 2>&1 || true
+}
+
+echo "Cleaning up any running follower on the Jetson..."
+remote_kill_follower
+sleep 1
+trap remote_kill_follower INT TERM EXIT
+
 ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   cd \"${REMOTE_WS}\"
   source /opt/ros/humble/setup.bash
