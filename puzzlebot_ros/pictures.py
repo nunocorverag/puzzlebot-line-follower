@@ -16,7 +16,7 @@ class CalibrationCaptureNode(Node):
         # =========================
         # Directory setup
         # =========================
-        self.save_dir = "calibration_images"
+        self.save_dir = "datasets/checkerboard"
         if not os.path.exists(self.save_dir):
             os.makedirs(self.save_dir)
             self.get_logger().info(f"Created directory: ./{self.save_dir}/")

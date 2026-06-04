@@ -31,7 +31,7 @@ sys.path.insert(0, str(REPO_DIR))
 from puzzlebot_ros.perception.camera import open_csi_capture  # noqa: E402
 from puzzlebot_ros.perception.stream import Preview  # noqa: E402
 
-DEFAULT_OUTPUT = REPO_DIR / "calibration_images"
+DEFAULT_OUTPUT = REPO_DIR / "datasets" / "checkerboard"
 
 # INNER-corner pattern comes from --pattern (default 5x7). We only accept that
 # board in its two orientations (5x7 and its 7x5 transpose) — never other sizes:

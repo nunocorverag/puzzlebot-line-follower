@@ -23,7 +23,7 @@ import cv2
 import numpy as np
 
 REPO_DIR = Path(__file__).resolve().parents[1]
-DEFAULT_IMAGES = REPO_DIR / "calibration_images"
+DEFAULT_IMAGES = REPO_DIR / "datasets" / "checkerboard"
 DEFAULT_OUTPUT = REPO_DIR / "config" / "camera_params.npz"
 DEFAULT_PREVIEW = REPO_DIR / "config" / "undistorted_preview.jpg"
 

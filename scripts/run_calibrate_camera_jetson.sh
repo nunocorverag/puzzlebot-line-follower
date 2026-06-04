@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Compute the camera intrinsics ON the Jetson (OpenCV lives there, not on the
-# laptop) from the captured calibration_images/, then pull the resulting
+# laptop) from the captured datasets/checkerboard/, then pull the resulting
 # config/camera_params.npz + undistorted preview back to the laptop.
 #
 #   scripts/run_calibrate_camera_jetson.sh
