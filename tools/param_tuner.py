@@ -36,11 +36,13 @@ TARGET_NODE = "autonomous_racer"
 FIELDS = [
     ("kp",                       "f", 0.0005),
     ("kd",                       "f", 0.001),
+    ("ff_gain",                  "f", 0.1),
     ("max_v",                    "f", 0.01),
     ("max_w",                    "f", 0.05),
     ("curve_slow_gain",          "f", 0.05),
     ("curve_min_scale",          "f", 0.05),
     ("lane.eval_y_pct",          "i", 1),
+    ("lane.lookahead_y_pct",     "i", 1),
     ("lane.src_top_y_pct",       "i", 1),
     ("lane.src_top_half_w_pct",  "i", 1),
     ("lane.src_bot_y_pct",       "i", 1),
@@ -48,9 +50,10 @@ FIELDS = [
     ("lane.base_search_half_w_pct", "i", 1),
 ]
 DEFAULTS = {
-    "kp": 0.0018, "kd": 0.01, "max_v": 0.08, "max_w": 0.6,
+    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
     "curve_slow_gain": 0.6, "curve_min_scale": 0.4,
-    "lane.eval_y_pct": 72, "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,
+    "lane.eval_y_pct": 72, "lane.lookahead_y_pct": 45,
+    "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,
     "lane.src_bot_y_pct": 95, "lane.src_bot_half_w_pct": 42,
     "lane.base_search_half_w_pct": 26,
 }
@@ -148,33 +151,45 @@ class Tuner(Node):
         self.msg = f"REC {'ON' if self.recording else 'off'}"
 
 
+def _safe_addstr(stdscr, y, x, text, attr=0):
+    """addstr that never throws on small terminals: skip off-screen rows and
+    truncate text to the window width (curses errors if you write past the edge)."""
+    max_y, max_x = stdscr.getmaxyx()
+    if y < 0 or y >= max_y or x >= max_x:
+        return
+    text = text[: max(0, max_x - x - 1)]
+    try:
+        stdscr.addstr(y, x, text, attr)
+    except curses.error:
+        pass
+
+
 def _draw(stdscr, tuner, sel):
     stdscr.erase()
-    stdscr.addstr(0, 2, f"PD / WARP TUNER        node: /{TARGET_NODE}", curses.A_BOLD)
-    stdscr.addstr(1, 2, "-" * 52)
+    _safe_addstr(stdscr, 0, 2, f"PD / WARP TUNER        node: /{TARGET_NODE}", curses.A_BOLD)
+    _safe_addstr(stdscr, 1, 2, "-" * 52)
     row = 2
     for i, (name, kind, step) in enumerate(FIELDS):
         val = tuner.values.get(name, 0.0)
         valstr = f"{val:.4f}" if kind == "f" else f"{int(val)}"
         marker = ">" if i == sel else " "
         attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
-        stdscr.addstr(row, 2, f"{marker} {name:<26} {valstr:>10}   (step {step})", attr)
+        _safe_addstr(stdscr, row, 2, f"{marker} {name:<26} {valstr:>10}   (step {step})", attr)
         row += 1
-    stdscr.addstr(row + 1, 2, "-" * 52)
+    _safe_addstr(stdscr, row + 1, 2, "-" * 52)
     off, conf, curv, v, w = tuner.metrics
     drive = "ON " if tuner.drive_on else "off"
     drive_attr = curses.A_BOLD if tuner.drive_on else curses.A_NORMAL
-    stdscr.addstr(row + 2, 2, "drive: ")
-    stdscr.addstr(row + 2, 9, drive, drive_attr)
-    rec = " REC" if tuner.recording else ""
-    stdscr.addstr(row + 2, 14,
-                  f"  off {off:+.2f}  conf {conf:.2f}  curv {curv:+.2f}  "
-                  f"v {v:.3f}  w {w:+.2f}")
-    if rec:
-        stdscr.addstr(row + 2, 56, "REC", curses.A_REVERSE)
-    stdscr.addstr(row + 4, 2, "[j/k] select  [-/=] nudge  [s] save  [q] quit")
-    stdscr.addstr(row + 5, 2, "[d] drive  [1/2/3] L/S/R  [0] reset cross  [r] record")
-    stdscr.addstr(row + 6, 2, tuner.msg[:60])
+    _safe_addstr(stdscr, row + 2, 2, "drive: ")
+    _safe_addstr(stdscr, row + 2, 9, drive, drive_attr)
+    _safe_addstr(stdscr, row + 2, 14,
+                 f"  off {off:+.2f}  conf {conf:.2f}  curv {curv:+.2f}  "
+                 f"v {v:.3f}  w {w:+.2f}")
+    if tuner.recording:
+        _safe_addstr(stdscr, row + 2, 56, "REC", curses.A_REVERSE)
+    _safe_addstr(stdscr, row + 4, 2, "[j/k] select  [-/=] nudge  [s] save  [q] quit")
+    _safe_addstr(stdscr, row + 5, 2, "[d] drive  [1/2/3] L/S/R  [0] reset cross  [r] record")
+    _safe_addstr(stdscr, row + 6, 2, tuner.msg[:60])
     stdscr.refresh()
 
 

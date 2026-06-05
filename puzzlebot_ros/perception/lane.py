@@ -81,6 +81,9 @@ class LaneParams:
     # --- Steering / confidence ---------------------------------------------
     eval_y_pct: int = 88           # where to read the steering offset
                                    # (% of warp_h from the top; near the robot)
+    lookahead_y_pct: int = 45      # second, FURTHER-AHEAD read (smaller pct = up =
+                                   # further). Its offset minus the near offset is
+                                   # the bend, used by the controller feedforward.
     min_windows_conf_pct: int = 40  # need this % of windows with pixels to trust
 
     # --- Optional metric scale ---------------------------------------------
@@ -101,6 +104,7 @@ class LaneResult:
     base_x: float | None = None     # detected line base x (warped px)
     eval_x: float | None = None     # line x at the eval row (warped px)
     lane_center_x_orig: float | None = None  # eval point mapped to original img
+    lane_center_far_x_orig: float | None = None  # lookahead point, original img
     lane_points_orig: list = field(default_factory=list)  # fitted curve, orig
     warped_mask: np.ndarray | None = None     # debug
     window_centers: list = field(default_factory=list)    # debug (warped px)
@@ -323,6 +327,13 @@ def analyze_lane(frame: np.ndarray, params: LaneParams,
     # Map the eval point back to the original image so the runtime PD (original
     # pixels) and the overlay can use it directly.
     result.lane_center_x_orig = _birdseye_to_orig((eval_x, eval_y), minv)[0]
+
+    # Second read further ahead (anticipation). The fit may extrapolate past the
+    # windows that found pixels, which is exactly what predicts the upcoming bend;
+    # clamp x into the warp so a wild extrapolation can't throw the controller.
+    look_y = wh * params.lookahead_y_pct / 100.0
+    far_x = float(np.clip(_eval_fit(fit, look_y), 0.0, ww))
+    result.lane_center_far_x_orig = _birdseye_to_orig((far_x, look_y), minv)[0]
 
     # A few points of the fitted curve, mapped back for the overlay.
     pts = []

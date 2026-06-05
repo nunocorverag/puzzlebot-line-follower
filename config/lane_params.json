@@ -19,6 +19,7 @@
   "min_fill_pct": 1,
   "max_fill_pct": 55,
   "eval_y_pct": 72,
+  "lookahead_y_pct": 45,
   "min_windows_conf_pct": 40,
   "px_per_cm_x10": 0
 }

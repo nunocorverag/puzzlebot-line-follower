@@ -33,6 +33,7 @@ from puzzlebot_ros.perception.lane import (
     LaneParams,
     analyze_lane,
     compute_homography,
+    draw_birdseye_debug,
     draw_lane_overlay,
     load_lane_params,
     save_lane_params,
@@ -267,10 +268,16 @@ class AutonomousRacer(Node):
         self.declare_parameter('kd', float(saved.get('kd', 0.008)))
         self.declare_parameter('max_v', float(saved.get('max_v', 0.08)))
         self.declare_parameter('max_w', float(saved.get('max_w', 0.6)))
+        # Curve feedforward: steer ahead by the bend (far offset - near offset),
+        # weighted by ff_gain and the SAME kp. 0 = pure feedback (old behavior);
+        # ~1 = anticipate the curve. It is the bend term, so straights are
+        # unaffected and the existing straight-line PD tuning is preserved.
+        self.declare_parameter('ff_gain', float(saved.get('ff_gain', 1.0)))
         self.kp = float(self.get_parameter('kp').value)
         self.kd = float(self.get_parameter('kd').value)
         self.max_v = float(self.get_parameter('max_v').value)
         self.max_w = float(self.get_parameter('max_w').value)
+        self.ff_gain = float(self.get_parameter('ff_gain').value)
 
         self.last_error = 0.0
         self.last_derivative = 0.0
@@ -567,6 +574,8 @@ class AutonomousRacer(Node):
                 self.max_v = float(p.value)
             elif p.name == 'max_w':
                 self.max_w = float(p.value)
+            elif p.name == 'ff_gain':
+                self.ff_gain = float(p.value)
             elif p.name == 'curve_slow_gain':
                 self._curve_slow_gain = float(p.value)
             elif p.name == 'curve_min_scale':
@@ -593,6 +602,7 @@ class AutonomousRacer(Node):
             self._control_params_path.write_text(json.dumps({
                 'kp': self.kp, 'kd': self.kd,
                 'max_v': self.max_v, 'max_w': self.max_w,
+                'ff_gain': self.ff_gain,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
             }, indent=2))
@@ -639,8 +649,9 @@ class AutonomousRacer(Node):
                  f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}")
         cv2.putText(frame, line2, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 255, 255), 1)
-        gains = f"kp:{self.kp:.4f} kd:{self.kd:.4f} mv:{self.max_v:.2f} mw:{self.max_w:.2f}"
-        cv2.putText(frame, gains, (max(10, w - 360), 22),
+        gains = (f"kp:{self.kp:.4f} kd:{self.kd:.4f} ff:{self.ff_gain:.2f} "
+                 f"mv:{self.max_v:.2f} mw:{self.max_w:.2f}")
+        cv2.putText(frame, gains, (max(10, w - 420), 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
         if self._recording:
             cv2.putText(frame, f"REC {self._snap_count}", (max(10, w - 110), 44),
@@ -669,7 +680,17 @@ class AutonomousRacer(Node):
             d.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             state = self._phase_label()[0].split(':')[0].replace(' ', '')
-            cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'), frame)
+            # Glue the bird's-eye debug (mask + sliding windows + fit) beside the
+            # annotated frame so a pulled snapshot shows exactly what the lane
+            # search saw -- the only way to diagnose curve failures offline.
+            out = frame
+            lr = self._last_lane_result
+            if lr is not None and lr.warped_mask is not None:
+                bev = draw_birdseye_debug(lr, self.lane_params)
+                scale = frame.shape[0] / float(bev.shape[0])
+                bev = cv2.resize(bev, (int(bev.shape[1] * scale), frame.shape[0]))
+                out = cv2.hconcat([frame, bev])
+            cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'), out)
             self._snap_count += 1
         except OSError as exc:
             self.get_logger().error(f'[REC] snapshot failed: {exc}')
@@ -1167,6 +1188,7 @@ class AutonomousRacer(Node):
         base_linear_x  = 0.0
         target_angular_z = 0.0
         steering_center_x = None
+        steering_far_x = None       # lookahead point (BEV only) -> curve feedforward
         lane_curvature = 0.0
         bottom_candidate = top_candidate = None
         self._last_lane_result = None    # set below when the bird's-eye path runs
@@ -1186,6 +1208,7 @@ class AutonomousRacer(Node):
             if lane_result.detected and lane_result.lane_center_x_orig is not None:
                 lane_ok = True
                 steering_center_x = lane_result.lane_center_x_orig
+                steering_far_x = lane_result.lane_center_far_x_orig
                 lane_curvature = abs(lane_result.curvature_norm)
                 self.time_line_lost = None
                 self.get_logger().info(
@@ -1307,7 +1330,18 @@ class AutonomousRacer(Node):
             if dt > 0:
                 raw_derivative = (line_error - self.last_error) / dt
                 derivative     = (0.7 * self.last_derivative) + (0.3 * raw_derivative)
-                w_out          = (self.kp * line_error) + (self.kd * derivative)
+
+                # Curve feedforward (BEV only): the bend = how much more the line
+                # is offset further ahead than right at the robot. Steering ahead
+                # by it makes the robot turn INTO the curve instead of chasing the
+                # near edge. It is a difference, so on a straight it is ~0 and the
+                # straight-line tuning is untouched.
+                curve_term = 0.0
+                if steering_far_x is not None:
+                    far_error = frame_center_x - steering_far_x
+                    curve_term = far_error - line_error
+                w_out = (self.kp * line_error) + (self.kd * derivative) \
+                    + (self.kp * self.ff_gain * curve_term)
 
                 curve_factor = max(0.4, 1.0 - (abs(line_error) / frame_center_x))
 
