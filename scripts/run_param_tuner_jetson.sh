@@ -9,10 +9,17 @@
 #   scripts/run_param_tuner_jetson.sh
 #
 # Keys: j/k select   -/= (or left/right) nudge   s save   q quit
+#
+# On quit (q or Ctrl-C) it ALSO pulls the follower's recorded snapshots to the
+# laptop and wipes the Jetson -- since quitting the tuner is effectively ending
+# the session. (The follower's own Ctrl-C does the same; whichever closes first.)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib/common.sh"
+
+PULL_SESSION="$(date +%Y%m%d_%H%M%S)"
+trap 'pull_and_clean_session "${REMOTE_PKG}/debug_dataset/follower_session" "${REPO_DIR}/datasets/follower_session/${PULL_SESSION}"' EXIT
 
 sync_repo
 ssh -t "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
