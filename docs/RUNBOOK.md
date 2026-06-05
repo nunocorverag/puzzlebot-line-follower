@@ -155,6 +155,48 @@ camera; the WASD bridge only touches `/cmd_vel`, so they coexist. Saved frames a
 
 ---
 
+## 5. Intersections (robust: curve→cross, straight→cross, doubles)
+
+Flow (geometry-agnostic, Duckietown-style): **FOLLOW → (zebra seen) slow-zone →
+APPROACH (center + align heading) → WAIT (decision) → COMMIT (open-loop turn) →
+re-acquire lane → travel guard**. Key design points already wired in:
+
+- APPROACH triggers on `entry_seen` (debounced, **does not require being centered**),
+  so a skewed curve-exit still catches the cross. It then **actively straightens**
+  (lateral centering + `k_align`·entry-slope) until centered, with a timeout that
+  falls back to FOLLOW if it can't.
+- The **feedforward is relaxed and speed is capped** (`intersection_slow_speed`) the
+  moment a zebra is seen → no overshoot into the cuadrito.
+- The **turn is an open-loop maneuver** (`commit_speed`/`commit_turn_w`/`commit_duration`),
+  then the bird's-eye follower re-acquires the branch. A **distance guard**
+  (`intersection_min_travel_m`) stops a double intersection from re-firing the one
+  you just left.
+
+Send the decision (or use the tuner keys `1/2/3` = L/S/R, `0` = reset):
+```bash
+scripts/set_intersection_jetson.sh left      # left | right | straight | reset
+```
+
+**Params to tune on the robot** (live in the tuner, no rebuild):
+
+| Param | What | Start |
+|---|---|---|
+| `commit_turn_w` + `commit_duration` | the actual ~90° L/R turn (biggest one) | 0.6 / 2.0 s |
+| `commit_duration_straight` | go-straight maneuver length | 1.5 s |
+| `k_align` | how hard APPROACH straightens a skewed entry (too high = wobble) | 0.6 |
+| `intersection_slow_speed` | slow-zone speed near a cross (keep > ~0.08 deadband) | 0.08 |
+| `intersection_min_travel_m` | gap before the next cross can fire (doubles) | 0.25 m |
+| `approach_timeout_s` | give up centering after this and resume FOLLOW | 6 s |
+
+> Note `k_align`'s sign: if APPROACH turns the **wrong** way to straighten, flip
+> `k_align` negative. Tune `commit_turn_w`/`commit_duration` first on a single cross
+> until L/R land on the exit lane, then test a double.
+
+Future (not yet implemented): a **topological map** of the track (graph of crosses +
+route) for known sequences — see `docs/LANE_FOLLOWING.md`.
+
+---
+
 ## Cleanup
 
 ```bash

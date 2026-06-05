@@ -182,6 +182,29 @@ scripts/set_intersection_jetson.sh left      # left | right | straight
 scripts/set_intersection_jetson.sh reset     # stuck? -> back to FOLLOW
 ```
 
+### Robust intersection approach (geometry-agnostic)
+
+The state machine is decoupled so that **curve→cross, straight→cross and double
+crosses use the same path** (the Duckietown / pure-pursuit pattern):
+`FOLLOW → slow-zone → APPROACH (center+align) → WAIT → COMMIT (open-loop turn) →
+re-acquire → travel-guard`.
+
+- Detection trigger (`entry_seen` in `intersection.py`) is **independent of
+  centering**, so a skewed curve-exit still enters APPROACH; APPROACH then
+  actively straightens (`k_align`·entry-slope) instead of *requiring* a centered
+  arrival. The feedforward is relaxed + speed capped (`intersection_slow_speed`)
+  once a zebra is seen, killing the overshoot into the cuadrito.
+- The turn is **open-loop and tunable** (`commit_speed/turn_w/duration`); the
+  bird's-eye follower re-acquires the branch afterwards. A distance proxy
+  (`intersection_min_travel_m`, integrated commanded speed — no encoder needed)
+  prevents a double intersection from re-firing the one just left.
+- Full param list + on-robot tuning order: see [`RUNBOOK.md`](RUNBOOK.md) §5.
+
+**Next step (not implemented):** a **topological map** of the track — a small
+graph of intersections and their connections + a planned route — would let the
+robot pick L/S/R automatically for *known* sequences instead of being told each
+time. It plugs in at the WAIT→decision step.
+
 ---
 
 ## 5. Camera mounting & tilt
