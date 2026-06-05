@@ -35,6 +35,13 @@ class IntersectionParams:
 
     roi_y0_pct: int = 72
     roi_y1_pct: int = 88
+    # Skew-robust TRIGGER band (wider than the centering band). entry_seen fires on
+    # the COUNT of dash blobs here, with a horizontal-span check, WITHOUT requiring
+    # a clean entry-line fit -- so a curve/intersection approach (zebra arrives
+    # tilted/high) still triggers. The line fit + slope + centering stay as the
+    # ARRIVAL gate only (entry_centered).
+    trigger_y0_pct: int = 58
+    trigger_min_span_pct: int = 20
     dash_min_area: int = 40
     near_dash_min_area: int = 700
     dynamic_dash_area: int = 1
@@ -353,6 +360,21 @@ def analyze_intersection(
         if width_median > 0.0 and dashed[i][2] > merge_factor * width_median
     }
 
+    # Skew-robust TRIGGER: count dash blobs in a WIDER forward band (does not need
+    # them to fit a clean horizontal line, which a curve/intersection approach
+    # can't give). A horizontal-span check keeps a couple of puzzle tabs from
+    # false-triggering. This drives entry_seen / APPROACH; the entry-line fit +
+    # slope + centering below stay as the ARRIVAL gate only.
+    trig_y0 = h * min(params.trigger_y0_pct, params.roi_y0_pct) / 100.0
+    trigger_band = [i for i in range(len(dashed))
+                    if trig_y0 <= dashed[i][1] <= roi_y1 and i not in merged_idx]
+    trigger_count = len(trigger_band)
+    if trigger_count >= 2:
+        txs = [dashed[i][0] for i in trigger_band]
+        trigger_span_pct = 100.0 * (max(txs) - min(txs)) / w
+    else:
+        trigger_span_pct = 0.0
+
     # Robustly fit the zebra row through the clean trigger dashes; only inliers
     # count toward the trigger and define the entry geometry.
     clean_trigger = [(i, dashed[i][0], dashed[i][1]) for i in trigger_idx if i not in merged_idx]
@@ -412,12 +434,15 @@ def analyze_intersection(
         h * params.side_y0_pct / 100.0, h * params.side_y1_pct / 100.0,
     )
 
-    # Trigger depends on the aligned entry dashes (inliers of the fitted zebra
-    # line), so a stray/skewed blob can no longer push the count over threshold.
-    raw_detected = aligned_count >= params.min_dash_count
+    # Trigger = enough dash blobs spanning the wider band (skew-robust), so a
+    # tilted/high zebra from a curve or intersection approach still fires. A few
+    # stray puzzle tabs don't qualify (need both the count AND the span).
+    raw_detected = (trigger_count >= params.min_dash_count
+                    and trigger_span_pct >= params.trigger_min_span_pct)
     stable_frames = stable_frames + 1 if raw_detected else 0
     stable_enough = stable_frames >= params.stable_frames_needed
-    # Options are only read once we are stably AND centered on the entry zebra.
+    # Options are only read once we are stably AND centered on the entry zebra
+    # (the arrival gate -- reached after APPROACH straightens the robot).
     dashed_detected = stable_enough and (entry_centered or not params.require_centered)
 
     state_name = (
