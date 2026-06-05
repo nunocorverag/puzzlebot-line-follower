@@ -576,6 +576,8 @@ class AutonomousRacer(Node):
                 self.max_w = float(p.value)
             elif p.name == 'ff_gain':
                 self.ff_gain = float(p.value)
+            elif p.name == 'snapshot_interval':
+                self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
                 self._curve_slow_gain = float(p.value)
             elif p.name == 'curve_min_scale':

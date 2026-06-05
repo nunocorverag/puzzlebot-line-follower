@@ -41,6 +41,7 @@ FIELDS = [
     ("max_w",                    "f", 0.05),
     ("curve_slow_gain",          "f", 0.05),
     ("curve_min_scale",          "f", 0.05),
+    ("snapshot_interval",        "f", 0.5),   # REC rate (s); 0 = off
     ("lane.eval_y_pct",          "i", 1),
     ("lane.lookahead_y_pct",     "i", 1),
     ("lane.src_top_y_pct",       "i", 1),
@@ -51,7 +52,7 @@ FIELDS = [
 ]
 DEFAULTS = {
     "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
-    "curve_slow_gain": 0.6, "curve_min_scale": 0.4,
+    "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "snapshot_interval": 2.0,
     "lane.eval_y_pct": 72, "lane.lookahead_y_pct": 45,
     "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,
     "lane.src_bot_y_pct": 95, "lane.src_bot_half_w_pct": 42,
@@ -238,9 +239,15 @@ def main():
     tuner = Tuner()
     try:
         curses.wrapper(_loop, tuner)
+    except KeyboardInterrupt:
+        pass  # Ctrl-C is a normal way to quit; don't dump a traceback
     finally:
-        tuner.destroy_node()
-        rclpy.shutdown()
+        try:
+            tuner.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():            # avoid "rcl_shutdown already called"
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
