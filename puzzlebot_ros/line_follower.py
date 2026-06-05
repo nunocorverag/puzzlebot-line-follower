@@ -279,6 +279,35 @@ class AutonomousRacer(Node):
         self.max_w = float(self.get_parameter('max_w').value)
         self.ff_gain = float(self.get_parameter('ff_gain').value)
 
+        # Robust-intersection knobs (all live-tunable + persisted in
+        # control_params.json). See docs/RUNBOOK.md "Intersections".
+        #   k_align         : heading-align gain in APPROACH (rotate the zebra
+        #                     horizontal); 0 = lateral-only centering.
+        #   slow speed      : FOLLOW speed cap once a zebra is seen (kills the
+        #                     feedforward overshoot before the cross).
+        #   commit_*        : the open-loop turn maneuver (NEEDS on-robot tuning).
+        #   min_travel      : distance to cover after a turn before the next cross
+        #                     can fire (double-intersection guard).
+        self.declare_parameter('k_align', float(saved.get('k_align', 0.6)))
+        self.declare_parameter('intersection_slow_speed', float(saved.get('intersection_slow_speed', 0.08)))
+        self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 6.0)))
+        self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
+        self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
+        self.declare_parameter('commit_duration', float(saved.get('commit_duration', 2.0)))
+        self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 1.5)))
+        self.declare_parameter('intersection_min_travel_m', float(saved.get('intersection_min_travel_m', 0.25)))
+        self._k_align = float(self.get_parameter('k_align').value)
+        self._intersection_slow_speed = float(self.get_parameter('intersection_slow_speed').value)
+        self._approach_timeout_s = float(self.get_parameter('approach_timeout_s').value)
+        self._commit_speed = float(self.get_parameter('commit_speed').value)
+        self._commit_turn_w = float(self.get_parameter('commit_turn_w').value)
+        self._commit_duration = float(self.get_parameter('commit_duration').value)
+        self._commit_duration_straight = float(self.get_parameter('commit_duration_straight').value)
+        self._intersection_min_travel_m = float(self.get_parameter('intersection_min_travel_m').value)
+        self._approach_start_time = None     # for the APPROACH timeout
+        self._dist_since_commit = 1e9        # distance proxy since last turn (m)
+        self._near_intersection = False      # zebra seen this frame (slow zone)
+
         self.last_error = 0.0
         self.last_derivative = 0.0
         self.last_time = self.get_clock().now()
@@ -582,6 +611,22 @@ class AutonomousRacer(Node):
                 self._curve_slow_gain = float(p.value)
             elif p.name == 'curve_min_scale':
                 self._curve_min_scale = float(p.value)
+            elif p.name == 'k_align':
+                self._k_align = float(p.value)
+            elif p.name == 'intersection_slow_speed':
+                self._intersection_slow_speed = float(p.value)
+            elif p.name == 'approach_timeout_s':
+                self._approach_timeout_s = float(p.value)
+            elif p.name == 'commit_speed':
+                self._commit_speed = float(p.value)
+            elif p.name == 'commit_turn_w':
+                self._commit_turn_w = float(p.value)
+            elif p.name == 'commit_duration':
+                self._commit_duration = float(p.value)
+            elif p.name == 'commit_duration_straight':
+                self._commit_duration_straight = float(p.value)
+            elif p.name == 'intersection_min_travel_m':
+                self._intersection_min_travel_m = float(p.value)
             elif p.name.startswith('lane.'):
                 field = p.name[len('lane.'):]
                 if hasattr(self.lane_params, field):
@@ -607,6 +652,14 @@ class AutonomousRacer(Node):
                 'ff_gain': self.ff_gain,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
+                'k_align': self._k_align,
+                'intersection_slow_speed': self._intersection_slow_speed,
+                'approach_timeout_s': self._approach_timeout_s,
+                'commit_speed': self._commit_speed,
+                'commit_turn_w': self._commit_turn_w,
+                'commit_duration': self._commit_duration,
+                'commit_duration_straight': self._commit_duration_straight,
+                'intersection_min_travel_m': self._intersection_min_travel_m,
             }, indent=2))
             self.get_logger().warn(
                 f'[SAVE] wrote {lane_path.name} + {self._control_params_path.name}')
@@ -1113,35 +1166,44 @@ class AutonomousRacer(Node):
         # ---------------------------------------------------------
         # 2. INTERSECTION / DASHED-LINE PERCEPTION
         # ---------------------------------------------------------
+        # Suppress detection while committing a turn, during the time cooldown, OR
+        # until we have driven far enough past the last cross (distance proxy that
+        # stops a double intersection from re-firing the one we just left).
         cooldown_active = (
-            self.intersection_cooldown_until is not None
-            and now < self.intersection_cooldown_until
+            (self.intersection_cooldown_until is not None
+             and now < self.intersection_cooldown_until)
+            or self._dist_since_commit < self._intersection_min_travel_m
         )
         if cooldown_active or self.commit_direction is not None:
-            # Suppress detection while committing a turn or cooling down.
             self.intersection_stable = 0
             result = None
         else:
             result = self._analyze_intersection(frame)
             self.intersection_result = result
 
-        # The detector requires stable_frames_needed consecutive (and centered)
-        # frames, so dashed_detected is already debounced. The first time it
-        # fires we enter APPROACH: keep following the line at a creep until the
-        # zebra is close and centered, only then stop and ask for a decision.
-        if (result is not None and result.dashed_detected
+        # FOLLOW slow-zone: the moment a zebra is SEEN (debounced, regardless of
+        # centering) we slow down and relax the curve feedforward below, so the
+        # robot does not overshoot the cross before it can center. Independent of
+        # whether we commit to APPROACH this frame.
+        self._near_intersection = bool(result is not None and result.entry_seen)
+
+        # Enter APPROACH on the centering-INDEPENDENT trigger (entry_seen). Coming
+        # out of a curve the robot is skewed and would never satisfy the old
+        # centered `dashed_detected` gate; APPROACH then actively straightens it.
+        if (result is not None and result.entry_seen
                 and self.intersection_phase is None):
             self.intersection_phase = 'approach'
             self.intersection_options = result.options
-            self.get_logger().info('[INTERSECTION] detected -> APPROACH_CENTER')
+            self._approach_start_time = now
+            self.get_logger().info('[INTERSECTION] seen -> APPROACH (center + align)')
 
         if self.intersection_phase in ('approach', 'wait') and self.intersection_result is not None:
             self.intersection_options = self.intersection_result.options
             self._draw_intersection_overlay(frame, self.intersection_result)
 
-        # APPROACH: arrived once the entry zebra is at the target depth and the
-        # fitted line is centered under the camera. Motion itself is handled by
-        # the line follower below (capped to a slow creep in the supervisor).
+        # APPROACH: arrived once the entry zebra is at the target depth AND centered
+        # (now reachable because the motion section actively aligns heading). A
+        # timeout drops back to FOLLOW so a bad detection can't strand the robot.
         if self.intersection_phase == 'approach':
             r = self.intersection_result
             arrived = (
@@ -1149,12 +1211,22 @@ class AutonomousRacer(Node):
                 and r.entry_y_pct >= self._approach_target_entry_y_pct
                 and r.entry_centered
             )
+            timed_out = (
+                self._approach_start_time is not None
+                and (now - self._approach_start_time).nanoseconds * 1e-9 > self._approach_timeout_s
+            )
             if arrived:
                 self.intersection_phase = 'wait'
                 self.intersection_pending = True
                 self.intersection_decision = None
                 self.last_prompt_time = None
+                self._approach_start_time = None
                 self.get_logger().info('[INTERSECTION] centered -> WAIT for decision')
+            elif timed_out:
+                self.intersection_phase = None
+                self._approach_start_time = None
+                self.intersection_cooldown_until = now + Duration(seconds=2.0)
+                self.get_logger().warn('[INTERSECTION] APPROACH timed out -> FOLLOW')
 
         # WAIT: stopped at the intersection, prompting until a decision arrives.
         if self.intersection_phase == 'wait':
@@ -1175,14 +1247,18 @@ class AutonomousRacer(Node):
                 return
 
             self.commit_direction = self.intersection_decision
-            self.commit_until = now + Duration(seconds=1.0)
+            dur = (self._commit_duration_straight
+                   if self.commit_direction == 'straight' else self._commit_duration)
+            self.commit_until = now + Duration(seconds=dur)
+            self._dist_since_commit = 0.0        # start the double-cross travel guard
+            self._approach_start_time = None
             self.intersection_phase = None
             self.intersection_pending = False
             self.intersection_options = []
             self.intersection_decision = None
             self.intersection_stable = 0
             self.intersection_result = None
-            self.intersection_cooldown_until = now + Duration(seconds=3.0)
+            self.intersection_cooldown_until = now + Duration(seconds=1.5)
 
         # ---------------------------------------------------------
         # 3. LINE PERCEPTION + BASE CONTROL
@@ -1342,6 +1418,8 @@ class AutonomousRacer(Node):
                 if steering_far_x is not None:
                     far_error = frame_center_x - steering_far_x
                     curve_term = far_error - line_error
+                if self._near_intersection:
+                    curve_term = 0.0   # relax anticipation near a cross (no overshoot)
                 w_out = (self.kp * line_error) + (self.kd * derivative) \
                     + (self.kp * self.ff_gain * curve_term)
 
@@ -1369,13 +1447,20 @@ class AutonomousRacer(Node):
             base_linear_x *= max(self._curve_min_scale,
                                  1.0 - self._curve_slow_gain * lane_curvature)
 
+        # Slow-zone: cap speed while a zebra is in view (FOLLOW only), so the robot
+        # closes on the cross slowly enough to center instead of overshooting.
+        if self._near_intersection and self.intersection_phase is None:
+            base_linear_x = min(base_linear_x, self._intersection_slow_speed)
+
         if self.commit_direction is not None:
             if self.commit_until is not None and now < self.commit_until:
-                base_linear_x = 0.04
+                # Open-loop turn maneuver (tunable). After it, FOLLOW re-acquires
+                # the line on the chosen branch, which corrects any small error.
+                base_linear_x = self._commit_speed
                 if self.commit_direction == 'left':
-                    target_angular_z = 0.25
+                    target_angular_z = self._commit_turn_w
                 elif self.commit_direction == 'right':
-                    target_angular_z = -0.25
+                    target_angular_z = -self._commit_turn_w
                 else:
                     target_angular_z = 0.0
                 self.get_logger().info(
@@ -1386,13 +1471,20 @@ class AutonomousRacer(Node):
                 self.commit_direction = None
                 self.commit_until = None
 
-        # During APPROACH keep steering (angular, for centering) but drive a
-        # fixed creep speed above the motor deadband so it actually closes on the
-        # zebra and stops at a repeatable spot.
+        # During APPROACH: drive a fixed creep AND actively align heading so the
+        # robot straightens onto the zebra (works whether it arrived from a curve
+        # or a straight). w_align rotates the fitted entry line toward horizontal;
+        # the legacy centering above already handles lateral offset.
         if self.intersection_phase == 'approach':
             base_linear_x = self._approach_speed
+            r = self.intersection_result
+            if r is not None and r.entry_y_pct is not None:
+                w_align = -self._k_align * r.entry_slope
+                target_angular_z = max(-self.max_w,
+                                       min(self.max_w, target_angular_z + w_align))
             self.get_logger().info(
-                f"[INTERSECTION] APPROACH creep: V={base_linear_x:.3f} W={target_angular_z:.2f}",
+                f"[INTERSECTION] APPROACH creep+align: V={base_linear_x:.3f} "
+                f"W={target_angular_z:.2f} slope={0.0 if r is None else r.entry_slope:.3f}",
                 throttle_duration_sec=1.0,
             )
 
@@ -1431,6 +1523,11 @@ class AutonomousRacer(Node):
             self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
 
         self.cmd_pub.publish(cmd)
+
+        # Distance proxy for the double-intersection guard: integrate commanded
+        # speed at the timer rate (30 Hz). Stays huge until a commit resets it.
+        self._dist_since_commit = min(100.0,
+                                      self._dist_since_commit + abs(cmd.linear.x) * 0.033)
 
         self.get_logger().debug("-" * 50)
 

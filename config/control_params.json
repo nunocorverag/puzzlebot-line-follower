@@ -1,9 +1,17 @@
 {
   "kp": 0.0018,
   "kd": 0.0,
-  "max_v": 0.08,
+  "max_v": 0.10,
   "max_w": 0.6,
   "ff_gain": 1.0,
-  "curve_slow_gain": 0.6,
-  "curve_min_scale": 0.4
+  "curve_slow_gain": 0.3,
+  "curve_min_scale": 0.85,
+  "k_align": 0.6,
+  "intersection_slow_speed": 0.08,
+  "approach_timeout_s": 6.0,
+  "commit_speed": 0.08,
+  "commit_turn_w": 0.6,
+  "commit_duration": 2.0,
+  "commit_duration_straight": 1.5,
+  "intersection_min_travel_m": 0.25
 }
