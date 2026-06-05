@@ -44,6 +44,7 @@ FIELDS = [
     ("snapshot_interval",        "f", 0.5),   # REC rate (s); 0 = off
     # --- intersection (tune on the robot) ---
     ("k_align",                  "f", 0.1),   # APPROACH heading-align strength
+    ("approach_align_slope",     "f", 0.02),  # |slope| to count as aligned -> stop
     ("intersection_slow_speed",  "f", 0.01),  # slow-zone speed near a cross
     ("commit_turn_w",            "f", 0.05),  # turn rate of the L/R maneuver
     ("commit_duration",          "f", 0.25),  # how long the L/R turn runs (~90 deg)
@@ -58,7 +59,7 @@ FIELDS = [
 DEFAULTS = {
     "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
     "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "snapshot_interval": 2.0,
-    "k_align": 0.6, "intersection_slow_speed": 0.08,
+    "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
     "commit_turn_w": 0.6, "commit_duration": 2.0,
     "lane.eval_y_pct": 72, "lane.lookahead_y_pct": 45,
     "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,
