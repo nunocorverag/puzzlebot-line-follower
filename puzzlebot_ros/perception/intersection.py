@@ -60,6 +60,8 @@ class IntersectionParams:
     right_x0_pct: int = 62
     right_x1_pct: int = 90
     option_min_dash_count: int = 2
+    option_require_slope: int = 0   # 0 = exit valid on dash PRESENCE in its ROI
+                                    # (robust once stabilized); 1 = old slope check
     option_x0_pct: int = 4
     option_x1_pct: int = 96
     option_y0_pct: int = 35
@@ -413,9 +415,20 @@ def analyze_intersection(
         name: dashes_in_pct_poly(dashed, w, h, poly) for name, poly in option_roi_polys.items()
     }
     option_counts = {name: len(points) for name, points in option_points.items()}
-    option_valid = {
-        name: aligned_option_pattern(points, name, params.option_min_dash_count)
-        for name, points in option_points.items()
+    # An exit is available if its (spatially separated) ROI has enough dashes.
+    # Since APPROACH stabilizes the robot before options are read, the ROIs are
+    # consistent, so PRESENCE is robust -- we don't demand a specific slope
+    # pattern (too strict: a real left exit with a different tilt got rejected).
+    # Set option_require_slope=1 to restore the old slope-based classification.
+    if params.option_require_slope:
+        option_valid = {
+            name: aligned_option_pattern(points, name, params.option_min_dash_count)
+            for name, points in option_points.items()
+        }
+    else:
+        option_valid = {
+            name: len(points) >= params.option_min_dash_count
+            for name, points in option_points.items()
     }
 
     ahead_ratio = black_ratio(
