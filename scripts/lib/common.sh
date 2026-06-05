@@ -50,6 +50,26 @@ fetch_from_jetson() {
     && echo "fetched ${remote_rel} -> ${local_dest}"
 }
 
+# Pull a recording session (absolute Jetson dir) to the laptop and delete it on
+# the Jetson, so the robot stays clean and the laptop keeps per-session datasets.
+#   pull_and_clean_session <remote-abs-dir> <local-dest-dir>
+pull_and_clean_session() {
+  local remote_abs="$1" local_dest="$2"
+  mkdir -p "${local_dest}"
+  local n
+  n=$(ssh -o BatchMode=yes "${JETSON_USER}@${JETSON_HOST}" \
+        "ls -1 '${remote_abs}' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
+  if [ "${n}" -gt 0 ]; then
+    rsync -az "${JETSON_USER}@${JETSON_HOST}:${remote_abs}/" "${local_dest}/"
+    echo "session: ${n} files -> ${local_dest}"
+  else
+    echo "session: nothing recorded (no files in ${remote_abs})"
+    rmdir "${local_dest}" 2>/dev/null || true
+  fi
+  ssh -o BatchMode=yes "${JETSON_USER}@${JETSON_HOST}" \
+    "rm -rf '${remote_abs}' 2>/dev/null; true" >/dev/null 2>&1 || true
+}
+
 # Free the CSI camera (single-owner) WITHOUT killing the micro-ROS agent, so
 # motion tools (teleop, follower) keep their /cmd_vel bridge alive. Covers every
 # camera consumer: ROS nodes, the standalone tools, AND the raw GStreamer

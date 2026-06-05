@@ -44,10 +44,19 @@ remote_kill_follower() {
     >/dev/null 2>&1 || true
 }
 
+# On exit: kill the node AND pull this run's recorded snapshots (tuner 'r' ->
+# debug_dataset/follower_session) to the laptop per session, wiping the Jetson.
+FOLLOWER_SESSION="$(date +%Y%m%d_%H%M%S)"
+cleanup_follower() {
+  remote_kill_follower
+  pull_and_clean_session "${REMOTE_PKG}/debug_dataset/follower_session" \
+    "${REPO_DIR}/datasets/follower_session/${FOLLOWER_SESSION}"
+}
+
 echo "Cleaning up any running follower on the Jetson..."
 remote_kill_follower
 sleep 1
-trap remote_kill_follower INT TERM EXIT
+trap cleanup_follower INT TERM EXIT
 
 ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   cd \"${REMOTE_WS}\"

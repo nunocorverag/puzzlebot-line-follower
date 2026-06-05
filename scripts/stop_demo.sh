@@ -16,7 +16,7 @@ tmux kill-session -t "${SESSION}" 2>/dev/null || true
 pkill -f "run_line_calibrator_jetson.sh|run_line_follower_jetson.sh|view_h264_stream.sh|gst-launch-1.0 .*udpsrc port=${H264_PORT:-5000}|ffplay .*pb_h264" 2>/dev/null || true
 
 echo "[2/5] Killing Jetson camera/perception processes..."
-safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer|line_vision_calibrator|tools/recorder.py|teleop_recorder|sign_detector|illumination_calibrator|focus_assist|calib_capture_checkerboard|nvarguscamerasrc|gst-launch|nvv4l2h264enc' 2>/dev/null || true"
+safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer|line_vision_calibrator|tools/recorder.py|cmd_vel_udp_bridge|sign_detector|illumination_calibrator|focus_assist|tilt_assistant|warp_calibrator|param_tuner|calib_capture_checkerboard|nvarguscamerasrc|gst-launch|nvv4l2h264enc' 2>/dev/null || true"
 
 echo "[3/5] Publishing zero /cmd_vel burst from Jetson..."
 safe_ssh "

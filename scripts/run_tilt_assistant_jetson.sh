@@ -26,5 +26,10 @@ fi
 
 sync_repo
 free_camera
-start_stream
+start_stream   # sets its own EXIT trap (kills the H264 receiver)
+
+# On exit, pull this session's tilt snapshots to the laptop and wipe the Jetson.
+TILT_SESSION="$(date +%Y%m%d_%H%M%S)"
+trap 'pull_and_clean_session "${REMOTE_PKG}/debug_dataset/tilt_session" "${REPO_DIR}/datasets/calibration/tilt_session/${TILT_SESSION}"; [ -n "${H264_RX_PID:-}" ] && kill "${H264_RX_PID}" 2>/dev/null || true' EXIT
+
 run_remote_tool "python3 tools/tilt_assistant.py --gstreamer --camera-params config/camera_params.npz --illumination-params config/illumination_flatfield.npz ${EXTRA_ARGS}"

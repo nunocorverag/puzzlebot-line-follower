@@ -83,10 +83,15 @@ class RecorderNode(Node):
         self.frame_count = 0
         self.last_save_time = 0.0
         self.start_time = time.time()
-        self.recording = False  # start paused — press Enter to begin
+        # Start paused (press Enter to begin) unless --start-recording was given,
+        # which is what the WASD+record flow uses since it runs detached (no tty).
+        self.recording = bool(getattr(args, "start_recording", False))
 
+        # downscale=True so nvvidconv delivers width x height (640x480) in HW,
+        # matching camera_params + the H264 encoder. Without it the CSI streams
+        # native 1280x720 and the encoder spams gst_buffer_resize_range errors.
         self.cap = open_csi_capture(width=args.width, height=args.height, fps=args.fps,
-                                    log=self.get_logger().info)
+                                    downscale=True, log=self.get_logger().info)
         if self.cap is None:
             raise RuntimeError("camera unavailable")
 
@@ -98,8 +103,11 @@ class RecorderNode(Node):
         self.create_timer(1.0 / max(1, args.fps), self.tick)
 
         print(f"[info] Saving to: {args.output_dir}  interval={args.interval}s", flush=True)
-        print("[info] Press Enter to START/PAUSE recording. Ctrl+C to quit.", flush=True)
-        print("[PAUSED] Ready - press Enter when you want to record.", flush=True)
+        if self.recording:
+            print("[RECORDING] auto-started. Ctrl+C to quit.", flush=True)
+        else:
+            print("[info] Press Enter to START/PAUSE recording. Ctrl+C to quit.", flush=True)
+            print("[PAUSED] Ready - press Enter when you want to record.", flush=True)
 
     def toggle_recording(self):
         self.recording = not self.recording
@@ -162,6 +170,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-illumination-correction", action="store_true")
     parser.add_argument("--output-dir",           type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--interval",             type=float, default=0.5)
+    parser.add_argument("--start-recording",      action="store_true",
+                        help="begin recording immediately (no Enter; for detached runs)")
     parser.add_argument("--duration",             type=float, default=0.0,
                         help="stop after N seconds (0 = run until Ctrl+C)")
     # kept for backwards compat, ignored (camera is opened directly via GStreamer)
