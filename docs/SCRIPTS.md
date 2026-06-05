@@ -164,8 +164,7 @@ scripts/pull_calibration_dataset.sh
 | Script / Tool | What it does | When to run |
 | --- | --- | --- |
 | `run_camera_jetson.sh` | `ros2 launch puzzlebot_ros camera_jetson.launch.py` (publishes `/video_source/raw`). | Bring up the CSI camera **topic** for other ROS nodes. The tools no longer need it — they open the camera directly. |
-| `run_recorder_jetson.sh` + `tools/recorder.py` | Periodically saves frames to `dataset/`. | Collect a raw image dataset. |
-| `run_teleop_recorder_jetson.sh` + `tools/teleop_recorder.py` | Drive + record simultaneously. | Build a driving dataset. |
+| `run_recorder_jetson.sh` + `tools/recorder.py` | See the camera (H264) and record CLEAN frames with Enter=start/pause. On quit pulls the session to `datasets/<CATEGORY>/<ts>/` and wipes the Jetson. Pair with `run_teleop_wasd_combo.sh` to drive while recording. | Collect an illumination / training dataset while watching the camera. |
 | `run_sign_detector_jetson.sh` + `tools/sign_detector.py` | YOLO (`config/best.pt`) traffic-sign / light detection with live preview. Opens the camera itself; honours `STREAM`. Auto-installs `ultralytics`. | Validate the trained YOLO model on the Jetson. |
 
 ## Camera preview / streaming
@@ -245,8 +244,7 @@ Use these from the repo root on the laptop unless noted otherwise. Most Jetson s
 | `view_h264_stream.sh` | `scripts/view_h264_stream.sh` | Manual laptop receiver. It reads `scripts/local.env` if present. |
 | `run_camera_jetson.sh` | `scripts/run_camera_jetson.sh` | ROS camera topic launcher. Most tools do not need it because they open CSI directly. |
 | `run_recorder_jetson.sh` | `scripts/run_recorder_jetson.sh` | Camera preview/dataset recorder. |
-| `run_teleop_recorder_jetson.sh` | `scripts/run_teleop_recorder_jetson.sh` | Manual drive plus recording. |
-| `run_teleop_wasd_combo.sh` | `scripts/run_teleop_wasd_combo.sh` | Laptop pygame WASD combo teleop via UDP bridge. |
+| `run_teleop_wasd_combo.sh` | `scripts/run_teleop_wasd_combo.sh` | Laptop pygame WASD combo teleop via UDP bridge (drive only; pair with the recorder to capture). |
 | `run_sign_detector_jetson.sh` | `scripts/run_sign_detector_jetson.sh` | YOLO sign/traffic-light detector with preview. |
 | `run_focus_assist_jetson.sh` | `scripts/run_focus_assist_jetson.sh` | Focus metric over H264. |
 | `run_checkerboard_capture_jetson.sh` | `scripts/run_checkerboard_capture_jetson.sh` | Auto-guided checkerboard image capture. |

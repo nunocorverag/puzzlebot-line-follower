@@ -101,10 +101,12 @@ scripts/sync_to_jetson.sh && scripts/build_on_jetson.sh
 ```
 
 **Illumination robustness (profes change the lights):** capture a multi-lighting
-dataset with `scripts/run_teleop_recorder_jetson.sh` (normal / dim / side-lamp
-shadow) over straight + curve + intersection, then validate the mask offline on
-each frame with `tools/warp_calibrator.py --image <frame.jpg>`, comparing Otsu
-vs. adaptive until the line is clean under every light.
+dataset (normal / dim / side-lamp shadow) over straight + curve + intersection
+with `CATEGORY=illumination scripts/run_recorder_jetson.sh` (watch the camera,
+Enter = start/pause) while driving via `scripts/run_teleop_wasd_combo.sh` in
+another terminal. The session lands clean in `datasets/illumination/<ts>/`. Then
+validate the mask offline on each frame with `tools/warp_calibrator.py --image
+<frame.jpg>`, comparing Otsu vs. adaptive until the line is clean under every light.
 
 ### Current calibration state (2026-06-04)
 
