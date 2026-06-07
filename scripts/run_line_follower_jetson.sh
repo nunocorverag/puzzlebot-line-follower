@@ -7,7 +7,8 @@
 #   STREAM=none  scripts/run_line_follower_jetson.sh    # MJPEG server only, no receiver
 #   NODE=autonomous_racer scripts/run_line_follower_jetson.sh
 #   IGNORE_TRAFFIC_LIGHT=1 scripts/run_line_follower_jetson.sh   # drive w/o needing a GREEN light (testing)
-#   CONTROLLER_LOG=1 scripts/run_line_follower_jetson.sh         # log control CSV (puzzlebot_ros/controller_data.csv)
+#   CONTROLLER_LOG=0 scripts/run_line_follower_jetson.sh         # disable control CSV for this run
+# Session files are pulled by scripts/run_control_panel_jetson.sh on quit.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,7 +26,7 @@ fi
 if [ "${IGNORE_TRAFFIC_LIGHT:-0}" = "1" ]; then
   PARAMS="${PARAMS} -p ignore_traffic_light:=true"
 fi
-if [ "${CONTROLLER_LOG:-0}" = "1" ]; then
+if [ "${CONTROLLER_LOG:-1}" = "1" ]; then
   PARAMS="${PARAMS} -p controller_log:=true"   # CSV -> puzzlebot_ros/controller_data.csv
 fi
 ROS_ARGS=""
@@ -44,13 +45,11 @@ remote_kill_follower() {
     >/dev/null 2>&1 || true
 }
 
-# On exit: kill the node AND pull this run's recorded snapshots (tuner 'r' ->
-# debug_dataset/follower_session) to the laptop per session, wiping the Jetson.
-FOLLOWER_SESSION="$(date +%Y%m%d_%H%M%S)"
+# On exit: kill only the follower. The control panel owns session archival
+# (snapshots + events.jsonl + controller_data.csv) so there is no race where
+# stopping the follower pulls/cleans the session before the operator is done.
 cleanup_follower() {
   remote_kill_follower
-  pull_and_clean_session "${REMOTE_PKG}/debug_dataset/follower_session" \
-    "${REPO_DIR}/datasets/follower_session/${FOLLOWER_SESSION}"
 }
 
 echo "Cleaning up any running follower on the Jetson..."

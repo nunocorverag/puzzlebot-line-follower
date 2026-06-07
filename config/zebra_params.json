@@ -1,0 +1,23 @@
+{
+  "widen_kx": 2.4,
+  "warp_w": 720,
+  "warp_h": 600,
+  "px_per_cm_x": 11.1,
+  "px_per_cm_y": 23.6,
+  "min_short_cm": 0.9,
+  "max_long_cm": 7.0,
+  "min_area_cm": 2.0,
+  "max_area_cm": 22.0,
+  "row_tol_cm": 2.0,
+  "min_dashes": 3,
+  "min_span_cm": 7.0,
+  "max_fwd_cm": 80.0,
+  "opt_side_cm": 6.0,
+  "opt_margin_cm": 2.0,
+  "opt_min_dashes": 2,
+  "opt_min_span_cm": 4.0,
+  "option_align_deg": 18.0,
+  "stable_frames_needed": 3,
+  "slow_distance_cm": 30.0,
+  "stop_distance_cm": 10.0
+}

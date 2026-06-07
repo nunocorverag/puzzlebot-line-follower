@@ -61,6 +61,11 @@ class LaneParams:
 
     # --- Mask (illumination-robust) ----------------------------------------
     mask_method: int = 0           # 0 = global Otsu, 1 = local adaptive
+    black_thresh: int = 0          # >0: fixed dark threshold (gray < this = line),
+                                   #     overrides Otsu/adaptive. The track lines
+                                   #     are ALWAYS black, so a fixed dark cut
+                                   #     ignores tan floor / white gaps robustly.
+                                   #     0 = keep mask_method (Otsu/adaptive).
     use_clahe: int = 1             # contrast-limited adaptive histogram eq
     clahe_clip_x10: int = 20       # CLAHE clip limit (2.0)
     clahe_grid: int = 8            # CLAHE tile grid (NxN)
@@ -77,6 +82,28 @@ class LaneParams:
                                       # KEY guard that ignores side lines
     min_fill_pct: int = 1          # below this mask fill the warped view is empty
     max_fill_pct: int = 55         # above this it is noise / over-binarized
+
+    # --- Dual-line (follow lane CENTER between the two black borders) -------
+    # The lane has two black border lines; tracking a single line drifts to one
+    # border (the "goes to the right line on curves" bug). With dual_line we find
+    # BOTH lines and steer on their midpoint; if only one is visible (tight curve)
+    # we offset it by half the lane width to recover the center.
+    dual_line: int = 0             # 1 = follow midpoint of the two lines (this
+                                   # track follows a single central line, so the
+                                   # default is single-line + continuity below)
+    min_line_gap_pct: int = 14     # min separation between the two line bases
+    lane_half_px: int = 90         # half lane width in warp px (auto-updates when
+                                   # both lines are seen; used for 1-line fallback)
+    # Temporal continuity: anchor the base histogram near the PREVIOUS frame's
+    # line position instead of the image center, so the tracker stays on the same
+    # line through a curve instead of jumping to the other border.
+    continuity: int = 1
+    continuity_search_half_w_pct: int = 12  # when prev_base_x exists, search only
+                                            # +/- this % of warp_w around it. This
+                                            # prevents a strong side seam from
+                                            # hijacking the tracker on approach.
+    base_hist_h_pct: int = 18      # bottom slice (% of warp_h) used for the base
+                                   # peak; thin = robust to curve smear
 
     # --- Steering / confidence ---------------------------------------------
     eval_y_pct: int = 88           # where to read the steering offset
@@ -184,6 +211,14 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
     """
     k = max(1, params.blur_ksize | 1)
     gray = cv2.GaussianBlur(warped_gray, (k, k), 1.4)
+    # Fixed dark threshold takes precedence: lines are always black, so cutting
+    # below a fixed gray level isolates them regardless of tan floor / white gaps
+    # (and never flips tan-vs-white the way a global Otsu can). CLAHE is skipped
+    # here because it would rescale the very brightness this relies on.
+    if getattr(params, "black_thresh", 0) > 0:
+        _, mask = cv2.threshold(gray, int(params.black_thresh), 255, cv2.THRESH_BINARY_INV)
+        kernel = np.ones((3, 3), np.uint8)
+        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     if params.use_clahe:
         clip = max(0.1, params.clahe_clip_x10 / 10.0)
         grid = max(1, params.clahe_grid)
@@ -204,44 +239,21 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
 # ---------------------------------------------------------------------------
 # Sliding-window line fit
 # ---------------------------------------------------------------------------
-def _sliding_window_fit(mask: np.ndarray, params: LaneParams):
-    """Histogram base (center-restricted) + sliding windows + polynomial fit.
+def _track_from_base(nz_x, nz_y, base_x, h, w, params):
+    """Slide windows upward from ``base_x`` and fit x = a y^2 + b y + c.
 
-    Returns dict with fit (a, b, c) for x = a y^2 + b y + c, base_x,
-    window_centers and the count of windows that actually found the line.
+    Returns (fit, found, window_centers). Shared by the single- and dual-line
+    fitters so both behave identically per line.
     """
-    h, w = mask.shape[:2]
     nwin = max(2, params.nwindows)
     half_w = max(4, int(w * params.window_half_w_pct / 100.0))
-    base_half = max(4, int(w * params.base_search_half_w_pct / 100.0))
-
-    # Base: histogram over the bottom third, but only within a band around the
-    # center. This is what rejects parallel side lines: the followed line must
-    # start near the robot's center, so we never lock onto an off-center seam.
-    bottom = mask[int(h * 2 / 3):, :]
-    column_sum = np.sum(bottom, axis=0).astype(np.float64)
-    center = w // 2
-    lo, hi = max(0, center - base_half), min(w, center + base_half)
-    band = column_sum[lo:hi]
-    if band.size == 0 or band.max() <= 0:
-        return {"fit": None, "base_x": None, "window_centers": [], "found": 0,
-                "nwin": nwin}
-    base_x = lo + int(np.argmax(band))
-
-    nz = mask.nonzero()
-    nz_y = np.array(nz[0])
-    nz_x = np.array(nz[1])
-
     win_h = h // nwin
     current_x = base_x
-    fit_x, fit_y = [], []
-    window_centers = []
-    found = 0
+    fit_x, fit_y, centers, found = [], [], [], 0
     for i in range(nwin):
         y_hi = h - i * win_h
         y_lo = h - (i + 1) * win_h
-        x_lo = int(current_x - half_w)
-        x_hi = int(current_x + half_w)
+        x_lo, x_hi = int(current_x - half_w), int(current_x + half_w)
         good = ((nz_y >= y_lo) & (nz_y < y_hi)
                 & (nz_x >= x_lo) & (nz_x < x_hi)).nonzero()[0]
         cy = (y_lo + y_hi) // 2
@@ -250,23 +262,112 @@ def _sliding_window_fit(mask: np.ndarray, params: LaneParams):
             found += 1
             fit_x.extend(nz_x[good].tolist())
             fit_y.extend(nz_y[good].tolist())
-            window_centers.append((current_x, cy))
-        else:
-            # No pixels: keep the last x (the window dead-reckons upward) but do
-            # not feed empty data into the fit.
-            window_centers.append((current_x, cy))
-
+        centers.append((current_x, cy))
     fit = None
     if len(fit_y) >= max(50, params.min_pix):
         ys = np.array(fit_y, dtype=np.float64)
         xs = np.array(fit_x, dtype=np.float64)
-        # x as a function of y (y is the long axis in the bird's-eye view).
         deg = 2 if found >= 3 else 1
         coeffs = np.polyfit(ys, xs, deg)
         if deg == 1:
             coeffs = np.array([0.0, coeffs[0], coeffs[1]])
         fit = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
+    return fit, found, centers
 
+
+def _dual_line_fit(mask: np.ndarray, params: LaneParams):
+    """Find BOTH black border lines and fit their MIDPOINT (the lane center).
+
+    Tracking a single line drifts onto a border in curves; the midpoint is stable.
+    If only one line is visible we offset it by half the lane width to keep the
+    center. ``lane_half_px`` self-updates whenever both lines are seen.
+    """
+    h, w = mask.shape[:2]
+    nwin = max(2, params.nwindows)
+    bottom = mask[int(h * 2 / 3):, :]
+    col = np.sum(bottom, axis=0).astype(np.float64)
+    if col.size == 0 or col.max() <= 0:
+        return {"fit": None, "base_x": None, "window_centers": [], "found": 0,
+                "nwin": nwin}
+
+    min_gap = max(8, int(w * params.min_line_gap_pct / 100.0))
+    p1 = int(np.argmax(col))
+    col2 = col.copy()
+    col2[max(0, p1 - min_gap):min(w, p1 + min_gap + 1)] = 0.0
+    p2 = int(np.argmax(col2)) if col2.max() > 0.30 * col.max() else None
+
+    nz = mask.nonzero()
+    nz_y, nz_x = np.array(nz[0]), np.array(nz[1])
+    tracks = []
+    for base in [p for p in (p1, p2) if p is not None]:
+        fit, found, centers = _track_from_base(nz_x, nz_y, base, h, w, params)
+        if fit is not None:
+            tracks.append({"base": base, "fit": fit, "found": found, "centers": centers})
+
+    if not tracks:
+        return {"fit": None, "base_x": None, "window_centers": [], "found": 0,
+                "nwin": nwin}
+
+    if len(tracks) >= 2:
+        tracks.sort(key=lambda t: t["base"])
+        left, right = tracks[0], tracks[1]
+        center_fit = tuple((left["fit"][i] + right["fit"][i]) / 2.0 for i in range(3))
+        half = (right["base"] - left["base"]) / 2.0
+        if half > 4:                              # learn the lane half-width
+            params.lane_half_px = int(0.8 * params.lane_half_px + 0.2 * half)
+        base_x = (left["base"] + right["base"]) / 2.0
+        found = max(left["found"], right["found"])
+        centers = left["centers"] + right["centers"]
+    else:
+        t = tracks[0]
+        half = float(params.lane_half_px)
+        # one line only: shift toward center by half a lane (sign from which side)
+        sign = +1.0 if t["base"] < w / 2.0 else -1.0
+        a, b, c = t["fit"]
+        center_fit = (a, b, c + sign * half)
+        base_x = t["base"] + sign * half
+        found = t["found"]
+        centers = t["centers"]
+
+    return {"fit": center_fit, "base_x": base_x, "window_centers": centers,
+            "found": found, "nwin": nwin}
+
+
+def _sliding_window_fit(mask: np.ndarray, params: LaneParams, prev_base_x=None):
+    """Histogram base + sliding windows + polynomial fit.
+
+    The base histogram is taken inside a band that is normally centered on the
+    image center (rejecting off-center side lines), but with ``continuity`` and a
+    ``prev_base_x`` it is centered on the PREVIOUS frame's line so the tracker
+    stays on the same line through a curve instead of jumping to the other border.
+    """
+    h, w = mask.shape[:2]
+    nwin = max(2, params.nwindows)
+    base_half = max(4, int(w * params.base_search_half_w_pct / 100.0))
+    continuity_half = max(4, int(w * getattr(params, "continuity_search_half_w_pct", 12) / 100.0))
+
+    # Base band: a thin slice right at the robot, NOT the whole bottom third. A
+    # curved line smears across x over a tall band (so a straighter border wins
+    # the peak); the slice nearest the robot keeps the followed line under center.
+    band_h = max(0.05, getattr(params, "base_hist_h_pct", 18) / 100.0)
+    bottom = mask[int(h * (1.0 - band_h)):, :]
+    column_sum = np.sum(bottom, axis=0).astype(np.float64)
+    if getattr(params, "continuity", 0) and prev_base_x is not None:
+        center = int(prev_base_x)
+        half = continuity_half
+    else:
+        center = w // 2
+        half = base_half
+    lo, hi = max(0, center - half), min(w, center + half)
+    band = column_sum[lo:hi]
+    if band.size == 0 or band.max() <= 0:
+        return {"fit": None, "base_x": None, "window_centers": [], "found": 0,
+                "nwin": nwin}
+    base_x = lo + int(np.argmax(band))
+
+    nz = mask.nonzero()
+    nz_y, nz_x = np.array(nz[0]), np.array(nz[1])
+    fit, found, window_centers = _track_from_base(nz_x, nz_y, base_x, h, w, params)
     return {"fit": fit, "base_x": base_x, "window_centers": window_centers,
             "found": found, "nwin": nwin}
 
@@ -277,7 +378,7 @@ def _eval_fit(fit, y):
 
 
 def analyze_lane(frame: np.ndarray, params: LaneParams,
-                 m=None, minv=None) -> LaneResult:
+                 m=None, minv=None, prev_base_x=None) -> LaneResult:
     """Full bird's-eye lane analysis on a (preprocessed) BGR frame.
 
     Pass a cached ``m``/``minv`` homography to avoid recomputing it every frame;
@@ -296,7 +397,8 @@ def analyze_lane(frame: np.ndarray, params: LaneParams,
     if not (params.min_fill_pct <= fill_pct <= params.max_fill_pct):
         return result
 
-    sw = _sliding_window_fit(mask, params)
+    sw = (_dual_line_fit(mask, params) if getattr(params, "dual_line", 0)
+          else _sliding_window_fit(mask, params, prev_base_x))
     result.base_x = None if sw["base_x"] is None else float(sw["base_x"])
     result.window_centers = sw["window_centers"]
     result.confidence = sw["found"] / float(sw["nwin"])

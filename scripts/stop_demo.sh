@@ -11,12 +11,12 @@ safe_ssh() {
   timeout 5 ssh -o BatchMode=yes -o ConnectTimeout=2 "${JETSON_USER}@${JETSON_HOST}" "$1" 2>/dev/null || true
 }
 
-echo "[1/5] Killing local tmux session and H264 receivers..."
+echo "[1/5] Killing local tmux session, H264 receivers, dashboard, tuner..."
 tmux kill-session -t "${SESSION}" 2>/dev/null || true
-pkill -f "run_line_calibrator_jetson.sh|run_line_follower_jetson.sh|view_h264_stream.sh|gst-launch-1.0 .*udpsrc port=${H264_PORT:-5000}|ffplay .*pb_h264" 2>/dev/null || true
+pkill -f "run_line_calibrator_jetson.sh|run_line_follower_jetson.sh|view_h264_stream.sh|gst-launch-1.0 .*udpsrc port=${H264_PORT:-5000}|ffplay .*pb_h264|tools/dashboard.py|run_dashboard.sh|run_param_tuner_jetson.sh|run_control_panel_jetson.sh|tools/param_tuner.py|tools/control_panel.py" 2>/dev/null || true
 
 echo "[2/5] Killing Jetson camera/perception processes..."
-safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer|line_vision_calibrator|tools/recorder.py|cmd_vel_udp_bridge|sign_detector|illumination_calibrator|focus_assist|tilt_assistant|warp_calibrator|param_tuner|calib_capture_checkerboard|nvarguscamerasrc|gst-launch|nvv4l2h264enc' 2>/dev/null || true"
+safe_ssh "pkill -f 'line_follower|line_detector|autonomous_racer|line_vision_calibrator|tools/recorder.py|cmd_vel_udp_bridge|sign_detector|illumination_calibrator|focus_assist|tilt_assistant|warp_calibrator|param_tuner|control_panel|calib_capture_checkerboard|nvarguscamerasrc|gst-launch|nvv4l2h264enc' 2>/dev/null || true"
 
 echo "[3/5] Publishing zero /cmd_vel burst from Jetson..."
 safe_ssh "

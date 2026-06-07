@@ -2,7 +2,9 @@
 
 import csv
 import json
+import math
 import os
+import socket
 from datetime import datetime
 
 import rclpy
@@ -37,6 +39,14 @@ from puzzlebot_ros.perception.lane import (
     draw_lane_overlay,
     load_lane_params,
     save_lane_params,
+)
+from puzzlebot_ros.perception.zebra import (
+    ZebraParams,
+    analyze_zebra,
+    draw_zebra_overlay,
+    load_zebra_params,
+    save_zebra_params,
+    wide_homography,
 )
 from dataclasses import fields as dataclass_fields
 from puzzlebot_ros.perception.camera import open_csi_capture
@@ -208,7 +218,8 @@ class AutonomousRacer(Node):
         self.intersection_decision = None
         self.last_prompt_time = None
         self.commit_direction = None
-        self.commit_until = None
+        self.commit_until = None             # MAX (safety) time for the maneuver
+        self._commit_min_until = None        # MIN time before re-acquire can end it
         self.intersection_cooldown_until = None
 
         # Approach-and-center: when the intersection is first detected the robot
@@ -218,9 +229,26 @@ class AutonomousRacer(Node):
         # robot, ~0.10 does). approach_speed must stay above it or the creep
         # never actually drives.
         self.declare_parameter('approach_target_entry_y_pct', 82)
-        self.declare_parameter('approach_speed', 0.10)
         self._approach_target_entry_y_pct = float(self.get_parameter('approach_target_entry_y_pct').value)
-        self._approach_speed = float(self.get_parameter('approach_speed').value)
+        self._approach_speed = 0.06
+
+        # Robust zebra detector (bird's-eye, ground-coordinate). When enabled it
+        # replaces the legacy raw-image entry-line geometry for the intersection
+        # trigger + the stop: it detects the zebra row in a dedicated WIDE warp and
+        # measures the forward DISTANCE in cm, so the robot stops the same way out
+        # of a straight or a curve (the legacy geometry was noise on curves and the
+        # robot drove through). Set use_zebra_bev:=false to fall back to legacy.
+        self.declare_parameter('use_zebra_bev', True)
+        self._use_zebra_bev = bool(self.get_parameter('use_zebra_bev').value)
+        self.declare_parameter('zebra_params_path', '')
+        self.zebra_params = self._load_zebra_params()
+        self._zebra_M = None              # cached wide homography
+        self._zebra_frame_size = None
+        self._zebra_stable = 0
+        self.zebra_result = None
+        self._zebra_opt_votes = {}        # exit -> frames seen during APPROACH
+        self.declare_parameter('zebra_opt_min_votes', 2)
+        self._zebra_opt_min_votes = int(self.get_parameter('zebra_opt_min_votes').value)
 
         # Testing aid: ignore the traffic-light supervisor so the robot drives
         # without needing to see a real GREEN light.
@@ -290,22 +318,42 @@ class AutonomousRacer(Node):
         #                     can fire (double-intersection guard).
         self.declare_parameter('k_align', float(saved.get('k_align', 0.6)))
         self.declare_parameter('intersection_slow_speed', float(saved.get('intersection_slow_speed', 0.08)))
+        self.declare_parameter('approach_speed', float(saved.get('approach_speed', 0.06)))
         self.declare_parameter('approach_align_slope', float(saved.get('approach_align_slope', 0.15)))
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
         self.declare_parameter('commit_duration', float(saved.get('commit_duration', 2.0)))
         self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 1.5)))
+        # Closed-loop commit: keep turning/crossing until the lane is RE-ACQUIRED
+        # (after a min time to clear the cross), capped by commit_duration above so
+        # a missed line can't spin forever. 0 = old pure open-loop (time only).
+        self.declare_parameter('commit_min_s', float(saved.get('commit_min_s', 0.8)))
+        self.declare_parameter('commit_closed_loop', bool(saved.get('commit_closed_loop', True)))
         self.declare_parameter('intersection_min_travel_m', float(saved.get('intersection_min_travel_m', 0.25)))
+        # Square-up-in-place: at the cross, if we stopped skewed (came off a curve)
+        # rotate IN PLACE (v=0, safe -- no arcing) to face the cross before reading
+        # options/asking. Uses k_align as the gain (rad of zebra angle -> w); flip
+        # k_align's sign live if it turns the wrong way.
+        self.declare_parameter('align_in_place', bool(saved.get('align_in_place', True)))
+        self.declare_parameter('align_tol_deg', float(saved.get('align_tol_deg', 12.0)))
+        self.declare_parameter('align_timeout_s', float(saved.get('align_timeout_s', 4.0)))
         self._k_align = float(self.get_parameter('k_align').value)
         self._intersection_slow_speed = float(self.get_parameter('intersection_slow_speed').value)
+        self._approach_speed = float(self.get_parameter('approach_speed').value)
         self._approach_align_slope = float(self.get_parameter('approach_align_slope').value)
         self._approach_timeout_s = float(self.get_parameter('approach_timeout_s').value)
         self._commit_speed = float(self.get_parameter('commit_speed').value)
         self._commit_turn_w = float(self.get_parameter('commit_turn_w').value)
         self._commit_duration = float(self.get_parameter('commit_duration').value)
         self._commit_duration_straight = float(self.get_parameter('commit_duration_straight').value)
+        self._commit_min_s = float(self.get_parameter('commit_min_s').value)
+        self._commit_closed_loop = bool(self.get_parameter('commit_closed_loop').value)
         self._intersection_min_travel_m = float(self.get_parameter('intersection_min_travel_m').value)
+        self._align_in_place = bool(self.get_parameter('align_in_place').value)
+        self._align_tol_deg = float(self.get_parameter('align_tol_deg').value)
+        self._align_timeout_s = float(self.get_parameter('align_timeout_s').value)
+        self._align_start_time = None        # for the square-up-in-place timeout
         self._approach_start_time = None     # for the APPROACH timeout
         self._dist_since_commit = 1e9        # distance proxy since last turn (m)
         self._near_intersection = False      # zebra seen this frame (slow zone)
@@ -348,7 +396,15 @@ class AutonomousRacer(Node):
             name = f"lane.{f.name}"
             self.declare_parameter(name, int(getattr(self.lane_params, f.name)))
             self._lane_param_names.append(name)
+        # Same for the zebra detector (zebra.<field>) so the stop distance, slow
+        # distance, etc. can be tuned live and saved to zebra_params.json.
+        self._zebra_param_names = []
+        for f in dataclass_fields(ZebraParams):
+            name = f"zebra.{f.name}"
+            self.declare_parameter(name, getattr(self.zebra_params, f.name))
+            self._zebra_param_names.append(name)
         self._lane_M = None              # cached homography (lazy, per frame size)
+        self._lane_prev_base = None      # previous lane base x (continuity)
         self._lane_Minv = None
         self._lane_frame_size = None
 
@@ -360,19 +416,40 @@ class AutonomousRacer(Node):
         self.declare_parameter('controller_log_path', '')
         self._csv_fp = None
         self._csv_writer = None
+        self._event_fp = None
         self._t0 = self.get_clock().now()
         if bool(self.get_parameter('controller_log').value):
             log_path = str(self.get_parameter('controller_log_path').value).strip() or \
-                str(Path(__file__).resolve().parent / 'controller_data.csv')
+                str(self._snapshot_dir() / 'controller_data.csv')
             try:
+                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
                 self._csv_fp = open(log_path, 'w', newline='')
                 self._csv_writer = csv.writer(self._csv_fp)
-                self._csv_writer.writerow(
-                    ['t', 'state', 'off', 'conf', 'curv', 'error', 'deriv', 'v', 'w', 'kp', 'kd'])
+                self._csv_writer.writerow([
+                    't', 'state', 'phase', 'commit', 'pending', 'decision', 'options',
+                    'lane_src', 'off', 'conf', 'curv', 'base_x',
+                    'z_seen', 'z_dist_cm', 'z_angle_deg', 'z_ndashes', 'z_span_cm',
+                    'z_options', 'near_intersection',
+                    'error', 'deriv', 'v', 'w',
+                    'kp', 'kd', 'ff_gain', 'max_v', 'max_w',
+                    'stop_cm', 'slow_cm', 'commit_min_s', 'commit_turn_w'])
                 self.get_logger().info(f'[LOG] controller CSV -> {log_path}')
             except OSError as exc:
                 self.get_logger().error(f'[LOG] could not open CSV ({exc}); disabled')
                 self._csv_fp = self._csv_writer = None
+        self.declare_parameter('session_log', True)
+        self.declare_parameter('session_log_path', '')
+        if bool(self.get_parameter('session_log').value):
+            log_path = str(self.get_parameter('session_log_path').value).strip()
+            if not log_path:
+                log_path = str(self._snapshot_dir() / 'events.jsonl')
+            try:
+                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+                self._event_fp = open(log_path, 'a', buffering=1)
+                self.get_logger().info(f'[LOG] session events -> {log_path}')
+            except OSError as exc:
+                self.get_logger().error(f'[LOG] could not open events log ({exc}); disabled')
+                self._event_fp = None
 
         # Operator reset for the intersection state machine
         # (scripts/set_intersection_jetson.sh reset): clears phase/decision/commit.
@@ -385,10 +462,25 @@ class AutonomousRacer(Node):
         # Persist current tunables to JSON on demand (tuner 'save' key).
         self.create_subscription(Bool, '/save_params', self._save_params_cb, 10)
 
+        # Live telemetry over UDP for the laptop dashboard (no ROS on the laptop,
+        # same pattern as the H264 stream). Broadcasts a compact JSON status; the
+        # dashboard (tools/dashboard.py) renders the state machine + detection +
+        # params + a rolling log. Reuses h264_host if telemetry_host is empty.
+        self.declare_parameter('telemetry_host', '')
+        self.declare_parameter('telemetry_port', 5055)
+        thost = str(self.get_parameter('telemetry_host').value).strip() or self._h264_host
+        self._telemetry_addr = None
+        self._telemetry_sock = None
+        if thost:
+            self._telemetry_addr = (thost, int(self.get_parameter('telemetry_port').value))
+            self._telemetry_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.get_logger().info(f'Telemetry UDP -> {self._telemetry_addr}')
+        self._telemetry_last = self.get_clock().now()
+
         # Periodic snapshot recorder (tuner 'r' -> /recorder_enable). Saves the
         # annotated frame every snapshot_interval s for offline review; pull with
         # scripts/pull_follower_snapshots.sh.
-        self.declare_parameter('snapshot_interval', 2.0)
+        self.declare_parameter('snapshot_interval', float(saved.get('snapshot_interval', 0.5)))
         self.declare_parameter('record_on_start', False)
         self._snapshot_interval = float(self.get_parameter('snapshot_interval').value)
         self._recording = bool(self.get_parameter('record_on_start').value)
@@ -489,6 +581,26 @@ class AutonomousRacer(Node):
         self.get_logger().warn('Intersection calibration JSON not found; using built-in defaults.')
         return IntersectionParams()
 
+    def _load_zebra_params(self):
+        configured_path = str(self.get_parameter('zebra_params_path').value).strip()
+        candidate_paths = []
+        if configured_path:
+            candidate_paths.append(Path(configured_path).expanduser())
+        candidate_paths.extend([
+            Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros/config/zebra_params.json'),
+            Path(__file__).resolve().parents[1] / 'config' / 'zebra_params.json',
+        ])
+        package_config = self._package_config_path('zebra_params.json')
+        if package_config is not None:
+            candidate_paths.append(package_config)
+        for params_path in candidate_paths:
+            if params_path.exists():
+                params = load_zebra_params(params_path)
+                self.get_logger().info(f'Loaded zebra calibration: {params_path}')
+                return params
+        self.get_logger().warn('Zebra calibration JSON not found; using built-in defaults.')
+        return ZebraParams()
+
     def _load_lane_params(self):
         configured_path = str(self.get_parameter('lane_params_path').value).strip()
         candidate_paths = []
@@ -565,6 +677,7 @@ class AutonomousRacer(Node):
             self.get_logger().warn(
                 f"Intersection decision '{msg.data}' ignored. Use left, straight, or right."
             )
+            self._event('decision_ignored', raw=msg.data, reason='unknown')
             return
         # Only enforce the option list when we actually classified some options.
         # If detection fired but no direction could be validated, trust the operator.
@@ -572,9 +685,12 @@ class AutonomousRacer(Node):
             self.get_logger().warn(
                 f"Decision '{normalized}' not in current options: {', '.join(self.intersection_options)}"
             )
+            self._event('decision_rejected', decision=normalized,
+                        allowed=list(self.intersection_options))
             return
         self.intersection_decision = normalized
         self.get_logger().info(f"Intersection decision received: {normalized}")
+        self._event('decision_received', decision=normalized)
 
     def _intersection_reset_cb(self, msg):
         """Operator escape hatch: clear the whole intersection state machine so
@@ -592,6 +708,7 @@ class AutonomousRacer(Node):
         self.last_prompt_time = None
         self.intersection_cooldown_until = None
         self.get_logger().warn('[INTERSECTION] state RESET by operator -> FOLLOW')
+        self._event('intersection_reset')
 
     def _on_set_params(self, params):
         """Apply live PD/curve/warp tuning from ros2 param set without a restart."""
@@ -631,11 +748,29 @@ class AutonomousRacer(Node):
                 self._commit_duration_straight = float(p.value)
             elif p.name == 'intersection_min_travel_m':
                 self._intersection_min_travel_m = float(p.value)
+            elif p.name == 'commit_min_s':
+                self._commit_min_s = float(p.value)
+            elif p.name == 'commit_closed_loop':
+                self._commit_closed_loop = bool(p.value)
+            elif p.name == 'align_in_place':
+                self._align_in_place = bool(p.value)
+            elif p.name == 'align_tol_deg':
+                self._align_tol_deg = float(p.value)
+            elif p.name == 'align_timeout_s':
+                self._align_timeout_s = float(p.value)
             elif p.name.startswith('lane.'):
                 field = p.name[len('lane.'):]
                 if hasattr(self.lane_params, field):
                     setattr(self.lane_params, field, int(p.value))
                     lane_changed = True
+            elif p.name.startswith('zebra.'):
+                field = p.name[len('zebra.'):]
+                if hasattr(self.zebra_params, field):
+                    cur = getattr(self.zebra_params, field)
+                    setattr(self.zebra_params, field, type(cur)(p.value))
+                    if field in ('widen_kx', 'warp_w', 'warp_h'):
+                        self._zebra_M = None          # geometry -> rebuild warp
+                        self._zebra_frame_size = None
         if lane_changed:
             # Trapezoid/size may have moved -> rebuild the homography next frame.
             self._lane_M = None
@@ -664,10 +799,16 @@ class AutonomousRacer(Node):
                 'commit_turn_w': self._commit_turn_w,
                 'commit_duration': self._commit_duration,
                 'commit_duration_straight': self._commit_duration_straight,
+                'commit_min_s': self._commit_min_s,
+                'commit_closed_loop': self._commit_closed_loop,
                 'intersection_min_travel_m': self._intersection_min_travel_m,
+                'snapshot_interval': self._snapshot_interval,
             }, indent=2))
+            zebra_path = self._config_save_path('zebra_params.json')
+            save_zebra_params(self.zebra_params, zebra_path)
             self.get_logger().warn(
-                f'[SAVE] wrote {lane_path.name} + {self._control_params_path.name}')
+                f'[SAVE] wrote {lane_path.name} + {self._control_params_path.name} '
+                f'+ {zebra_path.name}')
         except OSError as exc:
             self.get_logger().error(f'[SAVE] failed: {exc}')
 
@@ -703,10 +844,16 @@ class AutonomousRacer(Node):
         curv = lr.curvature_norm if lr is not None else 0.0
         light = "IGN" if self._ignore_traffic_light else self.current_state
 
+        zextra = ""
+        if self._use_zebra_bev and self.zebra_result is not None and self.zebra_result.seen:
+            zr = self.zebra_result
+            zd = "?" if zr.distance_cm is None else f"{zr.distance_cm:.0f}"
+            zextra = f"  ZEB:{zd}cm[{','.join(zr.options) or '-'}]"
+
         cv2.putText(frame, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         line2 = (f"drive:{'ON' if self._drive_enabled else 'off'}  light:{light}  "
                  f"{src} off:{off:+.2f} conf:{conf:.2f} curv:{curv:+.2f}  "
-                 f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}")
+                 f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}{zextra}")
         cv2.putText(frame, line2, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 255, 255), 1)
         gains = (f"kp:{self.kp:.4f} kd:{self.kd:.4f} ff:{self.ff_gain:.2f} "
@@ -722,6 +869,45 @@ class AutonomousRacer(Node):
         self.get_logger().warn(
             f'[REC] recording {"ON" if self._recording else "off"} '
             f'(total snaps: {self._snap_count})')
+        self._event('recorder', enabled=self._recording, snaps=self._snap_count)
+
+    def _event(self, name, **fields):
+        if self._event_fp is None:
+            return
+        now = self.get_clock().now()
+        lr = self._last_lane_result
+        zr = self.zebra_result
+        row = {
+            't': round((now - self._t0).nanoseconds * 1e-9, 3),
+            'event': name,
+            'state': self._phase_label()[0],
+            'phase': self.intersection_phase,
+            'commit': self.commit_direction,
+            'pending': bool(self.intersection_pending),
+            'decision': self.intersection_decision,
+            'options': list(self.intersection_options),
+            'lane': None if lr is None else {
+                'detected': bool(lr.detected),
+                'off': round(float(lr.offset_norm), 3),
+                'conf': round(float(lr.confidence), 3),
+                'curv': round(float(lr.curvature_norm), 3),
+                'base_x': None if lr.base_x is None else round(float(lr.base_x), 1),
+            },
+            'zebra': None if zr is None else {
+                'seen': bool(zr.seen),
+                'dist': None if zr.distance_cm is None else round(float(zr.distance_cm), 1),
+                'angle': None if zr.angle_deg is None else round(float(zr.angle_deg), 1),
+                'ndash': int(zr.n_dashes),
+                'span': round(float(zr.span_cm), 1),
+                'options': list(zr.options),
+                'debug': getattr(zr, 'option_debug', {}),
+            },
+        }
+        row.update(fields)
+        try:
+            self._event_fp.write(json.dumps(row, sort_keys=True) + '\n')
+        except OSError:
+            pass
 
     def _snapshot_dir(self):
         base = Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros')
@@ -750,6 +936,17 @@ class AutonomousRacer(Node):
                 scale = frame.shape[0] / float(bev.shape[0])
                 bev = cv2.resize(bev, (int(bev.shape[1] * scale), frame.shape[0]))
                 out = cv2.hconcat([frame, bev])
+            # Glue the WIDE zebra BEV with the detected row, so a recorded session
+            # shows exactly what the zebra detector saw (the lane BEV above is a
+            # different, narrower warp and does not show the zebra detection).
+            if (self._use_zebra_bev and self._zebra_M is not None
+                    and self.zebra_result is not None):
+                zp = self.zebra_params
+                zbev = cv2.warpPerspective(frame, self._zebra_M, (zp.warp_w, zp.warp_h))
+                zbev = draw_zebra_overlay(zbev, self.zebra_result)
+                zscale = frame.shape[0] / float(zbev.shape[0])
+                zbev = cv2.resize(zbev, (int(zbev.shape[1] * zscale), frame.shape[0]))
+                out = cv2.hconcat([out, zbev])
             cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'), out)
             self._snap_count += 1
         except OSError as exc:
@@ -765,19 +962,85 @@ class AutonomousRacer(Node):
             float(cmd.linear.x), float(cmd.angular.z)]
         self.lane_status_pub.publish(msg)
 
+    def _publish_telemetry(self, now, cmd):
+        """Broadcast a compact JSON status to the laptop dashboard (~10 Hz)."""
+        if self._telemetry_sock is None:
+            return
+        if (now - self._telemetry_last).nanoseconds * 1e-9 < 0.1:
+            return
+        self._telemetry_last = now
+        lr = self._last_lane_result
+        zr = self.zebra_result
+        zp = self.zebra_params
+        zebra = None
+        if self._use_zebra_bev and zr is not None:
+            zebra = {
+                'seen': bool(zr.seen),
+                'dist': None if zr.distance_cm is None else round(zr.distance_cm, 1),
+                'angle': None if zr.angle_deg is None else round(zr.angle_deg, 0),
+                'ndash': int(zr.n_dashes),
+                'span': round(zr.span_cm, 1),
+                'options': list(zr.options),
+                'debug': getattr(zr, 'option_debug', {}),
+            }
+        data = {
+            't': round((now - self._t0).nanoseconds * 1e-9, 1),
+            'state': self._phase_label()[0],
+            'drive': bool(self._drive_enabled),
+            'light': 'IGN' if self._ignore_traffic_light else self.current_state,
+            'phase': self.intersection_phase,
+            'commit': self.commit_direction,
+            'options': list(self.intersection_options),
+            'zebra': zebra,
+            'lane': {
+                'off': round(float(lr.offset_norm), 2) if lr else None,
+                'conf': round(float(lr.confidence), 2) if lr else None,
+                'curv': round(float(lr.curvature_norm), 2) if lr else None,
+                'src': 'BEV' if lr is not None else 'legacy',
+            },
+            'cmd': {'v': round(float(cmd.linear.x), 3), 'w': round(float(cmd.angular.z), 2)},
+            'params': {
+                'use_zebra_bev': bool(self._use_zebra_bev),
+                'kp': self.kp, 'kd': self.kd, 'max_v': self.max_v, 'max_w': self.max_w,
+                'ff_gain': self.ff_gain,
+                'slow_cm': zp.slow_distance_cm, 'stop_cm': zp.stop_distance_cm,
+                'approach_v': self._approach_speed,
+            },
+        }
+        try:
+            self._telemetry_sock.sendto(json.dumps(data).encode(), self._telemetry_addr)
+        except OSError:
+            pass
+
     def _log_controller_row(self, now, cmd):
         if self._csv_writer is None:
             return
         t = (now - self._t0).nanoseconds * 1e-9
         lr = self._last_lane_result
+        zr = self.zebra_result
+        zp = self.zebra_params
         self._csv_writer.writerow([
-            f"{t:.3f}", self._phase_label()[0],
+            f"{t:.3f}", self._phase_label()[0], self.intersection_phase or '',
+            self.commit_direction or '', bool(self.intersection_pending),
+            self.intersection_decision or '', '|'.join(self.intersection_options),
+            'BEV' if lr is not None else 'legacy',
             f"{(lr.offset_norm if lr else 0.0):+.3f}",
             f"{(lr.confidence if lr else 0.0):.2f}",
             f"{(lr.curvature_norm if lr else 0.0):+.3f}",
+            '' if (lr is None or lr.base_x is None) else f"{lr.base_x:.1f}",
+            bool(zr.seen) if zr is not None else False,
+            '' if (zr is None or zr.distance_cm is None) else f"{zr.distance_cm:.1f}",
+            '' if (zr is None or zr.angle_deg is None) else f"{zr.angle_deg:.1f}",
+            int(zr.n_dashes) if zr is not None else 0,
+            '' if zr is None else f"{zr.span_cm:.1f}",
+            '' if zr is None else '|'.join(zr.options),
+            bool(self._near_intersection),
             f"{self.last_error:.1f}", f"{self.last_derivative:.1f}",
             f"{cmd.linear.x:.3f}", f"{cmd.angular.z:+.3f}",
-            f"{self.kp:.4f}", f"{self.kd:.4f}"])
+            f"{self.kp:.4f}", f"{self.kd:.4f}", f"{self.ff_gain:.3f}",
+            f"{self.max_v:.3f}", f"{self.max_w:.3f}",
+            f"{zp.stop_distance_cm:.1f}", f"{zp.slow_distance_cm:.1f}",
+            f"{self._commit_min_s:.2f}", f"{self._commit_turn_w:.2f}"])
 
     def _publish_stream_frame(self, frame):
         """Throttle and push the annotated frame to the active stream (MJPEG or H264)."""
@@ -825,6 +1088,165 @@ class AutonomousRacer(Node):
             f"[INTERSECTION] Waiting for decision. Options: {option_text}. "
             f"dash={result.dashed_count} L:{result.left_dash} S:{result.center_dash} R:{result.right_dash}"
         )
+
+    def _publish_zebra_prompt(self, zres):
+        opts = zres.options if (zres is not None and zres.options) else []
+        option_text = ', '.join(opts) if opts else 'none (decide manually)'
+        msg = String()
+        msg.data = (
+            f"Intersection detected. Options: {option_text}. "
+            "Reply with: ros2 topic pub --once /intersection_decision "
+            "std_msgs/msg/String \"{data: 'left'}\""
+        )
+        self.intersection_prompt_pub.publish(msg)
+        d = '?' if (zres is None or zres.distance_cm is None) else f"{zres.distance_cm:.0f}"
+        self.get_logger().warn(
+            f"[ZEBRA] Waiting for decision. Options: {option_text}. dist={d}cm")
+
+    def _run_zebra_phase(self, frame, now):
+        """Robust bird's-eye / ground-coordinate intersection handling.
+
+        Mirrors the legacy phase machine (None -> approach -> wait -> commit) but
+        the trigger and the stop are driven by the zebra ROW DISTANCE in cm
+        (pose-independent), not the noisy raw-image entry-line geometry. Returns
+        True if it consumed the frame (WAIT: published a stop and early-returned).
+        """
+        zp = self.zebra_params
+
+        # Suppress detection while committing a turn or inside the post-turn
+        # travel/time cooldown (same double-cross guard as the legacy path).
+        cooldown_active = (
+            (self.intersection_cooldown_until is not None
+             and now < self.intersection_cooldown_until)
+            or self._dist_since_commit < self._intersection_min_travel_m
+        )
+        if cooldown_active or self.commit_direction is not None:
+            self._zebra_stable = 0
+            self.zebra_result = None
+        else:
+            h, w = frame.shape[:2]
+            if self._zebra_M is None or self._zebra_frame_size != (w, h):
+                self._zebra_M = wide_homography(self.lane_params, zp, w, h)
+                self._zebra_frame_size = (w, h)
+            zres = analyze_zebra(frame, self.lane_params, zp, self._zebra_M,
+                                 self._zebra_stable)
+            self._zebra_stable = zres.stable_frames
+            self.zebra_result = zres
+
+        zres = self.zebra_result
+        dist = zres.distance_cm if zres is not None else None
+        # Slow-zone: zebra debounced-seen AND within the slow distance.
+        self._near_intersection = bool(
+            zres is not None and zres.seen and dist is not None
+            and dist <= zp.slow_distance_cm)
+
+        # Enter APPROACH once the zebra is seen and within slowing range.
+        if (zres is not None and zres.seen and dist is not None
+                and dist <= zp.slow_distance_cm and self.intersection_phase is None):
+            self.intersection_phase = 'approach'
+            self._zebra_opt_votes = {}
+            self._approach_start_time = now
+            self.get_logger().info(f'[ZEBRA] seen @ {dist:.0f}cm -> APPROACH')
+            self._event('approach_start', dist_cm=round(float(dist), 1))
+
+        # APPROACH -> WAIT by distance (or timeout back to FOLLOW).
+        if self.intersection_phase == 'approach':
+            # Vote options over the whole approach (a single frame flaps; an exit
+            # seen in >= zebra_opt_min_votes frames sticks). Fixes "saw left but
+            # not right": once right is detected in any couple of frames it stays.
+            if zres is not None:
+                for o in zres.options:
+                    self._zebra_opt_votes[o] = self._zebra_opt_votes.get(o, 0) + 1
+                self.intersection_options = [
+                    o for o in ('left', 'straight', 'right')
+                    if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
+            arrived = dist is not None and dist <= zp.stop_distance_cm
+            timed_out = (
+                self._approach_start_time is not None
+                and (now - self._approach_start_time).nanoseconds * 1e-9
+                > self._approach_timeout_s)
+            if arrived:
+                self.intersection_phase = 'wait'
+                self.intersection_pending = True
+                self.intersection_decision = None
+                self.last_prompt_time = None
+                self._approach_start_time = None
+                self._align_start_time = None
+                self.get_logger().info(
+                    f'[ZEBRA] at cross ({dist:.0f}cm) -> WAIT')
+                self._event('wait_start', dist_cm=round(float(dist), 1),
+                            voted_options=list(self.intersection_options),
+                            option_votes=dict(self._zebra_opt_votes))
+            elif timed_out:
+                self.intersection_phase = None
+                self._approach_start_time = None
+                self.intersection_cooldown_until = now + Duration(seconds=2.0)
+                self.get_logger().warn('[ZEBRA] APPROACH timed out -> FOLLOW')
+                self._event('approach_timeout')
+
+        # WAIT: stopped at the cross. First SQUARE UP in place if we arrived skewed
+        # (came off a curve) -- rotate with v=0 (safe, no arcing) to face the cross
+        # so options read correctly, THEN prompt + wait for a decision.
+        if self.intersection_phase == 'wait':
+            zr = self.zebra_result
+            za = zr.angle_deg if zr is not None else None
+            if self._align_start_time is None:
+                self._align_start_time = now
+            align_elapsed = (now - self._align_start_time).nanoseconds * 1e-9
+            need_align = (self._align_in_place and za is not None
+                          and abs(za) > self._align_tol_deg
+                          and align_elapsed < self._align_timeout_s)
+            if need_align and self._drive_enabled and self.intersection_decision is None:
+                tw = Twist()
+                tw.angular.z = max(-self.max_w, min(self.max_w,
+                                                    -self._k_align * math.radians(za)))
+                self.cmd_pub.publish(tw)
+                self.get_logger().info(
+                    f'[ZEBRA] WAIT square-up in place: za={za:.0f} w={tw.angular.z:+.2f}',
+                    throttle_duration_sec=0.5)
+                self._draw_status_hud(frame, tw)
+                self._log_controller_row(now, tw)
+                self._publish_telemetry(now, tw)
+                self._publish_stream_frame(frame)
+                if self.show_window:
+                    cv2.imshow("Frame", frame)
+                    cv2.waitKey(1)
+                return True
+
+            should_prompt = (self.last_prompt_time is None
+                             or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0)
+            if should_prompt:
+                self._publish_zebra_prompt(zres)
+                self.last_prompt_time = now
+
+            if self.intersection_decision is None:
+                self.cmd_pub.publish(Twist())
+                self._draw_status_hud(frame, Twist())
+                self._log_controller_row(now, Twist())
+                self._publish_telemetry(now, Twist())
+                self._publish_stream_frame(frame)
+                if self.show_window:
+                    cv2.imshow("Frame", frame)
+                    cv2.waitKey(1)
+                return True
+
+            self.commit_direction = self.intersection_decision
+            dur = (self._commit_duration_straight
+                   if self.commit_direction == 'straight' else self._commit_duration)
+            self.commit_until = now + Duration(seconds=dur)
+            self._commit_min_until = now + Duration(seconds=self._commit_min_s)
+            self._dist_since_commit = 0.0
+            self._approach_start_time = None
+            self.intersection_phase = None
+            self.intersection_pending = False
+            self.intersection_options = []
+            self.intersection_decision = None
+            self._zebra_stable = 0
+            self.zebra_result = None
+            self.intersection_cooldown_until = now + Duration(seconds=1.5)
+            self._event('commit_start', direction=self.commit_direction,
+                        duration_s=float(dur), min_s=float(self._commit_min_s))
+        return False
 
     def _draw_intersection_overlay(self, frame, result):
         h, w = frame.shape[:2]
@@ -1171,104 +1593,110 @@ class AutonomousRacer(Node):
         # ---------------------------------------------------------
         # 2. INTERSECTION / DASHED-LINE PERCEPTION
         # ---------------------------------------------------------
-        # Suppress detection while committing a turn, during the time cooldown, OR
-        # until we have driven far enough past the last cross (distance proxy that
-        # stops a double intersection from re-firing the one we just left).
-        cooldown_active = (
-            (self.intersection_cooldown_until is not None
-             and now < self.intersection_cooldown_until)
-            or self._dist_since_commit < self._intersection_min_travel_m
-        )
-        if cooldown_active or self.commit_direction is not None:
-            self.intersection_stable = 0
-            result = None
-        else:
-            result = self._analyze_intersection(frame)
-            self.intersection_result = result
-
-        # FOLLOW slow-zone: the moment a zebra is SEEN (debounced, regardless of
-        # centering) we slow down and relax the curve feedforward below, so the
-        # robot does not overshoot the cross before it can center. Independent of
-        # whether we commit to APPROACH this frame.
-        self._near_intersection = bool(result is not None and result.entry_seen)
-
-        # Enter APPROACH on the centering-INDEPENDENT trigger (entry_seen). Coming
-        # out of a curve the robot is skewed and would never satisfy the old
-        # centered `dashed_detected` gate; APPROACH then actively straightens it.
-        if (result is not None and result.entry_seen
-                and self.intersection_phase is None):
-            self.intersection_phase = 'approach'
-            self.intersection_options = result.options
-            self._approach_start_time = now
-            self.get_logger().info('[INTERSECTION] seen -> APPROACH (center + align)')
-
-        if self.intersection_phase in ('approach', 'wait') and self.intersection_result is not None:
-            self.intersection_options = self.intersection_result.options
-            self._draw_intersection_overlay(frame, self.intersection_result)
-
-        # APPROACH: arrived once the entry zebra is at the target depth AND centered
-        # (now reachable because the motion section actively aligns heading). A
-        # timeout drops back to FOLLOW so a bad detection can't strand the robot.
-        if self.intersection_phase == 'approach':
-            r = self.intersection_result
-            close = (
-                r is not None and r.entry_y_pct is not None
-                and r.entry_y_pct >= self._approach_target_entry_y_pct
-            )
-            # A differential-drive robot can't strafe to center on an off-axis
-            # zebra (it would arc forward and blow through). So we DON'T require
-            # lateral centering -- only that it is close AND has rotated the zebra
-            # ~horizontal (achievable by turning in place). It stops AT the cross.
-            aligned = r is not None and abs(r.entry_slope) <= self._approach_align_slope
-            arrived = close and aligned
-            timed_out = (
-                self._approach_start_time is not None
-                and (now - self._approach_start_time).nanoseconds * 1e-9 > self._approach_timeout_s
-            )
-            if arrived:
-                self.intersection_phase = 'wait'
-                self.intersection_pending = True
-                self.intersection_decision = None
-                self.last_prompt_time = None
-                self._approach_start_time = None
-                self.get_logger().info('[INTERSECTION] at cross + aligned -> WAIT')
-            elif timed_out:
-                self.intersection_phase = None
-                self._approach_start_time = None
-                self.intersection_cooldown_until = now + Duration(seconds=2.0)
-                self.get_logger().warn('[INTERSECTION] APPROACH timed out -> FOLLOW')
-
-        # WAIT: stopped at the intersection, prompting until a decision arrives.
-        if self.intersection_phase == 'wait':
-            draw_result = self.intersection_result
-            should_prompt = self.last_prompt_time is None or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0
-            if should_prompt and draw_result is not None:
-                self._publish_intersection_prompt(draw_result)
-                self.last_prompt_time = now
-
-            if self.intersection_decision is None:
-                self.cmd_pub.publish(Twist())
-                self._draw_status_hud(frame, Twist())
-                self._log_controller_row(now, Twist())
-                self._publish_stream_frame(frame)
-                if self.show_window:
-                    cv2.imshow("Frame", frame)
-                    cv2.waitKey(1)
+        # Robust path (default): bird's-eye, ground-coordinate zebra detector. It
+        # owns the trigger + the stop (by distance in cm). Legacy raw-image path
+        # below runs only when use_zebra_bev:=false.
+        if self._use_zebra_bev:
+            if self._run_zebra_phase(frame, now):
                 return
+        else:
+            # Suppress detection while committing a turn, during the time cooldown,
+            # OR until we have driven far enough past the last cross (distance proxy
+            # that stops a double intersection from re-firing the one we just left).
+            cooldown_active = (
+                (self.intersection_cooldown_until is not None
+                 and now < self.intersection_cooldown_until)
+                or self._dist_since_commit < self._intersection_min_travel_m
+            )
+            if cooldown_active or self.commit_direction is not None:
+                self.intersection_stable = 0
+                result = None
+            else:
+                result = self._analyze_intersection(frame)
+                self.intersection_result = result
 
-            self.commit_direction = self.intersection_decision
-            dur = (self._commit_duration_straight
-                   if self.commit_direction == 'straight' else self._commit_duration)
-            self.commit_until = now + Duration(seconds=dur)
-            self._dist_since_commit = 0.0        # start the double-cross travel guard
-            self._approach_start_time = None
-            self.intersection_phase = None
-            self.intersection_pending = False
-            self.intersection_options = []
-            self.intersection_decision = None
-            self.intersection_stable = 0
-            self.intersection_result = None
-            self.intersection_cooldown_until = now + Duration(seconds=1.5)
+            # FOLLOW slow-zone: the moment a zebra is SEEN (debounced, regardless of
+            # centering) we slow down and relax the curve feedforward below, so the
+            # robot does not overshoot the cross before it can center. Independent of
+            # whether we commit to APPROACH this frame.
+            self._near_intersection = bool(result is not None and result.entry_seen)
+
+            # Enter APPROACH on the centering-INDEPENDENT trigger (entry_seen). Coming
+            # out of a curve the robot is skewed and would never satisfy the old
+            # centered `dashed_detected` gate; APPROACH then actively straightens it.
+            if (result is not None and result.entry_seen
+                    and self.intersection_phase is None):
+                self.intersection_phase = 'approach'
+                self.intersection_options = result.options
+                self._approach_start_time = now
+                self.get_logger().info('[INTERSECTION] seen -> APPROACH (center + align)')
+
+            if self.intersection_phase in ('approach', 'wait') and self.intersection_result is not None:
+                self.intersection_options = self.intersection_result.options
+                self._draw_intersection_overlay(frame, self.intersection_result)
+
+            # APPROACH: arrived once the entry zebra is at the target depth AND centered
+            # (now reachable because the motion section actively aligns heading). A
+            # timeout drops back to FOLLOW so a bad detection can't strand the robot.
+            if self.intersection_phase == 'approach':
+                r = self.intersection_result
+                # Coming out of a curve the robot is NOT aligned, and a diff-drive
+                # robot can't strafe to fix that. So we do NOT require alignment: we
+                # just STOP when the zebra is close, in whatever pose. The skew is
+                # absorbed later by the turn maneuver + lane re-acquisition.
+                arrived = (
+                    r is not None and r.entry_y_pct is not None
+                    and r.entry_y_pct >= self._approach_target_entry_y_pct
+                )
+                timed_out = (
+                    self._approach_start_time is not None
+                    and (now - self._approach_start_time).nanoseconds * 1e-9 > self._approach_timeout_s
+                )
+                if arrived:
+                    self.intersection_phase = 'wait'
+                    self.intersection_pending = True
+                    self.intersection_decision = None
+                    self.last_prompt_time = None
+                    self._approach_start_time = None
+                    self.get_logger().info('[INTERSECTION] at cross + aligned -> WAIT')
+                elif timed_out:
+                    self.intersection_phase = None
+                    self._approach_start_time = None
+                    self.intersection_cooldown_until = now + Duration(seconds=2.0)
+                    self.get_logger().warn('[INTERSECTION] APPROACH timed out -> FOLLOW')
+
+            # WAIT: stopped at the intersection, prompting until a decision arrives.
+            if self.intersection_phase == 'wait':
+                draw_result = self.intersection_result
+                should_prompt = self.last_prompt_time is None or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0
+                if should_prompt and draw_result is not None:
+                    self._publish_intersection_prompt(draw_result)
+                    self.last_prompt_time = now
+
+                if self.intersection_decision is None:
+                    self.cmd_pub.publish(Twist())
+                    self._draw_status_hud(frame, Twist())
+                    self._log_controller_row(now, Twist())
+                    self._publish_stream_frame(frame)
+                    if self.show_window:
+                        cv2.imshow("Frame", frame)
+                        cv2.waitKey(1)
+                    return
+
+                self.commit_direction = self.intersection_decision
+                dur = (self._commit_duration_straight
+                       if self.commit_direction == 'straight' else self._commit_duration)
+                self.commit_until = now + Duration(seconds=dur)
+                self._commit_min_until = now + Duration(seconds=self._commit_min_s)
+                self._dist_since_commit = 0.0        # start the double-cross travel guard
+                self._approach_start_time = None
+                self.intersection_phase = None
+                self.intersection_pending = False
+                self.intersection_options = []
+                self.intersection_decision = None
+                self.intersection_stable = 0
+                self.intersection_result = None
+                self.intersection_cooldown_until = now + Duration(seconds=1.5)
 
         # ---------------------------------------------------------
         # 3. LINE PERCEPTION + BASE CONTROL
@@ -1284,14 +1712,31 @@ class AutonomousRacer(Node):
         # Primary path: bird's-eye lane follower. Only while normally following;
         # during an intersection approach/commit we keep the legacy ROI logic
         # that centers on the zebra entry.
+        # In the zebra-BEV path we keep following the LANE during APPROACH (the
+        # robot creeps toward the cross while staying on the line); the legacy path
+        # instead centers on the entry zebra, so it only runs birdseye when FOLLOW.
+        lane_follow_phase_ok = self.intersection_phase is None or (
+            self._use_zebra_bev and self.intersection_phase == 'approach')
+        # Run the bird's-eye detector during FOLLOW, the zebra APPROACH, AND the
+        # COMMIT maneuver. During COMMIT it does not steer (the turn overrides
+        # below) but it provides the lane RE-ACQUIRED signal that ends the commit.
+        run_birdseye = self._use_birdseye and (
+            lane_follow_phase_ok or self.commit_direction is not None)
         lane_ok = False
-        if (self._use_birdseye and self.intersection_phase is None
-                and self.commit_direction is None):
+        if run_birdseye:
             if self._lane_M is None or self._lane_frame_size != (w, h):
                 self._lane_M, self._lane_Minv = compute_homography(self.lane_params, w, h)
                 self._lane_frame_size = (w, h)
-            lane_result = analyze_lane(frame, self.lane_params, self._lane_M, self._lane_Minv)
+            lane_result = analyze_lane(frame, self.lane_params, self._lane_M,
+                                       self._lane_Minv, self._lane_prev_base)
             self._last_lane_result = lane_result
+            # Thread the base x to the next frame for continuity (stay on the same
+            # line through a curve); drop it when the line is lost so it re-acquires
+            # from the center next time.
+            if lane_result.detected and lane_result.confidence >= 0.5:
+                self._lane_prev_base = lane_result.base_x
+            else:
+                self._lane_prev_base = None
             draw_lane_overlay(frame, self.lane_params, lane_result)
             if lane_result.detected and lane_result.lane_center_x_orig is not None:
                 lane_ok = True
@@ -1463,9 +1908,27 @@ class AutonomousRacer(Node):
             base_linear_x = min(base_linear_x, self._intersection_slow_speed)
 
         if self.commit_direction is not None:
-            if self.commit_until is not None and now < self.commit_until:
-                # Open-loop turn maneuver (tunable). After it, FOLLOW re-acquires
-                # the line on the chosen branch, which corrects any small error.
+            lr = self._last_lane_result
+            reacquired = (lr is not None and lr.detected
+                          and lr.confidence >= 0.5)
+            past_min = (self._commit_min_until is None
+                        or now >= self._commit_min_until)
+            past_max = (self.commit_until is not None
+                        and now >= self.commit_until)
+            # End the maneuver when the lane is RE-ACQUIRED (after a min time to
+            # clear the cross), or at the safety cap. A cross has no line to
+            # follow, so we drive the turn/cross open-loop ONLY until the line of
+            # the chosen branch reappears -- then hand straight back to FOLLOW.
+            if past_max or (self._commit_closed_loop and past_min and reacquired):
+                self.get_logger().info(
+                    f"[INTERSECTION] commit {self.commit_direction} done -> FOLLOW "
+                    f"(reacquired={reacquired}, timeout={past_max})")
+                self._event('commit_end', direction=self.commit_direction,
+                            reacquired=bool(reacquired), timeout=bool(past_max))
+                self.commit_direction = None
+                self.commit_until = None
+                self._commit_min_until = None
+            else:
                 base_linear_x = self._commit_speed
                 if self.commit_direction == 'left':
                     target_angular_z = self._commit_turn_w
@@ -1475,34 +1938,54 @@ class AutonomousRacer(Node):
                     target_angular_z = 0.0
                 self.get_logger().info(
                     f"[INTERSECTION] Committing {self.commit_direction}: "
-                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}"
-                )
-            else:
-                self.commit_direction = None
-                self.commit_until = None
+                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}",
+                    throttle_duration_sec=0.5)
 
         # During APPROACH: drive a fixed creep AND actively align heading so the
         # robot straightens onto the zebra (works whether it arrived from a curve
         # or a straight). w_align rotates the fitted entry line toward horizontal;
         # the legacy centering above already handles lateral offset.
         if self.intersection_phase == 'approach':
-            r = self.intersection_result
-            close = (r is not None and r.entry_y_pct is not None
-                     and r.entry_y_pct >= self._approach_target_entry_y_pct)
-            # Far: creep toward the zebra. Close: stop forward and rotate IN PLACE
-            # to make it horizontal, so an off-axis approach stops AT the cross
-            # instead of arcing through it.
-            base_linear_x = 0.0 if close else self._approach_speed
-            if r is not None and r.entry_y_pct is not None:
-                w_align = -self._k_align * r.entry_slope
-                target_angular_z = max(-self.max_w,
-                                       min(self.max_w, target_angular_z + w_align))
-            self.get_logger().info(
-                f"[INTERSECTION] APPROACH {'align-in-place' if close else 'creep'}: "
-                f"V={base_linear_x:.3f} W={target_angular_z:.2f} "
-                f"slope={0.0 if r is None else r.entry_slope:.3f}",
-                throttle_duration_sec=1.0,
-            )
+            if self._use_zebra_bev:
+                # Keep the LANE steering (computed above) so the robot stays on the
+                # line while creeping to the cross; just brake by distance. NOTE: a
+                # pure zebra-angle "square-up" was tried and made it WORSE -- it
+                # turned the wrong way and, with no lateral control, arced off the
+                # cross and lost the zebra (session 191531). Lane steering at least
+                # keeps it on the line into the cross; the option classifier is now
+                # robust to a small lateral offset (measured relative to the cross
+                # center), so we no longer need to fight for a perfect pose here.
+                zr = self.zebra_result
+                dist = zr.distance_cm if zr is not None else None
+                zp = self.zebra_params
+                if dist is not None and dist <= zp.stop_distance_cm:
+                    base_linear_x = 0.0
+                else:
+                    base_linear_x = self._approach_speed
+                self.get_logger().info(
+                    f"[ZEBRA] APPROACH creep: V={base_linear_x:.3f} "
+                    f"W={target_angular_z:.2f} dist="
+                    f"{'?' if dist is None else f'{dist:.0f}'}cm",
+                    throttle_duration_sec=1.0,
+                )
+            else:
+                r = self.intersection_result
+                close = (r is not None and r.entry_y_pct is not None
+                         and r.entry_y_pct >= self._approach_target_entry_y_pct)
+                # Far: creep toward the zebra. Close: stop forward and rotate IN
+                # PLACE to make it horizontal, so an off-axis approach stops AT the
+                # cross instead of arcing through it.
+                base_linear_x = 0.0 if close else self._approach_speed
+                if r is not None and r.entry_y_pct is not None:
+                    w_align = -self._k_align * r.entry_slope
+                    target_angular_z = max(-self.max_w,
+                                           min(self.max_w, target_angular_z + w_align))
+                self.get_logger().info(
+                    f"[INTERSECTION] APPROACH {'align-in-place' if close else 'creep'}: "
+                    f"V={base_linear_x:.3f} W={target_angular_z:.2f} "
+                    f"slope={0.0 if r is None else r.entry_slope:.3f}",
+                    throttle_duration_sec=1.0,
+                )
 
         # ---------------------------------------------------------
         # 5. SUPERVISOR OVERRIDE (Traffic Light Scale)
@@ -1552,6 +2035,7 @@ class AutonomousRacer(Node):
         self._draw_status_hud(frame, cmd)
         self._log_controller_row(now, cmd)
         self._publish_lane_status(cmd)
+        self._publish_telemetry(now, cmd)
         self._maybe_snapshot(now, frame)
         if self.show_window:
             cv2.imshow("Frame", frame)
@@ -1566,6 +2050,8 @@ class AutonomousRacer(Node):
             self._h264_streamer.release()
         if self._csv_fp is not None:
             self._csv_fp.close()
+        if self._event_fp is not None:
+            self._event_fp.close()
         if self.show_window:
             cv2.destroyAllWindows()
         super().destroy_node()

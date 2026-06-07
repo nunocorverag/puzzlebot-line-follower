@@ -26,6 +26,9 @@ rsync -az --delete \
   --exclude 'debug_dataset/' \
   --exclude 'datasets/' \
   --exclude 'scripts/local.env' \
+  --exclude 'config/control_params.json' \
+  --exclude 'config/lane_params.json' \
+  --exclude 'config/zebra_params.json' \
   "${REPO_DIR}/" "${JETSON_USER}@${JETSON_HOST}:${REMOTE_PACKAGE}/"
 
 ssh "${JETSON_USER}@${JETSON_HOST}" "chmod +x '${REMOTE_PACKAGE}/scripts/'*.sh '${REMOTE_PACKAGE}/env_jetson.sh' '${REMOTE_PACKAGE}/env_laptop.sh'"
