@@ -286,9 +286,9 @@ class AutonomousRacer(Node):
         # camera. Primary source = the robot's measured /robot_vel; if that is not
         # arriving (no motor agent / encoders), we fall back to integrating the
         # commanded speed in the control loop. Mark a point and read the delta.
-        self._odom_dist = 0.0
-        self._robot_vel_last_t = None     # last /robot_vel msg time (for dt)
-        self._robot_vel_fresh_t = None    # last time /robot_vel arrived (freshness)
+        self._odom_dist = 0.0             # integrated from the COMMAND (reliable)
+        self._robot_vel_fresh_t = None    # last time /robot_vel arrived (telemetry)
+        self._robot_vel_last_x = 0.0
         self.create_subscription(Twist, '/robot_vel', self._robot_vel_cb, 10)
 
         # ---------------------------------------------------------
@@ -706,21 +706,17 @@ class AutonomousRacer(Node):
         self.get_logger().info(f"[DRIVE] enabled={self._drive_enabled}")
 
     def _robot_vel_cb(self, msg):
-        """Integrate measured forward speed into the travelled-distance estimate."""
-        now = self.get_clock().now()
-        if self._robot_vel_last_t is not None:
-            dt = (now - self._robot_vel_last_t).nanoseconds * 1e-9
-            if 0.0 < dt < 0.5:                       # ignore stalls/jumps
-                self._odom_dist += abs(float(msg.linear.x)) * dt
-        self._robot_vel_last_t = now
-        self._robot_vel_fresh_t = now
+        """Record /robot_vel for telemetry only. Its content proved unreliable for
+        distance (it read ~0 while the robot was clearly moving), so odometry is
+        integrated from the COMMAND in _odom_tick instead."""
+        self._robot_vel_fresh_t = self.get_clock().now()
+        self._robot_vel_last_x = float(msg.linear.x)
 
-    def _odom_tick_fallback(self, now, cmd, loop_dt):
-        """When /robot_vel is not arriving, integrate the COMMANDED speed so the
-        odometry estimate keeps advancing (less precise, but never stalls)."""
-        fresh = (self._robot_vel_fresh_t is not None
-                 and (now - self._robot_vel_fresh_t).nanoseconds * 1e-9 < 0.5)
-        if not fresh and 0.0 < loop_dt < 0.5:
+    def _odom_tick(self, cmd, loop_dt):
+        """Integrate the COMMANDED forward speed into travelled distance. The robot
+        tracks the command well enough (verified: z_dist fell as commanded), and
+        this never stalls -- unlike the measured /robot_vel, which read 0."""
+        if 0.0 < loop_dt < 0.5:
             self._odom_dist += abs(float(cmd.linear.x)) * loop_dt
 
     def _odom_m(self):
@@ -2124,9 +2120,8 @@ class AutonomousRacer(Node):
 
         self.cmd_pub.publish(cmd)
 
-        # Odometry fallback: if /robot_vel is not arriving, integrate the command
-        # so the travelled-distance estimate keeps advancing.
-        self._odom_tick_fallback(now, cmd, 0.033)
+        # Odometry: integrate the commanded speed into travelled distance.
+        self._odom_tick(cmd, 0.033)
 
         # Distance proxy for the double-intersection guard: integrate commanded
         # speed at the timer rate (30 Hz). Stays huge until a commit resets it.
