@@ -262,14 +262,20 @@ class AutonomousRacer(Node):
         # exits are actually visible -- instead of stopping at the entry and trying
         # to read from the worst spot. Both tunable live.
         self.declare_parameter('detect_distance_cm', 22.0)
-        self.declare_parameter('read_distance_cm', 8.0)
+        self.declare_parameter('read_distance_cm', 6.0)
+        # After reaching the entry, drive this much FURTHER (by odometry) to sit ON
+        # the cross, where the side exits are visible, before asking. This is the
+        # "stop on the cross, not before it" fix.
+        self.declare_parameter('read_advance_extra_cm', 14.0)
         self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
         self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
-        # During ADVANCE the lane follower FLAKES over the cross (it grabs the side
-        # dashes and veers left). So we do NOT steer with it; we hold centre using
-        # the zebra ROW CENTER (stable: the dash row marks the lane) and go straight
-        # if the row is lost. gain in rad per cm of lateral row offset; sign tunable.
-        self.declare_parameter('advance_center_gain', 0.03)
+        self._read_advance_extra_cm = float(self.get_parameter('read_advance_extra_cm').value)
+        self._adv_at_entry = False        # phase-2 flag (reached entry, now crossing)
+        self._adv_extra_odom0 = 0.0
+        # ADVANCE goes STRAIGHT by default (gain 0): steering by the row/lane over a
+        # cross grabs the edge dashes and veers off. Raise advance_center_gain only
+        # if you want gentle centring on the zebra row center (sign tunable).
+        self.declare_parameter('advance_center_gain', 0.0)
         self._advance_center_gain = float(self.get_parameter('advance_center_gain').value)
         self._adv_odom0 = 0.0             # odometry mark at DETECT
         self._adv_target_m = 0.0          # distance to advance to the reading window
@@ -829,6 +835,8 @@ class AutonomousRacer(Node):
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
                 self._read_distance_cm = float(p.value)
+            elif p.name == 'read_advance_extra_cm':
+                self._read_advance_extra_cm = float(p.value)
             elif p.name == 'advance_center_gain':
                 self._advance_center_gain = float(p.value)
             elif p.name == 'align_in_place':
@@ -1262,6 +1270,7 @@ class AutonomousRacer(Node):
             self._zebra_opt_votes = {}
             self._adv_odom0 = self._odom_m()
             self._adv_target_m = max(0.0, (dist - self._read_distance_cm) / 100.0)
+            self._adv_at_entry = False
             self._approach_start_time = now
             self.get_logger().info(
                 f'[ZEBRA] detected @ {dist:.0f}cm -> ADVANCE {self._adv_target_m*100:.0f}cm')
@@ -1277,15 +1286,22 @@ class AutonomousRacer(Node):
                 self.intersection_options = [
                     o for o in ('left', 'straight', 'right')
                     if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
-            # Arrive at the reading window by the MEASURED camera distance while we
-            # can see the row (real, precise); fall back to odometry only if the row
-            # is lost. read_distance_cm tunes how deep we go: high = stop before the
-            # cross; low = chase the row across the first dashes onto the cross.
+            # Two-phase arrival:
+            #   phase 1: reach the ENTRY by the measured camera distance (precise),
+            #            or by odometry if the row is lost.
+            #   phase 2: drive read_advance_extra_cm FURTHER (odometry) to sit ON
+            #            the cross, then READ -- so it stops on the cross, not before.
             advanced = self._odom_m() - self._adv_odom0
-            if dist is not None:
-                arrived = dist <= self._read_distance_cm
+            if not self._adv_at_entry:
+                at_entry = ((dist is not None and dist <= self._read_distance_cm)
+                            or (dist is None and advanced >= self._adv_target_m))
+                if at_entry:
+                    self._adv_at_entry = True
+                    self._adv_extra_odom0 = self._odom_m()
+                arrived = False
             else:
-                arrived = advanced >= self._adv_target_m
+                arrived = (self._odom_m() - self._adv_extra_odom0) \
+                    >= self._read_advance_extra_cm / 100.0
             timed_out = (
                 self._approach_start_time is not None
                 and (now - self._approach_start_time).nanoseconds * 1e-9
