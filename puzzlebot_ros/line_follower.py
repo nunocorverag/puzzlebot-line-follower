@@ -263,15 +263,23 @@ class AutonomousRacer(Node):
         # to read from the worst spot. Both tunable live.
         self.declare_parameter('detect_distance_cm', 22.0)
         self.declare_parameter('read_distance_cm', 6.0)
-        # After reaching the entry, drive this much FURTHER (by odometry) to sit ON
-        # the cross, where the side exits are visible, before asking. This is the
-        # "stop on the cross, not before it" fix.
-        self.declare_parameter('read_advance_extra_cm', 14.0)
+        # ADVANCE now ends by VISION at the FIRST row (the good read spot), not by
+        # command odometry: the commanded speed (0.06) overran the real speed
+        # (~0.046, deadband) so the odom-extra drove PAST the first row onto the
+        # SECOND (z_dist jumped 6->24), stopping skewed with no visible exits.
+        #   read_cross_jump_cm: a sudden z_dist INCREASE this large (after coming
+        #     down close) means we just crossed the first row and now see the next
+        #     one -> stop. read_advance_extra_cm now defaults to 0 (odom-extra off);
+        #     keep it >0 only if you deliberately want a small odometry nudge.
+        self.declare_parameter('read_advance_extra_cm', 0.0)
+        self.declare_parameter('read_cross_jump_cm', 8.0)
         self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
         self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
         self._read_advance_extra_cm = float(self.get_parameter('read_advance_extra_cm').value)
+        self._read_cross_jump_cm = float(self.get_parameter('read_cross_jump_cm').value)
         self._adv_at_entry = False        # phase-2 flag (reached entry, now crossing)
         self._adv_extra_odom0 = 0.0
+        self._adv_prev_dist = None         # previous-frame z_dist (cross-jump detect)
         # ADVANCE goes STRAIGHT by default (gain 0): steering by the row/lane over a
         # cross grabs the edge dashes and veers off. Raise advance_center_gain only
         # if you want gentle centring on the zebra row center (sign tunable).
@@ -391,6 +399,18 @@ class AutonomousRacer(Node):
         self.declare_parameter('align_in_place', bool(saved.get('align_in_place', True)))
         self.declare_parameter('align_tol_deg', float(saved.get('align_tol_deg', 12.0)))
         self.declare_parameter('align_timeout_s', float(saved.get('align_timeout_s', 4.0)))
+        # The zebra angle (za) ON the cross is noisy: a robot that came in STRAIGHT
+        # (small lane offset + curvature just before the cross) still reads za~-13,
+        # which is detector noise, not a real skew -> it would rotate in place for
+        # free and leave the cross crooked. Skip the square-up when we arrived
+        # straight; only align when the approach was genuinely off a curve.
+        self.declare_parameter('align_skip_when_straight', bool(saved.get('align_skip_when_straight', True)))
+        self.declare_parameter('align_straight_off', float(saved.get('align_straight_off', 0.18)))
+        self.declare_parameter('align_straight_curv', float(saved.get('align_straight_curv', 0.25)))
+        self._align_skip_when_straight = bool(self.get_parameter('align_skip_when_straight').value)
+        self._align_straight_off = float(self.get_parameter('align_straight_off').value)
+        self._align_straight_curv = float(self.get_parameter('align_straight_curv').value)
+        self._adv_came_straight = False    # set at DETECT from the pre-cross lane
         self._k_align = float(self.get_parameter('k_align').value)
         self._intersection_slow_speed = float(self.get_parameter('intersection_slow_speed').value)
         self._approach_speed = float(self.get_parameter('approach_speed').value)
@@ -879,6 +899,8 @@ class AutonomousRacer(Node):
                 self._read_distance_cm = float(p.value)
             elif p.name == 'read_advance_extra_cm':
                 self._read_advance_extra_cm = float(p.value)
+            elif p.name == 'read_cross_jump_cm':
+                self._read_cross_jump_cm = float(p.value)
             elif p.name == 'advance_center_gain':
                 self._advance_center_gain = float(p.value)
             elif p.name == 'align_in_place':
@@ -887,6 +909,12 @@ class AutonomousRacer(Node):
                 self._align_tol_deg = float(p.value)
             elif p.name == 'align_timeout_s':
                 self._align_timeout_s = float(p.value)
+            elif p.name == 'align_skip_when_straight':
+                self._align_skip_when_straight = bool(p.value)
+            elif p.name == 'align_straight_off':
+                self._align_straight_off = float(p.value)
+            elif p.name == 'align_straight_curv':
+                self._align_straight_curv = float(p.value)
             elif p.name.startswith('lane.'):
                 field = p.name[len('lane.'):]
                 if hasattr(self.lane_params, field):
@@ -937,6 +965,9 @@ class AutonomousRacer(Node):
                 'commit_straight_min_s': self._commit_straight_min_s,
                 'commit_closed_loop': self._commit_closed_loop,
                 'intersection_min_travel_m': self._intersection_min_travel_m,
+                'align_skip_when_straight': self._align_skip_when_straight,
+                'align_straight_off': self._align_straight_off,
+                'align_straight_curv': self._align_straight_curv,
                 'snapshot_interval': self._snapshot_interval,
             }, indent=2))
             zebra_path = self._config_save_path('zebra_params.json')
@@ -1318,10 +1349,21 @@ class AutonomousRacer(Node):
             self._adv_odom0 = self._odom_m()
             self._adv_target_m = max(0.0, (dist - self._read_distance_cm) / 100.0)
             self._adv_at_entry = False
+            self._adv_prev_dist = dist         # seed the cross-jump detector
             self._approach_start_time = now
+            # Did we arrive STRAIGHT? Read the pre-cross lane (last FOLLOW frame):
+            # small offset + curvature => the za skew on the cross is noise, so the
+            # WAIT square-up must NOT fire (FIX 2). Off a curve this stays False.
+            lr = self._last_lane_result
+            pre_off = abs(lr.offset_norm) if (lr is not None and lr.detected) else 0.0
+            pre_curv = abs(lr.curvature_norm) if (lr is not None and lr.detected) else 0.0
+            self._adv_came_straight = (pre_off < self._align_straight_off
+                                       and pre_curv < self._align_straight_curv)
             self.get_logger().info(
-                f'[ZEBRA] detected @ {dist:.0f}cm -> ADVANCE {self._adv_target_m*100:.0f}cm')
-            self._event('approach_start', dist_cm=round(float(dist), 1))
+                f'[ZEBRA] detected @ {dist:.0f}cm -> ADVANCE to first row '
+                f'(came_straight={self._adv_came_straight}, off={pre_off:.2f})')
+            self._event('approach_start', dist_cm=round(float(dist), 1),
+                        came_straight=bool(self._adv_came_straight))
 
         # ADVANCE -> READ once we have driven to the reading window (or timeout).
         if self.intersection_phase == 'approach':
@@ -1333,22 +1375,36 @@ class AutonomousRacer(Node):
                 self.intersection_options = [
                     o for o in ('left', 'straight', 'right')
                     if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
-            # Two-phase arrival:
-            #   phase 1: reach the ENTRY by the measured camera distance (precise),
-            #            or by odometry if the row is lost.
-            #   phase 2: drive read_advance_extra_cm FURTHER (odometry) to sit ON
-            #            the cross, then READ -- so it stops on the cross, not before.
+            # VISION-FIRST arrival at the FIRST row (the good read spot):
+            #   reached : z_dist came down to <= read_distance (simple cross), OR
+            #   crossed : z_dist, after being close, JUMPED UP (we crossed the first
+            #             row and now see the NEXT one) -- the deadband-prone odom
+            #             extra is gone, so we no longer overrun onto the 2nd row.
+            # Odometry is kept ONLY as a fallback when the row is lost (dist None)
+            # and as the overall timeout below. An optional small odom nudge stays
+            # available via read_advance_extra_cm (default 0 = off).
             advanced = self._odom_m() - self._adv_odom0
             if not self._adv_at_entry:
-                at_entry = ((dist is not None and dist <= self._read_distance_cm)
-                            or (dist is None and advanced >= self._adv_target_m))
-                if at_entry:
+                reached = dist is not None and dist <= self._read_distance_cm
+                near = (self._adv_prev_dist is not None
+                        and self._adv_prev_dist
+                        <= self._read_distance_cm + self._read_cross_jump_cm)
+                crossed = (dist is not None and near
+                           and dist - self._adv_prev_dist > self._read_cross_jump_cm)
+                lost_odom = dist is None and advanced >= self._adv_target_m
+                if reached or crossed or lost_odom:
                     self._adv_at_entry = True
                     self._adv_extra_odom0 = self._odom_m()
-                arrived = False
+                    self.get_logger().info(
+                        f'[ZEBRA] at first row by '
+                        f'{"crossed-jump" if crossed else "reached" if reached else "odom"} '
+                        f'(dist={"?" if dist is None else f"{dist:.0f}"}cm)')
+                arrived = self._adv_at_entry and self._read_advance_extra_cm <= 0.0
             else:
                 arrived = (self._odom_m() - self._adv_extra_odom0) \
                     >= self._read_advance_extra_cm / 100.0
+            if dist is not None:
+                self._adv_prev_dist = dist
             timed_out = (
                 self._approach_start_time is not None
                 and (now - self._approach_start_time).nanoseconds * 1e-9
@@ -1382,9 +1438,19 @@ class AutonomousRacer(Node):
             if self._align_start_time is None:
                 self._align_start_time = now
             align_elapsed = (now - self._align_start_time).nanoseconds * 1e-9
+            # FIX 2: the za ON the cross is noisy. If we arrived STRAIGHT (small
+            # pre-cross lane offset/curvature), the za skew is detector noise, not a
+            # real heading error -- so do NOT rotate in place for free. Only square
+            # up when the approach was genuinely off a curve.
+            skip_straight = self._align_skip_when_straight and self._adv_came_straight
             need_align = (self._align_in_place and za is not None
                           and abs(za) > self._align_tol_deg
-                          and align_elapsed < self._align_timeout_s)
+                          and align_elapsed < self._align_timeout_s
+                          and not skip_straight)
+            if skip_straight and za is not None and abs(za) > self._align_tol_deg:
+                self.get_logger().info(
+                    f'[ZEBRA] WAIT square-up SKIPPED (came straight, za={za:.0f} noise)',
+                    throttle_duration_sec=1.0)
             if need_align and self._drive_enabled and self.intersection_decision is None:
                 tw = Twist()
                 tw.angular.z = max(-self.max_w, min(self.max_w,
