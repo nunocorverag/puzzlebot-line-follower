@@ -462,6 +462,21 @@ class AutonomousRacer(Node):
         self._lane_Minv = None
         self._lane_frame_size = None
 
+        # Heading hysteresis near a cross. When the BEV fit confidence drops in
+        # the slow-zone (zebra in view) we do NOT fall through to the legacy ROI
+        # detector (which can lock onto the zebra / side lines and jerk). Instead
+        # we HOLD the last confident steering target and drive straight on it for
+        # up to lane_hold_s, giving the anti-zebra filter time to re-acquire the
+        # continuous line through the transition. No-op away from a cross.
+        self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
+        self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
+        self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
+        self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
+        self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
+        self._lane_hold_s = float(self.get_parameter('lane_hold_s').value)
+        self._lane_hold_center_x = None  # last confident steering center (orig px)
+        self._lane_hold_time = None      # when it was captured (for the timeout)
+
         # ---------------------------------------------------------
         # Diagnostics: status HUD + optional controller CSV log.
         # ---------------------------------------------------------
@@ -805,6 +820,12 @@ class AutonomousRacer(Node):
                 self._curve_slow_gain = float(p.value)
             elif p.name == 'curve_min_scale':
                 self._curve_min_scale = float(p.value)
+            elif p.name == 'lane_hold_near_cross':
+                self._lane_hold_near_cross = bool(p.value)
+            elif p.name == 'lane_hold_conf':
+                self._lane_hold_conf = float(p.value)
+            elif p.name == 'lane_hold_s':
+                self._lane_hold_s = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -878,6 +899,9 @@ class AutonomousRacer(Node):
                 'ff_gain': self.ff_gain,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
+                'lane_hold_near_cross': self._lane_hold_near_cross,
+                'lane_hold_conf': self._lane_hold_conf,
+                'lane_hold_s': self._lane_hold_s,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -1887,11 +1911,36 @@ class AutonomousRacer(Node):
                 steering_far_x = lane_result.lane_center_far_x_orig
                 lane_curvature = abs(lane_result.curvature_norm)
                 self.time_line_lost = None
+                # Capture the last CONFIDENT heading for the near-cross hysteresis.
+                if lane_result.confidence >= self._lane_hold_conf:
+                    self._lane_hold_center_x = steering_center_x
+                    self._lane_hold_time = now
                 self.get_logger().info(
                     f"[LANE] off={lane_result.offset_norm:+.2f} "
                     f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
                     throttle_duration_sec=1.0,
                 )
+
+        # Heading hysteresis: in the slow-zone (zebra in view) the BEV fit can
+        # briefly lose confidence as the cross enters the ROI. Rather than drop to
+        # the legacy ROI detector (which would lock onto the zebra/side lines and
+        # jerk the robot), HOLD the last confident steering target and drive
+        # straight on it for up to lane_hold_s. The anti-zebra filter keeps the
+        # continuous line, so this just bridges the brief dropout. No-op away from
+        # a cross (near_intersection is False there).
+        if (not lane_ok and self._lane_hold_near_cross and self._near_intersection
+                and self._lane_hold_center_x is not None
+                and self._lane_hold_time is not None
+                and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_s):
+            lane_ok = True
+            steering_center_x = self._lane_hold_center_x
+            steering_far_x = None        # no anticipation -> go straight
+            lane_curvature = 0.0
+            self.time_line_lost = None
+            self.get_logger().warn(
+                f"[LANE] hold heading near cross (cx={steering_center_x:.0f})",
+                throttle_duration_sec=0.5,
+            )
 
         # Fallback path: legacy two-ROI detector. Also used during approach and
         # whenever the bird's-eye view is not confident (e.g. warp not yet tuned).

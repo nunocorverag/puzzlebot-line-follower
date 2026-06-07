@@ -83,6 +83,21 @@ class LaneParams:
     min_fill_pct: int = 1          # below this mask fill the warped view is empty
     max_fill_pct: int = 55         # above this it is noise / over-binarized
 
+    # --- Anti-zebra row reject (key guard at the intersection approach) -----
+    # The continuous lane line is VERTICAL in the warp, so it fills only a few
+    # px per row (~2.2 cm / lane width). The zebra crossing is a TRANSVERSAL bar
+    # of dashes that spans almost the whole warp width. Before the histogram /
+    # sliding window we project the mask onto Y (count px per row) and zero out
+    # any row whose fill exceeds ``zebra_row_fill_pct`` of the warp width: the
+    # dashed cross row vanishes, the continuous line survives, so the follower
+    # no longer locks onto the zebra as it approaches the intersection. On a
+    # normal straight/curve no row saturates, so this is a no-op there.
+    zebra_row_reject: int = 1      # 1 = enable the transversal-row filter
+    zebra_row_fill_pct: int = 40   # row fill (% of warp_w) that marks a row as
+                                   # a transversal zebra bar -> erased
+    zebra_row_close_px: int = 9    # horizontal close (px) to bridge dash gaps
+                                   # when measuring row fill (0 = off)
+
     # --- Dual-line (follow lane CENTER between the two black borders) -------
     # The lane has two black border lines; tracking a single line drifts to one
     # border (the "goes to the right line on curves" bug). With dual_line we find
@@ -133,9 +148,11 @@ class LaneResult:
     lane_center_x_orig: float | None = None  # eval point mapped to original img
     lane_center_far_x_orig: float | None = None  # lookahead point, original img
     lane_points_orig: list = field(default_factory=list)  # fitted curve, orig
-    warped_mask: np.ndarray | None = None     # debug
+    warped_mask: np.ndarray | None = None     # debug (post anti-zebra filter)
+    warped_mask_raw: np.ndarray | None = None  # debug (pre anti-zebra filter)
     window_centers: list = field(default_factory=list)    # debug (warped px)
     fill_pct: float = 0.0
+    zebra_rows_rejected: int = 0    # rows erased by the anti-zebra filter
 
 
 def save_lane_params(params: LaneParams, path) -> None:
@@ -234,6 +251,39 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     kernel = np.ones((3, 3), np.uint8)
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+
+
+def reject_transverse_rows(mask: np.ndarray, params: LaneParams):
+    """Erase horizontal (transversal) zebra bars from the warped mask.
+
+    The continuous lane line is near-vertical in the bird's-eye view, so it
+    fills only a few px per row. The zebra crossing is a row of dashes that
+    spans almost the whole warp width. We project the mask onto Y (px count per
+    row); rows whose fill exceeds ``zebra_row_fill_pct`` of the width are zeroed,
+    so the dashed cross disappears while the continuous line survives. A small
+    horizontal close first bridges the dash gaps so a dashed (not solid) bar
+    still registers as dense.
+
+    Returns ``(clean_mask, rows_rejected)``. A straight/curve never saturates a
+    row, so this is a no-op there.
+    """
+    if not getattr(params, "zebra_row_reject", 0):
+        return mask, 0
+    h, w = mask.shape[:2]
+    thresh = max(1, int(w * getattr(params, "zebra_row_fill_pct", 40) / 100.0))
+    close_px = int(getattr(params, "zebra_row_close_px", 0))
+    if close_px > 0:
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (close_px | 1, 1))
+        measured = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    else:
+        measured = mask
+    row_fill = np.count_nonzero(measured, axis=1)
+    dense = row_fill >= thresh
+    if not dense.any():
+        return mask, 0
+    clean = mask.copy()
+    clean[dense, :] = 0
+    return clean, int(np.count_nonzero(dense))
 
 
 # ---------------------------------------------------------------------------
@@ -390,10 +440,16 @@ def analyze_lane(frame: np.ndarray, params: LaneParams,
 
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     warped_gray = _warp(gray, m, params)
-    mask = warped_black_mask(warped_gray, params)
+    raw_mask = warped_black_mask(warped_gray, params)
+
+    # Anti-zebra: drop the transversal dash row(s) BEFORE the histogram / sliding
+    # window so the follower stays on the continuous (vertical) line and does not
+    # lock onto the zebra as it approaches the intersection.
+    mask, rows_rejected = reject_transverse_rows(raw_mask, params)
 
     fill_pct = 100.0 * float(cv2.countNonZero(mask)) / float(mask.size)
-    result = LaneResult(detected=False, warped_mask=mask, fill_pct=fill_pct)
+    result = LaneResult(detected=False, warped_mask=mask, warped_mask_raw=raw_mask,
+                        fill_pct=fill_pct, zebra_rows_rejected=rows_rejected)
     if not (params.min_fill_pct <= fill_pct <= params.max_fill_pct):
         return result
 

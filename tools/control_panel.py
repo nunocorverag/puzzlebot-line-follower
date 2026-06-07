@@ -78,6 +78,13 @@ GROUPS = [
         ("lane.window_half_w_pct",   "i", 1,      "sliding window half width"),
         ("lane.min_pix",             "i", 10,     "pixels to recenter window"),
     ]),
+    ("AntiZebra", [
+        ("lane.zebra_row_reject",    "i", 1,      "anti-zebra filter on/off"),
+        ("lane.zebra_row_fill_pct",  "i", 1,      "row fill %% = transversal bar"),
+        ("lane.zebra_row_close_px",  "i", 1,      "close px to bridge dash gaps"),
+        ("lane_hold_conf",           "f", 0.05,   "conf to refresh held heading"),
+        ("lane_hold_s",              "f", 0.1,    "max s to hold heading at cross"),
+    ]),
     ("Warp", [
         ("lane.src_top_y_pct",       "i", 1,      "warp top y"),
         ("lane.src_top_half_w_pct",  "i", 1,      "warp top half width"),
@@ -109,6 +116,8 @@ DEFAULTS = {
     "lane.src_bot_y_pct": 95, "lane.src_bot_half_w_pct": 42,
     "lane.base_search_half_w_pct": 26, "lane.continuity_search_half_w_pct": 12,
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
+    "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
+    "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
 }
 
 
