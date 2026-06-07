@@ -324,11 +324,16 @@ class AutonomousRacer(Node):
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
         self.declare_parameter('commit_duration', float(saved.get('commit_duration', 2.0)))
-        self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 1.5)))
+        self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 5.0)))
         # Closed-loop commit: keep turning/crossing until the lane is RE-ACQUIRED
         # (after a min time to clear the cross), capped by commit_duration above so
         # a missed line can't spin forever. 0 = old pure open-loop (time only).
         self.declare_parameter('commit_min_s', float(saved.get('commit_min_s', 0.8)))
+        # STRAIGHT needs a longer minimum: it must CROSS the whole zebra (~26 cm)
+        # before handing back to FOLLOW, or it re-acquires a side line of the cross
+        # mid-way and turns instead of going through. Only affects 'straight'; the
+        # left/right turn timing is unchanged so curves are not touched.
+        self.declare_parameter('commit_straight_min_s', float(saved.get('commit_straight_min_s', 3.0)))
         self.declare_parameter('commit_closed_loop', bool(saved.get('commit_closed_loop', True)))
         self.declare_parameter('intersection_min_travel_m', float(saved.get('intersection_min_travel_m', 0.25)))
         # Square-up-in-place: at the cross, if we stopped skewed (came off a curve)
@@ -348,6 +353,7 @@ class AutonomousRacer(Node):
         self._commit_duration = float(self.get_parameter('commit_duration').value)
         self._commit_duration_straight = float(self.get_parameter('commit_duration_straight').value)
         self._commit_min_s = float(self.get_parameter('commit_min_s').value)
+        self._commit_straight_min_s = float(self.get_parameter('commit_straight_min_s').value)
         self._commit_closed_loop = bool(self.get_parameter('commit_closed_loop').value)
         self._intersection_min_travel_m = float(self.get_parameter('intersection_min_travel_m').value)
         self._align_in_place = bool(self.get_parameter('align_in_place').value)
@@ -750,6 +756,8 @@ class AutonomousRacer(Node):
                 self._intersection_min_travel_m = float(p.value)
             elif p.name == 'commit_min_s':
                 self._commit_min_s = float(p.value)
+            elif p.name == 'commit_straight_min_s':
+                self._commit_straight_min_s = float(p.value)
             elif p.name == 'commit_closed_loop':
                 self._commit_closed_loop = bool(p.value)
             elif p.name == 'align_in_place':
@@ -800,6 +808,7 @@ class AutonomousRacer(Node):
                 'commit_duration': self._commit_duration,
                 'commit_duration_straight': self._commit_duration_straight,
                 'commit_min_s': self._commit_min_s,
+                'commit_straight_min_s': self._commit_straight_min_s,
                 'commit_closed_loop': self._commit_closed_loop,
                 'intersection_min_travel_m': self._intersection_min_travel_m,
                 'snapshot_interval': self._snapshot_interval,
@@ -1231,10 +1240,11 @@ class AutonomousRacer(Node):
                 return True
 
             self.commit_direction = self.intersection_decision
-            dur = (self._commit_duration_straight
-                   if self.commit_direction == 'straight' else self._commit_duration)
+            is_straight = self.commit_direction == 'straight'
+            dur = self._commit_duration_straight if is_straight else self._commit_duration
+            min_s = self._commit_straight_min_s if is_straight else self._commit_min_s
             self.commit_until = now + Duration(seconds=dur)
-            self._commit_min_until = now + Duration(seconds=self._commit_min_s)
+            self._commit_min_until = now + Duration(seconds=min_s)
             self._dist_since_commit = 0.0
             self._approach_start_time = None
             self.intersection_phase = None
