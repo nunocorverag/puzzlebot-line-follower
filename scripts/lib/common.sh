@@ -59,15 +59,33 @@ pull_and_clean_session() {
   local n
   n=$(ssh -o BatchMode=yes "${JETSON_USER}@${JETSON_HOST}" \
         "ls -1 '${remote_abs}' 2>/dev/null | wc -l" 2>/dev/null || echo 0)
-  if [ "${n}" -gt 0 ]; then
-    rsync -az "${JETSON_USER}@${JETSON_HOST}:${remote_abs}/" "${local_dest}/"
-    echo "session: ${n} files -> ${local_dest}"
-  else
+  if [ "${n}" -le 0 ]; then
     echo "session: nothing recorded (no files in ${remote_abs})"
     rmdir "${local_dest}" 2>/dev/null || true
+    return 0
   fi
-  ssh -o BatchMode=yes "${JETSON_USER}@${JETSON_HOST}" \
-    "rm -rf '${remote_abs}' 2>/dev/null; true" >/dev/null 2>&1 || true
+
+  # Pull first; the Jetson copy is the ONLY copy until rsync confirms it landed.
+  # RoboNet WiFi is flaky, so NEVER delete the remote unless (1) rsync exited 0
+  # AND (2) files actually arrived locally. Otherwise keep the remote and warn so
+  # the session can be re-pulled instead of being lost forever.
+  if rsync -az "${JETSON_USER}@${JETSON_HOST}:${remote_abs}/" "${local_dest}/"; then
+    local got
+    got=$(find "${local_dest}" -type f 2>/dev/null | wc -l)
+    if [ "${got}" -gt 0 ]; then
+      echo "session: ${n} files -> ${local_dest} (${got} landed)"
+      ssh -o BatchMode=yes "${JETSON_USER}@${JETSON_HOST}" \
+        "rm -rf '${remote_abs}' 2>/dev/null; true" >/dev/null 2>&1 || true
+    else
+      echo "session: WARNING rsync ok but 0 files landed in ${local_dest};" \
+           "keeping remote ${remote_abs} (re-run to retry)." >&2
+      return 1
+    fi
+  else
+    echo "session: WARNING rsync FAILED (WiFi?); keeping remote ${remote_abs}" \
+         "so it is not lost (re-run to retry)." >&2
+    return 1
+  fi
 }
 
 # Free the CSI camera (single-owner) WITHOUT killing the micro-ROS agent, so
