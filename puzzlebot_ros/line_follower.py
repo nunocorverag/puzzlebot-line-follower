@@ -262,7 +262,7 @@ class AutonomousRacer(Node):
         # exits are actually visible -- instead of stopping at the entry and trying
         # to read from the worst spot. Both tunable live.
         self.declare_parameter('detect_distance_cm', 22.0)
-        self.declare_parameter('read_distance_cm', 4.0)
+        self.declare_parameter('read_distance_cm', 8.0)
         self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
         self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
         # During ADVANCE the lane follower FLAKES over the cross (it grabs the side
@@ -293,6 +293,7 @@ class AutonomousRacer(Node):
         # arriving (no motor agent / encoders), we fall back to integrating the
         # commanded speed in the control loop. Mark a point and read the delta.
         self._odom_dist = 0.0             # integrated from the COMMAND (reliable)
+        self._last_odom_t = None          # for real-dt integration (loop rate varies)
         self._robot_vel_fresh_t = None    # last time /robot_vel arrived (telemetry)
         self._robot_vel_last_x = 0.0
         self.create_subscription(Twist, '/robot_vel', self._robot_vel_cb, 10)
@@ -718,12 +719,16 @@ class AutonomousRacer(Node):
         self._robot_vel_fresh_t = self.get_clock().now()
         self._robot_vel_last_x = float(msg.linear.x)
 
-    def _odom_tick(self, cmd, loop_dt):
-        """Integrate the COMMANDED forward speed into travelled distance. The robot
-        tracks the command well enough (verified: z_dist fell as commanded), and
-        this never stalls -- unlike the measured /robot_vel, which read 0."""
-        if 0.0 < loop_dt < 0.5:
-            self._odom_dist += abs(float(cmd.linear.x)) * loop_dt
+    def _odom_tick(self, now, cmd):
+        """Integrate the COMMANDED forward speed into travelled distance, using the
+        REAL elapsed time between calls (the loop rate varies a lot -- the debug
+        composite stream slows it well below 30 Hz -- so a fixed dt under-counted
+        ~3x and the ADVANCE never reached its target -> timeout -> never asked)."""
+        if self._last_odom_t is not None:
+            dt = (now - self._last_odom_t).nanoseconds * 1e-9
+            if 0.0 < dt < 0.5:
+                self._odom_dist += abs(float(cmd.linear.x)) * dt
+        self._last_odom_t = now
 
     def _odom_m(self):
         return self._odom_dist
@@ -1272,8 +1277,15 @@ class AutonomousRacer(Node):
                 self.intersection_options = [
                     o for o in ('left', 'straight', 'right')
                     if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
+            # Arrive at the reading window by the MEASURED camera distance while we
+            # can see the row (real, precise); fall back to odometry only if the row
+            # is lost. read_distance_cm tunes how deep we go: high = stop before the
+            # cross; low = chase the row across the first dashes onto the cross.
             advanced = self._odom_m() - self._adv_odom0
-            arrived = advanced >= self._adv_target_m
+            if dist is not None:
+                arrived = dist <= self._read_distance_cm
+            else:
+                arrived = advanced >= self._adv_target_m
             timed_out = (
                 self._approach_start_time is not None
                 and (now - self._approach_start_time).nanoseconds * 1e-9
@@ -2138,7 +2150,7 @@ class AutonomousRacer(Node):
         self.cmd_pub.publish(cmd)
 
         # Odometry: integrate the commanded speed into travelled distance.
-        self._odom_tick(cmd, 0.033)
+        self._odom_tick(now, cmd)
 
         # Distance proxy for the double-intersection guard: integrate commanded
         # speed at the timer rate (30 Hz). Stays huge until a commit resets it.
