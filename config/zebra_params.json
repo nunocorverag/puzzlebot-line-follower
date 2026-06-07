@@ -19,5 +19,5 @@
   "option_align_deg": 18.0,
   "stable_frames_needed": 3,
   "slow_distance_cm": 30.0,
-  "stop_distance_cm": 10.0
+  "stop_distance_cm": 6.0
 }

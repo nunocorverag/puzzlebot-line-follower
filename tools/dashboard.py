@@ -29,7 +29,7 @@ def c(code, s):
 
 
 GREEN, YELLOW, RED, CYAN, ORANGE, GREY, BOLD = "32", "33", "31", "36", "38;5;208", "90", "1"
-STAGES = ["FOLLOW", "APPROACH", "WAIT", "COMMIT"]
+STAGES = ["FOLLOW", "ADVANCE", "READ", "COMMIT"]
 
 
 def stage_of(d):
@@ -37,9 +37,9 @@ def stage_of(d):
         return "COMMIT"
     ph = d.get("phase")
     if ph == "wait":
-        return "WAIT"
+        return "READ"
     if ph == "approach":
-        return "APPROACH"
+        return "ADVANCE"
     return "FOLLOW"
 
 
@@ -62,11 +62,13 @@ def render(d, last_seen, log):
     cells = []
     for s in STAGES:
         if s == cur:
-            col = {"FOLLOW": GREEN, "APPROACH": YELLOW, "WAIT": RED, "COMMIT": ORANGE}[s]
+            col = {"FOLLOW": GREEN, "ADVANCE": YELLOW, "READ": RED, "COMMIT": ORANGE}[s]
             cells.append(c(BOLD, c(col, f"[{s}]")))
         else:
             cells.append(c(GREY, f" {s} "))
     out.append("  STATE:  " + c(GREY, " -> ").join(cells))
+    if cur == "ADVANCE" and d.get("advance") is not None:
+        out.append(f"          advancing {d.get('advance')}/{d.get('advance_target')} cm to read window")
     raw = d.get("state", "?")
     drive = c(GREEN, "ON") if d.get("drive") else c(RED, "off")
     light = d.get("light", "?")

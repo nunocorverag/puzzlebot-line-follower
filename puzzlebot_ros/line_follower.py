@@ -252,9 +252,21 @@ class AutonomousRacer(Node):
         self._zebra_frame_size = None
         self._zebra_stable = 0
         self.zebra_result = None
-        self._zebra_opt_votes = {}        # exit -> frames seen during APPROACH
+        self._zebra_opt_votes = {}        # exit -> frames seen during ADVANCE
         self.declare_parameter('zebra_opt_min_votes', 2)
         self._zebra_opt_min_votes = int(self.get_parameter('zebra_opt_min_votes').value)
+        # DETECT -> ADVANCE -> READ flow (odometry-based). On the first stable sight
+        # of the entry row within detect_distance, the robot freezes a travel target
+        # and ADVANCES that distance by odometry to the READING window (read_distance
+        # to the entry; can be small/negative = on top of the cross) where the side
+        # exits are actually visible -- instead of stopping at the entry and trying
+        # to read from the worst spot. Both tunable live.
+        self.declare_parameter('detect_distance_cm', 22.0)
+        self.declare_parameter('read_distance_cm', 4.0)
+        self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
+        self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
+        self._adv_odom0 = 0.0             # odometry mark at DETECT
+        self._adv_target_m = 0.0          # distance to advance to the reading window
 
         # Testing aid: ignore the traffic-light supervisor so the robot drives
         # without needing to see a real GREEN light.
@@ -268,6 +280,16 @@ class AutonomousRacer(Node):
         self.declare_parameter('start_driving', False)
         self._drive_enabled = bool(self.get_parameter('start_driving').value)
         self.create_subscription(Bool, '/drive_enable', self._drive_enable_cb, 10)
+
+        # Odometry: a monotonically-growing travelled-distance estimate (metres),
+        # used to advance/cross exact distances at intersections independent of the
+        # camera. Primary source = the robot's measured /robot_vel; if that is not
+        # arriving (no motor agent / encoders), we fall back to integrating the
+        # commanded speed in the control loop. Mark a point and read the delta.
+        self._odom_dist = 0.0
+        self._robot_vel_last_t = None     # last /robot_vel msg time (for dt)
+        self._robot_vel_fresh_t = None    # last time /robot_vel arrived (freshness)
+        self.create_subscription(Twist, '/robot_vel', self._robot_vel_cb, 10)
 
         # ---------------------------------------------------------
         # Per-lane persistent anchors for the top ROI's 3 lines.
@@ -683,6 +705,27 @@ class AutonomousRacer(Node):
         self._drive_enabled = bool(msg.data)
         self.get_logger().info(f"[DRIVE] enabled={self._drive_enabled}")
 
+    def _robot_vel_cb(self, msg):
+        """Integrate measured forward speed into the travelled-distance estimate."""
+        now = self.get_clock().now()
+        if self._robot_vel_last_t is not None:
+            dt = (now - self._robot_vel_last_t).nanoseconds * 1e-9
+            if 0.0 < dt < 0.5:                       # ignore stalls/jumps
+                self._odom_dist += abs(float(msg.linear.x)) * dt
+        self._robot_vel_last_t = now
+        self._robot_vel_fresh_t = now
+
+    def _odom_tick_fallback(self, now, cmd, loop_dt):
+        """When /robot_vel is not arriving, integrate the COMMANDED speed so the
+        odometry estimate keeps advancing (less precise, but never stalls)."""
+        fresh = (self._robot_vel_fresh_t is not None
+                 and (now - self._robot_vel_fresh_t).nanoseconds * 1e-9 < 0.5)
+        if not fresh and 0.0 < loop_dt < 0.5:
+            self._odom_dist += abs(float(cmd.linear.x)) * loop_dt
+
+    def _odom_m(self):
+        return self._odom_dist
+
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
         aliases = {
@@ -775,6 +818,10 @@ class AutonomousRacer(Node):
                 self._commit_closed_loop = bool(p.value)
             elif p.name == 'stream_debug':
                 self._stream_debug = bool(p.value)
+            elif p.name == 'detect_distance_cm':
+                self._detect_distance_cm = float(p.value)
+            elif p.name == 'read_distance_cm':
+                self._read_distance_cm = float(p.value)
             elif p.name == 'align_in_place':
                 self._align_in_place = bool(p.value)
             elif p.name == 'align_tol_deg':
@@ -844,9 +891,9 @@ class AutonomousRacer(Node):
         if effective == "RED":
             return ("STOP: red light", (0, 0, 255))
         if self.intersection_phase == 'wait':
-            return ("WAIT: decision", (0, 0, 255))
+            return ("READ: decision", (0, 0, 255))
         if self.intersection_phase == 'approach':
-            return ("APPROACH", (0, 255, 255))
+            return ("ADVANCE", (0, 255, 255))
         if self.commit_direction is not None:
             return (f"COMMIT {self.commit_direction}", (255, 160, 0))
         if self.time_line_lost is not None:
@@ -1030,6 +1077,11 @@ class AutonomousRacer(Node):
             'phase': self.intersection_phase,
             'commit': self.commit_direction,
             'options': list(self.intersection_options),
+            'odom': round(self._odom_m(), 2),
+            'advance': (round((self._odom_m() - self._adv_odom0) * 100, 0)
+                        if self.intersection_phase == 'approach' else None),
+            'advance_target': (round(self._adv_target_m * 100, 0)
+                               if self.intersection_phase == 'approach' else None),
             'zebra': zebra,
             'lane': {
                 'off': round(float(lr.offset_norm), 2) if lr else None,
@@ -1191,48 +1243,55 @@ class AutonomousRacer(Node):
             zres is not None and zres.seen and dist is not None
             and dist <= zp.slow_distance_cm)
 
-        # Enter APPROACH once the zebra is seen and within slowing range.
+        # DETECT: first stable sight of the entry row within detect range -> start
+        # ADVANCE. Freeze a travel target from the MEASURED distance now, then drive
+        # that far by ODOMETRY to the reading window, so we no longer need the row
+        # in view while moving onto the cross (it leaves the camera when close).
         if (zres is not None and zres.seen and dist is not None
-                and dist <= zp.slow_distance_cm and self.intersection_phase is None):
-            self.intersection_phase = 'approach'
+                and dist <= self._detect_distance_cm and self.intersection_phase is None):
+            self.intersection_phase = 'approach'   # ADVANCE
             self._zebra_opt_votes = {}
+            self._adv_odom0 = self._odom_m()
+            self._adv_target_m = max(0.0, (dist - self._read_distance_cm) / 100.0)
             self._approach_start_time = now
-            self.get_logger().info(f'[ZEBRA] seen @ {dist:.0f}cm -> APPROACH')
+            self.get_logger().info(
+                f'[ZEBRA] detected @ {dist:.0f}cm -> ADVANCE {self._adv_target_m*100:.0f}cm')
             self._event('approach_start', dist_cm=round(float(dist), 1))
 
-        # APPROACH -> WAIT by distance (or timeout back to FOLLOW).
+        # ADVANCE -> READ once we have driven to the reading window (or timeout).
         if self.intersection_phase == 'approach':
-            # Vote options over the whole approach (a single frame flaps; an exit
-            # seen in >= zebra_opt_min_votes frames sticks). Fixes "saw left but
-            # not right": once right is detected in any couple of frames it stays.
+            # Vote options over the whole advance (a single frame flaps; an exit
+            # seen in >= zebra_opt_min_votes frames sticks).
             if zres is not None:
                 for o in zres.options:
                     self._zebra_opt_votes[o] = self._zebra_opt_votes.get(o, 0) + 1
                 self.intersection_options = [
                     o for o in ('left', 'straight', 'right')
                     if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
-            arrived = dist is not None and dist <= zp.stop_distance_cm
+            advanced = self._odom_m() - self._adv_odom0
+            arrived = advanced >= self._adv_target_m
             timed_out = (
                 self._approach_start_time is not None
                 and (now - self._approach_start_time).nanoseconds * 1e-9
                 > self._approach_timeout_s)
             if arrived:
-                self.intersection_phase = 'wait'
+                self.intersection_phase = 'wait'   # READ
                 self.intersection_pending = True
                 self.intersection_decision = None
                 self.last_prompt_time = None
                 self._approach_start_time = None
                 self._align_start_time = None
                 self.get_logger().info(
-                    f'[ZEBRA] at cross ({dist:.0f}cm) -> WAIT')
-                self._event('wait_start', dist_cm=round(float(dist), 1),
+                    f'[ZEBRA] at reading window (advanced {advanced*100:.0f}cm) -> READ')
+                self._event('wait_start',
+                            dist_cm=None if dist is None else round(float(dist), 1),
                             voted_options=list(self.intersection_options),
                             option_votes=dict(self._zebra_opt_votes))
             elif timed_out:
                 self.intersection_phase = None
                 self._approach_start_time = None
                 self.intersection_cooldown_until = now + Duration(seconds=2.0)
-                self.get_logger().warn('[ZEBRA] APPROACH timed out -> FOLLOW')
+                self.get_logger().warn('[ZEBRA] ADVANCE timed out -> FOLLOW')
                 self._event('approach_timeout')
 
         # WAIT: stopped at the cross. First SQUARE UP in place if we arrived skewed
@@ -1999,25 +2058,15 @@ class AutonomousRacer(Node):
         # the legacy centering above already handles lateral offset.
         if self.intersection_phase == 'approach':
             if self._use_zebra_bev:
-                # Keep the LANE steering (computed above) so the robot stays on the
-                # line while creeping to the cross; just brake by distance. NOTE: a
-                # pure zebra-angle "square-up" was tried and made it WORSE -- it
-                # turned the wrong way and, with no lateral control, arced off the
-                # cross and lost the zebra (session 191531). Lane steering at least
-                # keeps it on the line into the cross; the option classifier is now
-                # robust to a small lateral offset (measured relative to the cross
-                # center), so we no longer need to fight for a perfect pose here.
-                zr = self.zebra_result
-                dist = zr.distance_cm if zr is not None else None
-                zp = self.zebra_params
-                if dist is not None and dist <= zp.stop_distance_cm:
-                    base_linear_x = 0.0
-                else:
-                    base_linear_x = self._approach_speed
+                # ADVANCE: keep the LANE steering (computed above) and just creep
+                # forward; the phase machine ends ADVANCE by ODOMETRY (at the
+                # reading window), so we drive at approach_speed the whole time and
+                # do NOT brake on the camera distance (the row leaves view up close).
+                base_linear_x = self._approach_speed
+                advanced = self._odom_m() - self._adv_odom0
                 self.get_logger().info(
-                    f"[ZEBRA] APPROACH creep: V={base_linear_x:.3f} "
-                    f"W={target_angular_z:.2f} dist="
-                    f"{'?' if dist is None else f'{dist:.0f}'}cm",
+                    f"[ZEBRA] ADVANCE: V={base_linear_x:.3f} W={target_angular_z:.2f} "
+                    f"adv={advanced*100:.0f}/{self._adv_target_m*100:.0f}cm",
                     throttle_duration_sec=1.0,
                 )
             else:
@@ -2074,6 +2123,10 @@ class AutonomousRacer(Node):
             self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
 
         self.cmd_pub.publish(cmd)
+
+        # Odometry fallback: if /robot_vel is not arriving, integrate the command
+        # so the travelled-distance estimate keeps advancing.
+        self._odom_tick_fallback(now, cmd, 0.033)
 
         # Distance proxy for the double-intersection guard: integrate commanded
         # speed at the timer rate (30 Hz). Stays huge until a commit resets it.
