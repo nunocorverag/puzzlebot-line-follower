@@ -165,6 +165,12 @@ class AutonomousRacer(Node):
                 fps=stream_fps, log=self.get_logger().info,
             )
 
+        # Live debug view: stream the full composite (camera + lane BEV + zebra
+        # BEV/mask + overlays) instead of just the camera, so a single video shows
+        # everything the robot sees. Toggle live with /autonomous_racer stream_debug.
+        self.declare_parameter('stream_debug', True)
+        self._stream_debug = bool(self.get_parameter('stream_debug').value)
+
         self.declare_parameter('show_window', False)
         requested_window = bool(self.get_parameter('show_window').value)
         self.show_window = requested_window and bool(os.environ.get('DISPLAY'))
@@ -767,6 +773,8 @@ class AutonomousRacer(Node):
                 self._commit_straight_min_s = float(p.value)
             elif p.name == 'commit_closed_loop':
                 self._commit_closed_loop = bool(p.value)
+            elif p.name == 'stream_debug':
+                self._stream_debug = bool(p.value)
             elif p.name == 'align_in_place':
                 self._align_in_place = bool(p.value)
             elif p.name == 'align_tol_deg':
@@ -931,6 +939,41 @@ class AutonomousRacer(Node):
             base = Path(__file__).resolve().parents[1]
         return base / 'debug_dataset' / 'follower_session'
 
+    def _build_debug_composite(self, frame):
+        """[camera+HUD | lane BEV (mask+windows+fit) | wide zebra BEV (row+why)].
+
+        Fixed panel sizes (black placeholders when a result is missing) so the
+        composite keeps a CONSTANT size every frame -- required for the H264
+        encoder, and what lets us watch everything the robot sees live.
+        """
+        h = frame.shape[0]
+        panels = [frame]
+
+        lp = self.lane_params
+        lr = self._last_lane_result
+        if lr is not None and lr.warped_mask is not None:
+            bev = draw_birdseye_debug(lr, lp)
+        else:
+            bev = np.zeros((lp.warp_h, lp.warp_w, 3), np.uint8)
+            cv2.putText(bev, 'lane: --', (8, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                        (120, 120, 120), 1)
+        s = h / float(bev.shape[0])
+        panels.append(cv2.resize(bev, (max(1, int(bev.shape[1] * s)), h)))
+
+        if self._use_zebra_bev:
+            zp = self.zebra_params
+            if self._zebra_M is not None:
+                zbev = cv2.warpPerspective(frame, self._zebra_M, (zp.warp_w, zp.warp_h))
+                if self.zebra_result is not None:
+                    zbev = draw_zebra_overlay(zbev, self.zebra_result)
+            else:
+                zbev = np.zeros((zp.warp_h, zp.warp_w, 3), np.uint8)
+                cv2.putText(zbev, 'zebra: --', (8, 24), cv2.FONT_HERSHEY_SIMPLEX,
+                            0.6, (120, 120, 120), 1)
+            s = h / float(zbev.shape[0])
+            panels.append(cv2.resize(zbev, (max(1, int(zbev.shape[1] * s)), h)))
+        return cv2.hconcat(panels)
+
     def _maybe_snapshot(self, now, frame):
         if not self._recording or self._snapshot_interval <= 0:
             return
@@ -942,28 +985,8 @@ class AutonomousRacer(Node):
             d.mkdir(parents=True, exist_ok=True)
             stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')[:-3]
             state = self._phase_label()[0].split(':')[0].replace(' ', '')
-            # Glue the bird's-eye debug (mask + sliding windows + fit) beside the
-            # annotated frame so a pulled snapshot shows exactly what the lane
-            # search saw -- the only way to diagnose curve failures offline.
-            out = frame
-            lr = self._last_lane_result
-            if lr is not None and lr.warped_mask is not None:
-                bev = draw_birdseye_debug(lr, self.lane_params)
-                scale = frame.shape[0] / float(bev.shape[0])
-                bev = cv2.resize(bev, (int(bev.shape[1] * scale), frame.shape[0]))
-                out = cv2.hconcat([frame, bev])
-            # Glue the WIDE zebra BEV with the detected row, so a recorded session
-            # shows exactly what the zebra detector saw (the lane BEV above is a
-            # different, narrower warp and does not show the zebra detection).
-            if (self._use_zebra_bev and self._zebra_M is not None
-                    and self.zebra_result is not None):
-                zp = self.zebra_params
-                zbev = cv2.warpPerspective(frame, self._zebra_M, (zp.warp_w, zp.warp_h))
-                zbev = draw_zebra_overlay(zbev, self.zebra_result)
-                zscale = frame.shape[0] / float(zbev.shape[0])
-                zbev = cv2.resize(zbev, (int(zbev.shape[1] * zscale), frame.shape[0]))
-                out = cv2.hconcat([out, zbev])
-            cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'), out)
+            cv2.imwrite(str(d / f'follow_{stamp}_{state}.jpg'),
+                        self._build_debug_composite(frame))
             self._snap_count += 1
         except OSError as exc:
             self.get_logger().error(f'[REC] snapshot failed: {exc}')
@@ -1059,12 +1082,24 @@ class AutonomousRacer(Node):
             f"{self._commit_min_s:.2f}", f"{self._commit_turn_w:.2f}"])
 
     def _publish_stream_frame(self, frame):
-        """Throttle and push the annotated frame to the active stream (MJPEG or H264)."""
+        """Throttle and push the annotated frame to the active stream (MJPEG or H264).
+
+        With stream_debug on, push the full debug composite (camera + lane BEV +
+        zebra BEV) so the live stream shows everything the robot sees, not just the
+        camera. The composite has a constant size, so the H264 encoder is happy.
+        """
         now = self.get_clock().now()
         if (self._last_stream_time is not None
                 and (now - self._last_stream_time).nanoseconds * 1e-9 < self._stream_min_period):
             return
         self._last_stream_time = now
+
+        if self._stream_debug:
+            try:
+                frame = self._build_debug_composite(frame)
+            except Exception as exc:  # never let the overlay kill the stream
+                self.get_logger().warn(f'[stream] debug composite failed: {exc}',
+                                       throttle_duration_sec=5.0)
 
         if self._stream_mode == 'h264':
             if self._h264_streamer is not None and self._h264_streamer.write(frame):
