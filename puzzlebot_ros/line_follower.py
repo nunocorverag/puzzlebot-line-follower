@@ -477,6 +477,23 @@ class AutonomousRacer(Node):
         self._lane_hold_center_x = None  # last confident steering center (orig px)
         self._lane_hold_time = None      # when it was captured (for the timeout)
 
+        # Branch guard near a cross. At a fork the BEV can briefly drop the line
+        # (anti-zebra row reject) and then RE-ACQUIRE onto the diverging side
+        # branch with HIGH confidence -> the robot turns off instead of going
+        # straight. Two defenses, BOTH gated on _near_intersection so the normal
+        # straight/curve is untouched:
+        #   - sticky base: keep _lane_prev_base anchored through brief dropouts so
+        #     re-acquisition stays in the narrow continuity corridor (not the wide
+        #     center band that grabs the branch). Dropped after lane_base_hold_s.
+        #   - base-jump reject: ignore a detected base that jumped more than
+        #     lane_base_max_jump_pct of the warp width from the last good base.
+        self.declare_parameter('lane_base_hold_s', float(saved.get('lane_base_hold_s', 1.0)))
+        self.declare_parameter('lane_base_max_jump_pct', int(saved.get('lane_base_max_jump_pct', 15)))
+        self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
+        self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
+        self._lane_good_base = None      # last accepted base x (warped px)
+        self._lane_good_base_time = None # when it was accepted (for the timeout)
+
         # ---------------------------------------------------------
         # Diagnostics: status HUD + optional controller CSV log.
         # ---------------------------------------------------------
@@ -826,6 +843,10 @@ class AutonomousRacer(Node):
                 self._lane_hold_conf = float(p.value)
             elif p.name == 'lane_hold_s':
                 self._lane_hold_s = float(p.value)
+            elif p.name == 'lane_base_hold_s':
+                self._lane_base_hold_s = float(p.value)
+            elif p.name == 'lane_base_max_jump_pct':
+                self._lane_base_max_jump_pct = int(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -902,6 +923,8 @@ class AutonomousRacer(Node):
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
+                'lane_base_hold_s': self._lane_base_hold_s,
+                'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -1897,15 +1920,45 @@ class AutonomousRacer(Node):
             lane_result = analyze_lane(frame, self.lane_params, self._lane_M,
                                        self._lane_Minv, self._lane_prev_base)
             self._last_lane_result = lane_result
+            now_good = lane_result.detected and lane_result.confidence >= 0.5
+            base_x = lane_result.base_x
+            near = self._near_intersection
+
+            # Branch guard (cross only): reject a base that jumped too far from the
+            # last good base -- that is the BEV re-locking onto a diverging side
+            # branch, not the continuing line. Away from a cross this never fires.
+            base_jumped = False
+            if (near and now_good and base_x is not None
+                    and self._lane_base_max_jump_pct > 0
+                    and self._lane_good_base is not None
+                    and self._lane_good_base_time is not None
+                    and (now - self._lane_good_base_time).nanoseconds * 1e-9 <= self._lane_base_hold_s):
+                max_jump = self.lane_params.warp_w * self._lane_base_max_jump_pct / 100.0
+                if abs(base_x - self._lane_good_base) > max_jump:
+                    base_jumped = True
+                    self.get_logger().warn(
+                        f"[LANE] base jump {self._lane_good_base:.0f}->{base_x:.0f} "
+                        f"(> {max_jump:.0f}px) rejected -- side-branch guard",
+                        throttle_duration_sec=0.5)
+            accept = now_good and not base_jumped
+
             # Thread the base x to the next frame for continuity (stay on the same
-            # line through a curve); drop it when the line is lost so it re-acquires
-            # from the center next time.
-            if lane_result.detected and lane_result.confidence >= 0.5:
-                self._lane_prev_base = lane_result.base_x
+            # line through a curve). Near a cross keep it STICKY through brief
+            # dropouts (up to lane_base_hold_s) so re-acquisition stays in the
+            # narrow continuity corridor instead of grabbing the side branch from
+            # the wide center band. Away from a cross, drop it immediately as
+            # before so a genuine line loss re-acquires from center.
+            if accept:
+                self._lane_prev_base = base_x
+                self._lane_good_base = base_x
+                self._lane_good_base_time = now
+            elif (near and self._lane_good_base_time is not None
+                  and (now - self._lane_good_base_time).nanoseconds * 1e-9 <= self._lane_base_hold_s):
+                pass  # sticky: keep _lane_prev_base anchored on the last good line
             else:
                 self._lane_prev_base = None
             draw_lane_overlay(frame, self.lane_params, lane_result)
-            if lane_result.detected and lane_result.lane_center_x_orig is not None:
+            if accept and lane_result.lane_center_x_orig is not None:
                 lane_ok = True
                 steering_center_x = lane_result.lane_center_x_orig
                 steering_far_x = lane_result.lane_center_far_x_orig

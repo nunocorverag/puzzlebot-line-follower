@@ -72,6 +72,12 @@ def main():
     out = os.path.join(root, "zebra_filter_out")
     os.makedirs(out, exist_ok=True)
 
+    # Branch-guard policy (mirrors line_follower.py, frame-based since offline has
+    # no real clock): near a cross keep the base STICKY through brief dropouts and
+    # REJECT a base that jumps > MAXJUMP px from the last good base.
+    HOLD_FRAMES = 12                         # ~1.0 s at ~12 Hz
+    MAXJUMP = lp.warp_w * 15 / 100.0         # lane_base_max_jump_pct = 15
+
     seqs = {"zebra_recta": 32, "zebra_curva": 42, "zebra_interseccion": 53}
     M = Minv = None
     for cat, n in seqs.items():
@@ -80,7 +86,10 @@ def main():
         except IndexError:
             print(f"!! no frames for {cat}")
             continue
+        near = cat == "zebra_interseccion"   # only sim the cross policy here
         prev_base = None
+        good_base = None
+        good_idx = -999
         for idx in range(n):
             fp = os.path.join(lf, f"frame_{idx:05d}.jpg")
             img = cv2.imread(fp)
@@ -91,7 +100,23 @@ def main():
             if M is None:
                 M, Minv = compute_homography(lp, w, h)
             r = analyze_lane(und, lp, M, Minv, prev_base)
-            prev_base = r.base_x if (r.detected and r.confidence >= 0.5) else None
+            now_good = r.detected and r.confidence >= 0.5
+            base_jumped = (near and now_good and r.base_x is not None
+                           and good_base is not None
+                           and (idx - good_idx) <= HOLD_FRAMES
+                           and abs(r.base_x - good_base) > MAXJUMP)
+            accept = now_good and not base_jumped
+            if accept:
+                prev_base = r.base_x
+                good_base = r.base_x
+                good_idx = idx
+            elif near and good_base is not None and (idx - good_idx) <= HOLD_FRAMES:
+                pass                          # sticky: keep prev_base anchored
+            else:
+                prev_base = None
+            if base_jumped:
+                print(f"  {cat} f{idx:03d}: BRANCH-GUARD rejected base {good_base:.0f}"
+                      f"->{r.base_x:.0f} (>{MAXJUMP:.0f}px)")
             # Dump frames where the filter fires (the interesting ones) plus a
             # couple of plain references per category.
             interesting = r.zebra_rows_rejected > 0 or idx in (5, 15, 25)

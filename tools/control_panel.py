@@ -84,6 +84,8 @@ GROUPS = [
         ("lane.zebra_row_close_px",  "i", 1,      "close px to bridge dash gaps"),
         ("lane_hold_conf",           "f", 0.05,   "conf to refresh held heading"),
         ("lane_hold_s",              "f", 0.1,    "max s to hold heading at cross"),
+        ("lane_base_max_jump_pct",   "i", 1,      "max base jump %% (branch guard)"),
+        ("lane_base_hold_s",         "f", 0.1,    "sticky base hold s at cross"),
     ]),
     ("Warp", [
         ("lane.src_top_y_pct",       "i", 1,      "warp top y"),
@@ -118,6 +120,7 @@ DEFAULTS = {
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
+    "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
 }
 
 
