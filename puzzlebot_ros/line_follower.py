@@ -323,17 +323,24 @@ class AutonomousRacer(Node):
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
-        self.declare_parameter('commit_duration', float(saved.get('commit_duration', 2.0)))
-        self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 5.0)))
+        # Commit must CROSS the intersection before re-acquiring. The robot stops
+        # ~10 cm before the first dashed row and the cross is ~26 cm deep (double
+        # cross), so straight must travel ~36 cm before it looks for the continuing
+        # line; turns must clear the cross too. At commit_speed 0.08 m/s: ~36 cm =
+        # ~4.5 s (straight), turns ~2 s. The re-acquire (which is trivially true
+        # while sitting on a line) is only allowed AFTER this min, so it no longer
+        # cuts the commit short.
+        self.declare_parameter('commit_duration', float(saved.get('commit_duration', 3.5)))
+        self.declare_parameter('commit_duration_straight', float(saved.get('commit_duration_straight', 6.0)))
         # Closed-loop commit: keep turning/crossing until the lane is RE-ACQUIRED
         # (after a min time to clear the cross), capped by commit_duration above so
         # a missed line can't spin forever. 0 = old pure open-loop (time only).
-        self.declare_parameter('commit_min_s', float(saved.get('commit_min_s', 0.8)))
+        self.declare_parameter('commit_min_s', float(saved.get('commit_min_s', 2.0)))
         # STRAIGHT needs a longer minimum: it must CROSS the whole zebra (~26 cm)
         # before handing back to FOLLOW, or it re-acquires a side line of the cross
         # mid-way and turns instead of going through. Only affects 'straight'; the
         # left/right turn timing is unchanged so curves are not touched.
-        self.declare_parameter('commit_straight_min_s', float(saved.get('commit_straight_min_s', 3.0)))
+        self.declare_parameter('commit_straight_min_s', float(saved.get('commit_straight_min_s', 4.5)))
         self.declare_parameter('commit_closed_loop', bool(saved.get('commit_closed_loop', True)))
         self.declare_parameter('intersection_min_travel_m', float(saved.get('intersection_min_travel_m', 0.25)))
         # Square-up-in-place: at the cross, if we stopped skewed (came off a curve)
@@ -685,15 +692,15 @@ class AutonomousRacer(Node):
             )
             self._event('decision_ignored', raw=msg.data, reason='unknown')
             return
-        # Only enforce the option list when we actually classified some options.
-        # If detection fired but no direction could be validated, trust the operator.
-        if self.intersection_pending and self.intersection_options and normalized not in self.intersection_options:
+        # The OPERATOR is the authority: a manual decision is always obeyed, even
+        # if it is not in the auto-detected options (those are a best-effort hint
+        # and can be wrong/incomplete -- e.g. a real straight read as left-only).
+        if (self.intersection_pending and self.intersection_options
+                and normalized not in self.intersection_options):
             self.get_logger().warn(
-                f"Decision '{normalized}' not in current options: {', '.join(self.intersection_options)}"
+                f"Decision '{normalized}' not in detected options "
+                f"({', '.join(self.intersection_options)}); obeying operator anyway."
             )
-            self._event('decision_rejected', decision=normalized,
-                        allowed=list(self.intersection_options))
-            return
         self.intersection_decision = normalized
         self.get_logger().info(f"Intersection decision received: {normalized}")
         self._event('decision_received', decision=normalized)

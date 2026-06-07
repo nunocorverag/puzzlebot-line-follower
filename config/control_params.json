@@ -12,11 +12,11 @@
   "approach_timeout_s": 10.0,
   "commit_speed": 0.08,
   "commit_turn_w": 0.6,
-  "commit_duration": 2.0,
-  "commit_duration_straight": 5.0,
-  "commit_min_s": 0.8,
+  "commit_duration": 3.5,
+  "commit_duration_straight": 6.0,
+  "commit_min_s": 2.0,
   "commit_closed_loop": true,
   "intersection_min_travel_m": 0.25,
   "snapshot_interval": 0.5,
-  "commit_straight_min_s": 3.0
+  "commit_straight_min_s": 4.5
 }

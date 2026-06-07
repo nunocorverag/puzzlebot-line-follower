@@ -46,19 +46,21 @@ tmux kill-session -t "${SESSION}" 2>/dev/null || true
 SESSION="${SESSION}" "${SCRIPT_DIR}/stop_demo.sh" || true
 rm -f "${READY_FILE}"
 
-# --- Window 1: STACK (logs as split panes) --------------------------------
-tmux new-session -d -s "${SESSION}" -n STACK
-P_BUILD=$(tmux display-message -p -t "${SESSION}:STACK" '#{pane_id}')
+# --- Window 1: LOGS (build/motor/follower as split panes) -----------------
+tmux new-session -d -s "${SESSION}" -n LOGS
+P_BUILD=$(tmux display-message -p -t "${SESSION}:LOGS" '#{pane_id}')
 P_MOTOR=$(tmux split-window -t "${P_BUILD}" -P -F '#{pane_id}')
 P_FOLLOWER=$(tmux split-window -t "${P_MOTOR}" -P -F '#{pane_id}')
-if [ "${DASH}" = "1" ]; then
-  P_DASH=$(tmux split-window -t "${P_FOLLOWER}" -P -F '#{pane_id}')
-fi
-tmux select-layout -t "${SESSION}:STACK" tiled >/dev/null
-# Keep dead panes visible so a crash leaves its error on screen.
-tmux set-option -w -t "${SESSION}:STACK" remain-on-exit on >/dev/null
+tmux select-layout -t "${SESSION}:LOGS" tiled >/dev/null
+tmux set-option -w -t "${SESSION}:LOGS" remain-on-exit on >/dev/null
 
-# --- Window 2: CONTROL (panel, full screen) -------------------------------
+# --- Window 2: MONITOR (state-machine dashboard, full screen) -------------
+if [ "${DASH}" = "1" ]; then
+  tmux new-window -t "${SESSION}" -n MONITOR
+  P_DASH=$(tmux display-message -p -t "${SESSION}:MONITOR" '#{pane_id}')
+fi
+
+# --- Window 3: CONTROL (panel, full screen) -------------------------------
 tmux new-window -t "${SESSION}" -n CONTROL
 P_PANEL=$(tmux display-message -p -t "${SESSION}:CONTROL" '#{pane_id}')
 
@@ -82,8 +84,9 @@ fi
 tmux send-keys -t "${P_PANEL}" "while [ ! -f '${READY_FILE}' ]; do echo '[panel] waiting for build...'; sleep 1; done; echo '[panel] waiting for /autonomous_racer...'; until ssh -o BatchMode=yes -o ConnectTimeout=3 '${JETSON_USER}@${JETSON_HOST}' \"bash -lc 'source /opt/ros/humble/setup.bash; source ${REMOTE_WS}/install/setup.bash 2>/dev/null || true; ros2 service list 2>/dev/null | grep -q /autonomous_racer/get_parameters'\"; do sleep 1; done; echo '[panel] starting (q quits AND stops everything)'; SYNC=0 scripts/run_control_panel_jetson.sh; echo '[panel] exited -> stopping whole stack'; setsid bash -c 'SESSION=${SESSION} ${SCRIPT_DIR}/stop_demo.sh' </dev/null >/tmp/${SESSION}_stop.log 2>&1 &" C-m
 
 tmux select-window -t "${SESSION}:CONTROL"
-echo "tmux session '${SESSION}' started."
-echo "  CONTROL window = the panel (press d / 1,2,3 here)."
-echo "  STACK window   = logs (build/motor/follower/dashboard) -> Ctrl-b n/p to switch."
+echo "tmux session '${SESSION}' started. Windows (Ctrl-b n/p):"
+echo "  CONTROL = the panel (press d / 1,2,3 here)."
+echo "  MONITOR = full-screen state-machine dashboard."
+echo "  LOGS    = build/motor/follower panes."
 echo "  Quitting the panel (q) stops EVERYTHING (local + Jetson)."
 tmux attach-session -t "${SESSION}"
