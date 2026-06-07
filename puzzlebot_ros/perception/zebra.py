@@ -88,6 +88,9 @@ class ZebraResult:
     stable_frames: int = 0
     distance_cm: float | None = None       # forward distance to row at lane center
     angle_deg: float | None = None         # row tilt vs transverse (robot skew)
+    row_center_cm: float | None = None     # lateral center of the row (lane center
+                                           # relative to the robot); stable guide to
+                                           # stay centred while crossing
     n_dashes: int = 0
     span_cm: float = 0.0
     options: list = field(default_factory=list)
@@ -274,6 +277,7 @@ def analyze_zebra(frame_undistorted, lane_params: LaneParams, zp: ZebraParams,
                 dist, ang = float(np.median(ys)), 0.0
             res.distance_cm = dist
             res.angle_deg = ang
+            res.row_center_cm = float(np.median(xs))
             res.span_cm = span
             res.row_inlier_idx = list(inl)
             # Only trust the L/S/R read when the robot is roughly square to the

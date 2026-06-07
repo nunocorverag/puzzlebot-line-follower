@@ -265,6 +265,12 @@ class AutonomousRacer(Node):
         self.declare_parameter('read_distance_cm', 4.0)
         self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
         self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
+        # During ADVANCE the lane follower FLAKES over the cross (it grabs the side
+        # dashes and veers left). So we do NOT steer with it; we hold centre using
+        # the zebra ROW CENTER (stable: the dash row marks the lane) and go straight
+        # if the row is lost. gain in rad per cm of lateral row offset; sign tunable.
+        self.declare_parameter('advance_center_gain', 0.03)
+        self._advance_center_gain = float(self.get_parameter('advance_center_gain').value)
         self._adv_odom0 = 0.0             # odometry mark at DETECT
         self._adv_target_m = 0.0          # distance to advance to the reading window
 
@@ -818,6 +824,8 @@ class AutonomousRacer(Node):
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
                 self._read_distance_cm = float(p.value)
+            elif p.name == 'advance_center_gain':
+                self._advance_center_gain = float(p.value)
             elif p.name == 'align_in_place':
                 self._align_in_place = bool(p.value)
             elif p.name == 'align_tol_deg':
@@ -2054,14 +2062,23 @@ class AutonomousRacer(Node):
         # the legacy centering above already handles lateral offset.
         if self.intersection_phase == 'approach':
             if self._use_zebra_bev:
-                # ADVANCE: keep the LANE steering (computed above) and just creep
-                # forward; the phase machine ends ADVANCE by ODOMETRY (at the
-                # reading window), so we drive at approach_speed the whole time and
-                # do NOT brake on the camera distance (the row leaves view up close).
+                # ADVANCE: do NOT use the lane follower here (it flakes over the
+                # cross and grabs the side dashes -> veers left). Hold centre with
+                # the zebra ROW CENTER (stable) and go STRAIGHT if the row is lost.
+                # End ADVANCE by ODOMETRY at the reading window (not the camera
+                # distance, which leaves view up close).
                 base_linear_x = self._approach_speed
+                zr = self.zebra_result
+                rc = zr.row_center_cm if (zr is not None and zr.seen) else None
+                if rc is not None:
+                    target_angular_z = max(-self.max_w, min(
+                        self.max_w, -self._advance_center_gain * rc))
+                else:
+                    target_angular_z = 0.0   # row lost: keep heading straight
                 advanced = self._odom_m() - self._adv_odom0
                 self.get_logger().info(
                     f"[ZEBRA] ADVANCE: V={base_linear_x:.3f} W={target_angular_z:.2f} "
+                    f"rc={'?' if rc is None else f'{rc:.0f}'}cm "
                     f"adv={advanced*100:.0f}/{self._adv_target_m*100:.0f}cm",
                     throttle_duration_sec=1.0,
                 )
