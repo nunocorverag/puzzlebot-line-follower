@@ -48,6 +48,11 @@ from puzzlebot_ros.perception.zebra import (
     save_zebra_params,
     wide_homography,
 )
+from puzzlebot_ros.perception.signs import (
+    SignParams,
+    SignDetector,
+    draw_sign_overlay,
+)
 from dataclasses import fields as dataclass_fields
 from puzzlebot_ros.perception.camera import open_csi_capture
 from puzzlebot_ros.perception.stream import H264Streamer
@@ -294,6 +299,46 @@ class AutonomousRacer(Node):
         # without needing to see a real GREEN light.
         self.declare_parameter('ignore_traffic_light', False)
         self._ignore_traffic_light = bool(self.get_parameter('ignore_traffic_light').value)
+
+        # --- YOLO traffic signs (best.pt) -------------------------------------
+        # Gated by use_signs (default False so it can NEVER break line following;
+        # turn it on once the model is confirmed on the robot). Behaviours:
+        #   workers          -> slow to workers_speed_factor for workers_slow_s
+        #   stop             -> stop for stop_seconds, then continue (once)
+        #   give_way         -> stop for giveway_seconds, then continue (once)
+        #   turn_left/right  -> AUTO-decide that direction at the NEXT cross
+        #   go_straight      -> AUTO-decide straight at the next cross
+        # The signs are read in the UPPER band only and every few frames, so they
+        # do not slow the loop. Detection degrades to no-op if the model is absent.
+        self.declare_parameter('use_signs', False)
+        self.declare_parameter('signs_model_path', '')
+        self.declare_parameter('signs_conf', 0.55)
+        self.declare_parameter('workers_speed_factor', 0.5)
+        self.declare_parameter('workers_slow_s', 4.0)
+        self.declare_parameter('stop_seconds', 3.0)
+        self.declare_parameter('giveway_seconds', 1.5)
+        self.declare_parameter('sign_cooldown_s', 6.0)   # don't re-fire same sign
+        self._use_signs = bool(self.get_parameter('use_signs').value)
+        self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
+        self._workers_slow_s = float(self.get_parameter('workers_slow_s').value)
+        self._stop_seconds = float(self.get_parameter('stop_seconds').value)
+        self._giveway_seconds = float(self.get_parameter('giveway_seconds').value)
+        self._sign_cooldown_s = float(self.get_parameter('sign_cooldown_s').value)
+        self._sign_detector = None
+        if self._use_signs:
+            mp = str(self.get_parameter('signs_model_path').value).strip()
+            if not mp:
+                found = self._find_config('best.pt')
+                mp = str(found) if found is not None else ''
+            self._sign_detector = SignDetector(
+                SignParams(model_path=mp,
+                           conf=float(self.get_parameter('signs_conf').value)),
+                log=self.get_logger().info)
+        self._sign_result = None             # last SignResult (for HUD/telemetry)
+        self._pending_turn = None            # 'left'/'right'/'straight' from a sign
+        self._workers_until = None           # slow-zone end time from a workers sign
+        self._stopsign_until = None          # hold-still end time (stop/give_way)
+        self._sign_last_fired = {}           # sign name -> last action time (cooldown)
 
         # Motion master switch for safe testing. Starts disabled so the robot
         # never moves until you explicitly enable it from the terminal via
@@ -807,6 +852,36 @@ class AutonomousRacer(Node):
     def _odom_m(self):
         return self._odom_dist
 
+    def _run_signs(self, frame, now):
+        """Detect a sign and LATCH its action. No-op if signs are disabled. Each
+        sign re-fires at most once per sign_cooldown_s so it doesn't retrigger."""
+        if not self._use_signs or self._sign_detector is None:
+            return
+        res = self._sign_detector.detect(frame)
+        self._sign_result = res
+        if res.name is None:
+            return
+        last = self._sign_last_fired.get(res.name)
+        if last is not None and (now - last).nanoseconds * 1e-9 < self._sign_cooldown_s:
+            return
+        name = res.name
+        if name in ('turn_left', 'turn_right', 'go_straight'):
+            self._pending_turn = {'turn_left': 'left', 'turn_right': 'right',
+                                  'go_straight': 'straight'}[name]
+            self._sign_last_fired[name] = now
+            self.get_logger().warn(
+                f"[SIGN] {name} ({res.conf:.2f}) -> auto-{self._pending_turn} at next cross")
+        elif name == 'workers':
+            self._workers_until = now + Duration(seconds=self._workers_slow_s)
+            self._sign_last_fired[name] = now
+            self.get_logger().warn(f"[SIGN] workers ({res.conf:.2f}) -> slowing")
+        elif name in ('stop', 'give_way'):
+            if self._stopsign_until is None:        # not already holding
+                dur = self._stop_seconds if name == 'stop' else self._giveway_seconds
+                self._stopsign_until = now + Duration(seconds=dur)
+                self._sign_last_fired[name] = now
+                self.get_logger().warn(f"[SIGN] {name} ({res.conf:.2f}) -> hold {dur:.1f}s")
+
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
         aliases = {
@@ -911,6 +986,16 @@ class AutonomousRacer(Node):
                 self._commit_closed_loop = bool(p.value)
             elif p.name == 'stream_debug':
                 self._stream_debug = bool(p.value)
+            elif p.name == 'workers_speed_factor':
+                self._workers_speed_factor = float(p.value)
+            elif p.name == 'workers_slow_s':
+                self._workers_slow_s = float(p.value)
+            elif p.name == 'stop_seconds':
+                self._stop_seconds = float(p.value)
+            elif p.name == 'giveway_seconds':
+                self._giveway_seconds = float(p.value)
+            elif p.name == 'sign_cooldown_s':
+                self._sign_cooldown_s = float(p.value)
             elif p.name == 'detect_distance_cm':
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
@@ -1208,6 +1293,8 @@ class AutonomousRacer(Node):
             'phase': self.intersection_phase,
             'commit': self.commit_direction,
             'options': list(self.intersection_options),
+            'sign': (self._sign_result.name if self._sign_result else None),
+            'pending_turn': self._pending_turn,
             'odom': round(self._odom_m(), 2),
             'advance': (round((self._odom_m() - self._adv_odom0) * 100, 0)
                         if self.intersection_phase == 'approach' else None),
@@ -1537,6 +1624,15 @@ class AutonomousRacer(Node):
                     cv2.imshow("Frame", frame)
                     cv2.waitKey(1)
                 return True
+
+            # AUTO-decision from a traffic sign: if an arrow sign latched a turn,
+            # take it here instead of waiting for the operator (fluid, no stop for
+            # input). Manual 1/2/3 still works and overrides if pressed.
+            if self.intersection_decision is None and self._pending_turn is not None:
+                self.intersection_decision = self._pending_turn
+                self.get_logger().warn(
+                    f"[SIGN] auto-deciding {self._pending_turn} at cross")
+                self._pending_turn = None
 
             should_prompt = (self.last_prompt_time is None
                              or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0)
@@ -1869,6 +1965,9 @@ class AutonomousRacer(Node):
         h, w = frame.shape[:2]
         frame_center_x = w / 2.0
         now = self.get_clock().now()
+
+        # YOLO traffic signs: detect + latch actions (no-op if disabled).
+        self._run_signs(frame, now)
 
         # ---------------------------------------------------------
         # 1. TRAFFIC LIGHT PERCEPTION
@@ -2412,6 +2511,25 @@ class AutonomousRacer(Node):
                 throttle_duration_sec=1.0,
             )
 
+        # --- TRAFFIC SIGN overrides (after the light, before the drive switch) ---
+        # workers: cap/scale speed while the slow window is active.
+        if self._workers_until is not None:
+            if now < self._workers_until:
+                cmd.linear.x *= self._workers_speed_factor
+                self.get_logger().info("[SIGN] workers: slowing", throttle_duration_sec=1.0)
+            else:
+                self._workers_until = None
+        # stop / give_way: hold still for the configured time, then release.
+        if self._stopsign_until is not None:
+            if now < self._stopsign_until:
+                cmd.linear.x = 0.0
+                cmd.angular.z = 0.0
+                self.get_logger().info("[SIGN] holding for stop/give-way",
+                                       throttle_duration_sec=1.0)
+            else:
+                self._stopsign_until = None
+                self.get_logger().warn("[SIGN] hold done -> resume")
+
         # Master motion switch: if driving is disabled, hold still regardless of
         # what the controller computed (perception keeps running below).
         if not self._drive_enabled:
@@ -2432,6 +2550,8 @@ class AutonomousRacer(Node):
 
         # Debug Visuals
         cv2.line(frame, (int(frame_center_x), 0), (int(frame_center_x), h), (0, 255, 255), 2)
+        if self._sign_result is not None:
+            draw_sign_overlay(frame, self._sign_result)
         self._draw_status_hud(frame, cmd)
         self._log_controller_row(now, cmd)
         self._publish_lane_status(cmd)

@@ -95,6 +95,12 @@ def render(d, last_seen, log):
     if zdbg:
         parts = [f"{k}:{v}" for k, v in zdbg.items()]
         out.append("    why: " + c(GREY, " | ".join(parts)[:130]))
+    sign = d.get("sign")
+    pend = d.get("pending_turn")
+    if sign or pend:
+        s = c(YELLOW, sign.upper()) if sign else c(GREY, "—")
+        p = c(GREEN, f"auto->{pend}") if pend else ""
+        out.append(f"    SIGN: {s}  {p}")
     out.append("")
 
     # --- lane + command ----------------------------------------------------
