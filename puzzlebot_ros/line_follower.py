@@ -263,22 +263,24 @@ class AutonomousRacer(Node):
         # to read from the worst spot. Both tunable live.
         self.declare_parameter('detect_distance_cm', 22.0)
         self.declare_parameter('read_distance_cm', 6.0)
-        # ADVANCE now ends by VISION at the FIRST row (the good read spot), not by
-        # command odometry: the commanded speed (0.06) overran the real speed
-        # (~0.046, deadband) so the odom-extra drove PAST the first row onto the
-        # SECOND (z_dist jumped 6->24), stopping skewed with no visible exits.
+        # ADVANCE crosses the FIRST row by vision, then creeps briefly to the
+        # reading spot instead of stopping before the row.
         #   read_cross_jump_cm: a sudden z_dist INCREASE this large (after coming
-        #     down close) means we just crossed the first row and now see the next
-        #     one -> stop. read_advance_extra_cm now defaults to 0 (odom-extra off);
-        #     keep it >0 only if you deliberately want a small odometry nudge.
+        #     down close) means we crossed the first row and now see the next one.
+        #   read_after_entry_max_cm: short cap after that crossing, so ADVANCE
+        #     does not chase the exit row. read_advance_extra_cm remains as an
+        #     optional tighter cap for deliberate odometry-only tuning.
         self.declare_parameter('read_advance_extra_cm', 0.0)
+        self.declare_parameter('read_after_entry_max_cm', 6.0)
         self.declare_parameter('read_cross_jump_cm', 8.0)
         self._detect_distance_cm = float(self.get_parameter('detect_distance_cm').value)
         self._read_distance_cm = float(self.get_parameter('read_distance_cm').value)
         self._read_advance_extra_cm = float(self.get_parameter('read_advance_extra_cm').value)
+        self._read_after_entry_max_cm = float(self.get_parameter('read_after_entry_max_cm').value)
         self._read_cross_jump_cm = float(self.get_parameter('read_cross_jump_cm').value)
         self._adv_at_entry = False        # phase-2 flag (reached entry, now crossing)
         self._adv_extra_odom0 = 0.0
+        self._adv_entry_target_m = 0.0
         self._adv_prev_dist = None         # previous-frame z_dist (cross-jump detect)
         # ADVANCE goes STRAIGHT by default (gain 0): steering by the row/lane over a
         # cross grabs the edge dashes and veers off. Raise advance_center_gain only
@@ -396,7 +398,7 @@ class AutonomousRacer(Node):
         # rotate IN PLACE (v=0, safe -- no arcing) to face the cross before reading
         # options/asking. Uses k_align as the gain (rad of zebra angle -> w); flip
         # k_align's sign live if it turns the wrong way.
-        self.declare_parameter('align_in_place', bool(saved.get('align_in_place', True)))
+        self.declare_parameter('align_in_place', bool(saved.get('align_in_place', False)))
         self.declare_parameter('align_tol_deg', float(saved.get('align_tol_deg', 12.0)))
         self.declare_parameter('align_timeout_s', float(saved.get('align_timeout_s', 4.0)))
         # The zebra angle (za) ON the cross is noisy: a robot that came in STRAIGHT
@@ -899,6 +901,8 @@ class AutonomousRacer(Node):
                 self._read_distance_cm = float(p.value)
             elif p.name == 'read_advance_extra_cm':
                 self._read_advance_extra_cm = float(p.value)
+            elif p.name == 'read_after_entry_max_cm':
+                self._read_after_entry_max_cm = float(p.value)
             elif p.name == 'read_cross_jump_cm':
                 self._read_cross_jump_cm = float(p.value)
             elif p.name == 'advance_center_gain':
@@ -964,10 +968,13 @@ class AutonomousRacer(Node):
                 'commit_min_s': self._commit_min_s,
                 'commit_straight_min_s': self._commit_straight_min_s,
                 'commit_closed_loop': self._commit_closed_loop,
+                'align_in_place': self._align_in_place,
+                'align_tol_deg': self._align_tol_deg,
                 'intersection_min_travel_m': self._intersection_min_travel_m,
                 'align_skip_when_straight': self._align_skip_when_straight,
                 'align_straight_off': self._align_straight_off,
                 'align_straight_curv': self._align_straight_curv,
+                'read_after_entry_max_cm': self._read_after_entry_max_cm,
                 'snapshot_interval': self._snapshot_interval,
             }, indent=2))
             zebra_path = self._config_save_path('zebra_params.json')
@@ -1348,6 +1355,7 @@ class AutonomousRacer(Node):
             self._zebra_opt_votes = {}
             self._adv_odom0 = self._odom_m()
             self._adv_target_m = max(0.0, (dist - self._read_distance_cm) / 100.0)
+            self._adv_entry_target_m = max(0.0, (dist + 2.0) / 100.0)
             self._adv_at_entry = False
             self._adv_prev_dist = dist         # seed the cross-jump detector
             self._approach_start_time = now
@@ -1375,34 +1383,41 @@ class AutonomousRacer(Node):
                 self.intersection_options = [
                     o for o in ('left', 'straight', 'right')
                     if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
-            # VISION-FIRST arrival at the FIRST row (the good read spot):
-            #   reached : z_dist came down to <= read_distance (simple cross), OR
-            #   crossed : z_dist, after being close, JUMPED UP (we crossed the first
-            #             row and now see the NEXT one) -- the deadband-prone odom
-            #             extra is gone, so we no longer overrun onto the 2nd row.
-            # Odometry is kept ONLY as a fallback when the row is lost (dist None)
-            # and as the overall timeout below. An optional small odom nudge stays
-            # available via read_advance_extra_cm (default 0 = off).
+            # VISION-FIRST crossing of the ENTRY row. Reaching read_distance only
+            # arms the jump detector; READ starts after the row is crossed. Once
+            # crossed, creep a short distance until the continuous straight line is
+            # visible, or stop at read_after_entry_max_cm so we do not chase the
+            # exit row. read_advance_extra_cm remains as an optional extra cap.
             advanced = self._odom_m() - self._adv_odom0
+            straight_seen = bool(zres is not None and "straight" in zres.options)
             if not self._adv_at_entry:
-                reached = dist is not None and dist <= self._read_distance_cm
                 near = (self._adv_prev_dist is not None
                         and self._adv_prev_dist
                         <= self._read_distance_cm + self._read_cross_jump_cm)
                 crossed = (dist is not None and near
                            and dist - self._adv_prev_dist > self._read_cross_jump_cm)
-                lost_odom = dist is None and advanced >= self._adv_target_m
-                if reached or crossed or lost_odom:
+                odom_crossed = advanced >= self._adv_entry_target_m
+                if crossed or odom_crossed:
                     self._adv_at_entry = True
                     self._adv_extra_odom0 = self._odom_m()
+                    mode = "z_dist jump" if crossed else "odom fallback"
+                    dtxt = "?" if dist is None else f"{dist:.0f}"
                     self.get_logger().info(
-                        f'[ZEBRA] at first row by '
-                        f'{"crossed-jump" if crossed else "reached" if reached else "odom"} '
-                        f'(dist={"?" if dist is None else f"{dist:.0f}"}cm)')
-                arrived = self._adv_at_entry and self._read_advance_extra_cm <= 0.0
+                        f"[ZEBRA] crossed entry row by {mode} (dist={dtxt}cm)")
+                arrived = False
             else:
-                arrived = (self._odom_m() - self._adv_extra_odom0) \
-                    >= self._read_advance_extra_cm / 100.0
+                extra_cm = (self._odom_m() - self._adv_extra_odom0) * 100.0
+                cap_cm = max(0.0, self._read_after_entry_max_cm)
+                if self._read_advance_extra_cm > 0.0:
+                    cap_cm = min(cap_cm, self._read_advance_extra_cm)
+                if straight_seen:
+                    self._zebra_opt_votes["straight"] = max(
+                        self._zebra_opt_votes.get("straight", 0),
+                        self._zebra_opt_min_votes)
+                    self.intersection_options = [
+                        o for o in ("left", "straight", "right")
+                        if self._zebra_opt_votes.get(o, 0) >= self._zebra_opt_min_votes]
+                arrived = straight_seen or extra_cm >= cap_cm
             if dist is not None:
                 self._adv_prev_dist = dist
             timed_out = (
@@ -1460,6 +1475,7 @@ class AutonomousRacer(Node):
                     f'[ZEBRA] WAIT square-up in place: za={za:.0f} w={tw.angular.z:+.2f}',
                     throttle_duration_sec=0.5)
                 self._draw_status_hud(frame, tw)
+                self._maybe_snapshot(now, frame)
                 self._log_controller_row(now, tw)
                 self._publish_telemetry(now, tw)
                 self._publish_stream_frame(frame)
@@ -1477,6 +1493,7 @@ class AutonomousRacer(Node):
             if self.intersection_decision is None:
                 self.cmd_pub.publish(Twist())
                 self._draw_status_hud(frame, Twist())
+                self._maybe_snapshot(now, frame)
                 self._log_controller_row(now, Twist())
                 self._publish_telemetry(now, Twist())
                 self._publish_stream_frame(frame)
