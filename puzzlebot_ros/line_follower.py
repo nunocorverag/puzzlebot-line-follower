@@ -2093,8 +2093,10 @@ class AutonomousRacer(Node):
         # upper ROI keep floor/tan/clutter out. Green kept (it already worked).
         red_mask = cv2.inRange(hsv, np.array([0, 90, 70]), np.array([10, 255, 255])) + \
                    cv2.inRange(hsv, np.array([168, 90, 70]), np.array([180, 255, 255]))
-        yellow_mask = cv2.inRange(hsv, np.array([16, 90, 90]), np.array([34, 255, 255]))
-        green_mask  = cv2.inRange(hsv, np.array([40, 120, 120]), np.array([85, 255, 255]))
+        # Yellow disc measured at HSV~(35,92,200): the old max H=34 missed it (it
+        # fell in the gap before green H>=40). Widen yellow to H[15..39], lower S.
+        yellow_mask = cv2.inRange(hsv, np.array([15, 80, 90]), np.array([39, 255, 255]))
+        green_mask  = cv2.inRange(hsv, np.array([42, 120, 120]), np.array([85, 255, 255]))
 
         # Don't let the RED of a YOLO sign (e.g. the STOP octagon) be read as a red
         # traffic LIGHT: blank the detected sign's box (+margin) from the color masks.
