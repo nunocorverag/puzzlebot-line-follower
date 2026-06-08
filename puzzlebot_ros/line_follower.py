@@ -350,6 +350,11 @@ class AutonomousRacer(Node):
         self.declare_parameter('stop_seconds', 3.0)
         self.declare_parameter('giveway_seconds', 1.5)
         self.declare_parameter('sign_cooldown_s', 6.0)   # don't re-fire same sign
+        # stop/give_way only ACT when the sign is CLOSE (its box is big enough = near).
+        # Arrow/workers latch from farther (just min_box_pct). area_pct is a distance
+        # proxy: bigger box => closer sign.
+        self.declare_parameter('sign_act_area_pct', 6.0)
+        self._sign_act_area_pct = float(self.get_parameter('sign_act_area_pct').value)
         self._use_signs = bool(self.get_parameter('use_signs').value)
         self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
         self._workers_slow_s = float(self.get_parameter('workers_slow_s').value)
@@ -908,11 +913,19 @@ class AutonomousRacer(Node):
             self._sign_last_fired[name] = now
             self.get_logger().warn(f"[SIGN] workers ({res.conf:.2f}) -> slowing")
         elif name in ('stop', 'give_way'):
+            # Only act when the sign is CLOSE (box big enough). Far away we wait.
+            if res.area_pct < self._sign_act_area_pct:
+                self.get_logger().info(
+                    f"[SIGN] {name} seen far (area {res.area_pct:.1f}<"
+                    f"{self._sign_act_area_pct:.1f}) -> waiting to get closer",
+                    throttle_duration_sec=1.0)
+                return
             if self._stopsign_until is None:        # not already holding
                 dur = self._stop_seconds if name == 'stop' else self._giveway_seconds
                 self._stopsign_until = now + Duration(seconds=dur)
                 self._sign_last_fired[name] = now
-                self.get_logger().warn(f"[SIGN] {name} ({res.conf:.2f}) -> hold {dur:.1f}s")
+                self.get_logger().warn(
+                    f"[SIGN] {name} ({res.conf:.2f}, area {res.area_pct:.1f}) -> hold {dur:.1f}s")
 
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
@@ -1042,6 +1055,8 @@ class AutonomousRacer(Node):
                 self._giveway_seconds = float(p.value)
             elif p.name == 'sign_cooldown_s':
                 self._sign_cooldown_s = float(p.value)
+            elif p.name == 'sign_act_area_pct':
+                self._sign_act_area_pct = float(p.value)
             elif p.name == 'detect_distance_cm':
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
@@ -2077,6 +2092,18 @@ class AutonomousRacer(Node):
                    cv2.inRange(hsv, np.array([172, 150, 100]), np.array([180, 255, 255]))
         yellow_mask = cv2.inRange(hsv, np.array([20, 150, 120]), np.array([32, 255, 255]))
         green_mask  = cv2.inRange(hsv, np.array([40, 120, 120]), np.array([85, 255, 255]))
+
+        # Don't let the RED of a YOLO sign (e.g. the STOP octagon) be read as a red
+        # traffic LIGHT: blank the detected sign's box (+margin) from the color masks.
+        sr = self._sign_result
+        if sr is not None and sr.box is not None:
+            bx1, by1, bx2, by2 = (int(v) for v in sr.box)
+            m = 12
+            y0b, y1b = max(0, by1 - m), min(h, by2 + m)
+            x0b, x1b = max(0, bx1 - m), min(w, bx2 + m)
+            red_mask[y0b:y1b, x0b:x1b] = 0
+            yellow_mask[y0b:y1b, x0b:x1b] = 0
+            green_mask[y0b:y1b, x0b:x1b] = 0
 
         red_area, red_cand, _ = self.detect_color(red_mask, "RED")
         yellow_area, yellow_cand, _ = self.detect_color(yellow_mask, "YELLOW")
