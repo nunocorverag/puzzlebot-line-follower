@@ -77,6 +77,7 @@ class ZebraParams:
                                    # exits, so we refuse to guess until aligned.
     # --- straight exit classification ---
     straight_by_line: bool = True   # straight is the continuous black lane, not dashes
+    straight_center_on_row: bool = False
     straight_min_len_cm: float = 8.0
     straight_corridor_cm: float = 11.8
     straight_black_thresh: int = 90
@@ -357,8 +358,9 @@ def analyze_zebra(frame_undistorted, lane_params: LaneParams, zp: ZebraParams,
                     row_x=float(np.median(xs)))
                 if zp.straight_by_line:
                     opts = [o for o in opts if o != "straight"]
+                    straight_x = float(np.median(xs)) if zp.straight_center_on_row else 0.0
                     ok, bbox, reason = _detect_straight_line(
-                        gray, float(np.median(ys)), float(np.median(xs)), zp)
+                        gray, float(np.median(ys)), straight_x, zp)
                     if ok:
                         opts.append("straight")
                     reasons["straight"] = reason

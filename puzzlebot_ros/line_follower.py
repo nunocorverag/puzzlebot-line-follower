@@ -374,6 +374,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
+        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 4.0)))
         # Commit must CROSS the intersection before re-acquiring. The robot stops
         # ~10 cm before the first dashed row and the cross is ~26 cm deep (double
         # cross), so straight must travel ~36 cm before it looks for the continuing
@@ -400,7 +401,11 @@ class AutonomousRacer(Node):
         # k_align's sign live if it turns the wrong way.
         self.declare_parameter('align_in_place', bool(saved.get('align_in_place', False)))
         self.declare_parameter('align_tol_deg', float(saved.get('align_tol_deg', 12.0)))
-        self.declare_parameter('align_timeout_s', float(saved.get('align_timeout_s', 4.0)))
+        self.declare_parameter('align_max_w', float(saved.get('align_max_w', 0.20)))
+        self.declare_parameter('align_prior_min_frames', int(saved.get('align_prior_min_frames', 5)))
+        self.declare_parameter('align_prior_heading_deg', float(saved.get('align_prior_heading_deg', 8.0)))
+        self.declare_parameter('align_prior_curv', float(saved.get('align_prior_curv', 0.30)))
+        self.declare_parameter('align_timeout_s', float(saved.get('align_timeout_s', 0.8)))
         # The zebra angle (za) ON the cross is noisy: a robot that came in STRAIGHT
         # (small lane offset + curvature just before the cross) still reads za~-13,
         # which is detector noise, not a real skew -> it would rotate in place for
@@ -420,6 +425,8 @@ class AutonomousRacer(Node):
         self._approach_timeout_s = float(self.get_parameter('approach_timeout_s').value)
         self._commit_speed = float(self.get_parameter('commit_speed').value)
         self._commit_turn_w = float(self.get_parameter('commit_turn_w').value)
+        self._commit_turn_pre_advance_cm = float(self.get_parameter('commit_turn_pre_advance_cm').value)
+        self._commit_odom0 = 0.0
         self._commit_duration = float(self.get_parameter('commit_duration').value)
         self._commit_duration_straight = float(self.get_parameter('commit_duration_straight').value)
         self._commit_min_s = float(self.get_parameter('commit_min_s').value)
@@ -428,6 +435,13 @@ class AutonomousRacer(Node):
         self._intersection_min_travel_m = float(self.get_parameter('intersection_min_travel_m').value)
         self._align_in_place = bool(self.get_parameter('align_in_place').value)
         self._align_tol_deg = float(self.get_parameter('align_tol_deg').value)
+        self._align_max_w = float(self.get_parameter('align_max_w').value)
+        self._align_prior_min_frames = int(self.get_parameter('align_prior_min_frames').value)
+        self._align_prior_heading_deg = float(self.get_parameter('align_prior_heading_deg').value)
+        self._align_prior_curv = float(self.get_parameter('align_prior_curv').value)
+        self._align_prior_samples = []
+        self._adv_align_prior_curved = False
+        self._adv_align_prior = {}
         self._align_timeout_s = float(self.get_parameter('align_timeout_s').value)
         self._align_start_time = None        # for the square-up-in-place timeout
         self._approach_start_time = None     # for the APPROACH timeout
@@ -881,6 +895,8 @@ class AutonomousRacer(Node):
                 self._commit_speed = float(p.value)
             elif p.name == 'commit_turn_w':
                 self._commit_turn_w = float(p.value)
+            elif p.name == 'commit_turn_pre_advance_cm':
+                self._commit_turn_pre_advance_cm = float(p.value)
             elif p.name == 'commit_duration':
                 self._commit_duration = float(p.value)
             elif p.name == 'commit_duration_straight':
@@ -911,6 +927,14 @@ class AutonomousRacer(Node):
                 self._align_in_place = bool(p.value)
             elif p.name == 'align_tol_deg':
                 self._align_tol_deg = float(p.value)
+            elif p.name == 'align_max_w':
+                self._align_max_w = float(p.value)
+            elif p.name == 'align_prior_min_frames':
+                self._align_prior_min_frames = int(p.value)
+            elif p.name == 'align_prior_heading_deg':
+                self._align_prior_heading_deg = float(p.value)
+            elif p.name == 'align_prior_curv':
+                self._align_prior_curv = float(p.value)
             elif p.name == 'align_timeout_s':
                 self._align_timeout_s = float(p.value)
             elif p.name == 'align_skip_when_straight':
@@ -963,6 +987,7 @@ class AutonomousRacer(Node):
                 'approach_timeout_s': self._approach_timeout_s,
                 'commit_speed': self._commit_speed,
                 'commit_turn_w': self._commit_turn_w,
+                'commit_turn_pre_advance_cm': self._commit_turn_pre_advance_cm,
                 'commit_duration': self._commit_duration,
                 'commit_duration_straight': self._commit_duration_straight,
                 'commit_min_s': self._commit_min_s,
@@ -970,6 +995,10 @@ class AutonomousRacer(Node):
                 'commit_closed_loop': self._commit_closed_loop,
                 'align_in_place': self._align_in_place,
                 'align_tol_deg': self._align_tol_deg,
+                'align_max_w': self._align_max_w,
+                'align_prior_min_frames': self._align_prior_min_frames,
+                'align_prior_heading_deg': self._align_prior_heading_deg,
+                'align_prior_curv': self._align_prior_curv,
                 'intersection_min_travel_m': self._intersection_min_travel_m,
                 'align_skip_when_straight': self._align_skip_when_straight,
                 'align_straight_off': self._align_straight_off,
@@ -1365,13 +1394,36 @@ class AutonomousRacer(Node):
             lr = self._last_lane_result
             pre_off = abs(lr.offset_norm) if (lr is not None and lr.detected) else 0.0
             pre_curv = abs(lr.curvature_norm) if (lr is not None and lr.detected) else 0.0
-            self._adv_came_straight = (pre_off < self._align_straight_off
+            prior = list(self._align_prior_samples)
+            prior_frames = len(prior)
+            if prior:
+                prior_heading = float(np.median([p["heading_deg"] for p in prior]))
+                prior_abs_heading = float(np.median([abs(p["heading_deg"]) for p in prior]))
+                prior_curv = float(np.median([p["curv"] for p in prior]))
+                prior_off = float(np.median([p["off"] for p in prior]))
+            else:
+                prior_heading = prior_abs_heading = prior_curv = prior_off = 0.0
+            self._adv_align_prior_curved = (
+                prior_frames >= self._align_prior_min_frames
+                and (prior_abs_heading >= self._align_prior_heading_deg
+                     or prior_curv >= self._align_prior_curv))
+            self._adv_align_prior = {
+                "frames": prior_frames,
+                "heading_deg": round(prior_heading, 1),
+                "abs_heading_deg": round(prior_abs_heading, 1),
+                "curv": round(prior_curv, 3),
+                "off": round(prior_off, 3),
+                "curved": bool(self._adv_align_prior_curved),
+            }
+            self._adv_came_straight = (not self._adv_align_prior_curved
+                                       and pre_off < self._align_straight_off
                                        and pre_curv < self._align_straight_curv)
             self.get_logger().info(
                 f'[ZEBRA] detected @ {dist:.0f}cm -> ADVANCE to first row '
                 f'(came_straight={self._adv_came_straight}, off={pre_off:.2f})')
             self._event('approach_start', dist_cm=round(float(dist), 1),
-                        came_straight=bool(self._adv_came_straight))
+                        came_straight=bool(self._adv_came_straight),
+                        align_prior=dict(self._adv_align_prior))
 
         # ADVANCE -> READ once we have driven to the reading window (or timeout).
         if self.intersection_phase == 'approach':
@@ -1461,6 +1513,7 @@ class AutonomousRacer(Node):
             need_align = (self._align_in_place and za is not None
                           and abs(za) > self._align_tol_deg
                           and align_elapsed < self._align_timeout_s
+                          and self._adv_align_prior_curved
                           and not skip_straight)
             if skip_straight and za is not None and abs(za) > self._align_tol_deg:
                 self.get_logger().info(
@@ -1468,11 +1521,12 @@ class AutonomousRacer(Node):
                     throttle_duration_sec=1.0)
             if need_align and self._drive_enabled and self.intersection_decision is None:
                 tw = Twist()
-                tw.angular.z = max(-self.max_w, min(self.max_w,
+                limit_w = min(self.max_w, self._align_max_w)
+                tw.angular.z = max(-limit_w, min(limit_w,
                                                     -self._k_align * math.radians(za)))
                 self.cmd_pub.publish(tw)
                 self.get_logger().info(
-                    f'[ZEBRA] WAIT square-up in place: za={za:.0f} w={tw.angular.z:+.2f}',
+                    f"[ZEBRA] WAIT square-up in place: za={za:.0f} w={tw.angular.z:+.2f} prior={self._adv_align_prior}",
                     throttle_duration_sec=0.5)
                 self._draw_status_hud(frame, tw)
                 self._maybe_snapshot(now, frame)
@@ -1506,9 +1560,11 @@ class AutonomousRacer(Node):
             is_straight = self.commit_direction == 'straight'
             dur = self._commit_duration_straight if is_straight else self._commit_duration
             min_s = self._commit_straight_min_s if is_straight else self._commit_min_s
+            pre_turn_cm = 0.0 if is_straight else self._commit_turn_pre_advance_cm
             self.commit_until = now + Duration(seconds=dur)
             self._commit_min_until = now + Duration(seconds=min_s)
             self._dist_since_commit = 0.0
+            self._commit_odom0 = self._odom_m()
             self._approach_start_time = None
             self.intersection_phase = None
             self.intersection_pending = False
@@ -1518,7 +1574,8 @@ class AutonomousRacer(Node):
             self.zebra_result = None
             self.intersection_cooldown_until = now + Duration(seconds=1.5)
             self._event('commit_start', direction=self.commit_direction,
-                        duration_s=float(dur), min_s=float(self._commit_min_s))
+                        duration_s=float(dur), min_s=float(self._commit_min_s),
+                        pre_advance_cm=float(pre_turn_cm))
         return False
 
     def _draw_intersection_overlay(self, frame, result):
@@ -2056,6 +2113,13 @@ class AutonomousRacer(Node):
                     f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
                     throttle_duration_sec=1.0,
                 )
+                if self.commit_direction is None and self.intersection_phase in (None, "approach"):
+                    self._align_prior_samples.append({
+                        "off": abs(float(lane_result.offset_norm)),
+                        "curv": abs(float(lane_result.curvature_norm)),
+                        "heading_deg": math.degrees(math.atan(float(lane_result.heading))),
+                    })
+                    self._align_prior_samples = self._align_prior_samples[-20:]
 
         # Heading hysteresis: in the slow-zone (zebra in view) the BEV fit can
         # briefly lose confidence as the cross enters the ROI. Rather than drop to
@@ -2258,7 +2322,12 @@ class AutonomousRacer(Node):
                 self._commit_min_until = None
             else:
                 base_linear_x = self._commit_speed
-                if self.commit_direction == 'left':
+                pre_cm = (self._commit_turn_pre_advance_cm
+                          if self.commit_direction in ("left", "right") else 0.0)
+                pre_done = (self._odom_m() - self._commit_odom0) * 100.0 >= pre_cm
+                if not pre_done:
+                    target_angular_z = 0.0
+                elif self.commit_direction == 'left':
                     target_angular_z = self._commit_turn_w
                 elif self.commit_direction == 'right':
                     target_angular_z = -self._commit_turn_w
@@ -2266,7 +2335,8 @@ class AutonomousRacer(Node):
                     target_angular_z = 0.0
                 self.get_logger().info(
                     f"[INTERSECTION] Committing {self.commit_direction}: "
-                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}",
+                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
+                    f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm",
                     throttle_duration_sec=0.5)
 
         # During APPROACH: drive a fixed creep AND actively align heading so the
