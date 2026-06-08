@@ -203,6 +203,17 @@ class AutonomousRacer(Node):
         self.declare_parameter('traffic_light_aspect_tol', float(traffic_saved.get('traffic_light_aspect_tol', 0.35)))
         self.declare_parameter('traffic_light_min_fill', float(traffic_saved.get('traffic_light_min_fill', 0.45)))
         self.declare_parameter('traffic_light_max_fill', float(traffic_saved.get('traffic_light_max_fill', 1.15)))
+        # Require the light to sit on the gray screen/plate (measured S~45, V~101):
+        # the ring just outside the disc must be grayish. Rejects loose colored
+        # objects (red cable, chair) not inside the panel.
+        self.declare_parameter('traffic_light_require_plate', bool(traffic_saved.get('traffic_light_require_plate', True)))
+        self.declare_parameter('traffic_light_plate_max_sat', float(traffic_saved.get('traffic_light_plate_max_sat', 95.0)))
+        self.declare_parameter('traffic_light_plate_min_val', float(traffic_saved.get('traffic_light_plate_min_val', 45.0)))
+        self.declare_parameter('traffic_light_plate_max_val', float(traffic_saved.get('traffic_light_plate_max_val', 210.0)))
+        self._tl_require_plate = bool(self.get_parameter('traffic_light_require_plate').value)
+        self._tl_plate_max_sat = float(self.get_parameter('traffic_light_plate_max_sat').value)
+        self._tl_plate_min_val = float(self.get_parameter('traffic_light_plate_min_val').value)
+        self._tl_plate_max_val = float(self.get_parameter('traffic_light_plate_max_val').value)
         self._tl_roi_y_pct = int(self.get_parameter('traffic_light_roi_y_pct').value)
         self._tl_min_area = float(self.get_parameter('traffic_light_min_area').value)
         self._tl_max_area = float(self.get_parameter('traffic_light_max_area').value)
@@ -1045,6 +1056,14 @@ class AutonomousRacer(Node):
                 self._tl_min_fill = float(p.value)
             elif p.name == "traffic_light_max_fill":
                 self._tl_max_fill = float(p.value)
+            elif p.name == "traffic_light_require_plate":
+                self._tl_require_plate = bool(p.value)
+            elif p.name == "traffic_light_plate_max_sat":
+                self._tl_plate_max_sat = float(p.value)
+            elif p.name == "traffic_light_plate_min_val":
+                self._tl_plate_min_val = float(p.value)
+            elif p.name == "traffic_light_plate_max_val":
+                self._tl_plate_max_val = float(p.value)
             elif p.name == 'workers_speed_factor':
                 self._workers_speed_factor = float(p.value)
             elif p.name == 'workers_slow_s':
@@ -1810,7 +1829,7 @@ class AutonomousRacer(Node):
     # =============================================================
     # TRAFFIC LIGHT DETECTOR
     # =============================================================
-    def detect_color(self, mask, color_name="UNKNOWN"):
+    def detect_color(self, mask, color_name="UNKNOWN", hsv=None):
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
@@ -1841,6 +1860,17 @@ class AutonomousRacer(Node):
             fill = area / circle_area if circle_area > 1e-3 else 0.0
             if not (self._tl_min_fill <= fill <= self._tl_max_fill):
                 continue
+            # The light must sit ON the gray screen/plate: the ring just outside the
+            # disc must be grayish (low saturation, mid value). This rejects loose
+            # colored objects (red cable, chair) that are NOT inside the panel.
+            if self._tl_require_plate and hsv is not None:
+                ring = np.zeros((h, _w), np.uint8)
+                cv2.circle(ring, (int(cx), int(cy)), int(2.2 * radius), 255, -1)
+                cv2.circle(ring, (int(cx), int(cy)), int(1.4 * radius), 0, -1)
+                _, s_ring, v_ring, _ = cv2.mean(hsv, mask=ring)
+                if not (s_ring <= self._tl_plate_max_sat
+                        and self._tl_plate_min_val <= v_ring <= self._tl_plate_max_val):
+                    continue   # not on the gray plate -> reject
             cand = {
                 "color": color_name, "area": area, "center": (float(cx), float(cy)),
                 "radius": float(radius), "bbox": (int(x), int(y), int(bw), int(bh)),
@@ -2110,9 +2140,9 @@ class AutonomousRacer(Node):
             yellow_mask[y0b:y1b, x0b:x1b] = 0
             green_mask[y0b:y1b, x0b:x1b] = 0
 
-        red_area, red_cand, _ = self.detect_color(red_mask, "RED")
-        yellow_area, yellow_cand, _ = self.detect_color(yellow_mask, "YELLOW")
-        green_area, green_cand, _ = self.detect_color(green_mask, "GREEN")
+        red_area, red_cand, _ = self.detect_color(red_mask, "RED", hsv)
+        yellow_area, yellow_cand, _ = self.detect_color(yellow_mask, "YELLOW", hsv)
+        green_area, green_cand, _ = self.detect_color(green_mask, "GREEN", hsv)
 
         detected_color = "UNKNOWN"
         candidates = [("RED", red_area, red_cand),
