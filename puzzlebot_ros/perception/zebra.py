@@ -70,7 +70,11 @@ class ZebraParams:
     opt_side_cm: float = 6.0       # |X| beyond this = left/right bucket
     opt_margin_cm: float = 2.0     # look beyond row + this for exits
     opt_min_dashes: int = 2        # dashes needed in a side bucket
-    opt_min_span_cm: float = 4.0   # left/right need lateral spread (reject lane-edge columns)
+    opt_min_span_cm: float = 4.0   # left/right need spread along their dash line
+    opt_side_back_cm: float = 12.0  # side exits may project slightly before row_y
+    opt_side_line_tol_cm: float = 2.5
+    opt_side_relaxed_min_y_cm: float = 18.0
+    opt_side_relaxed_min_dashes: int = 3
     option_align_deg: float = 18.0  # ONLY read options when the row is within this
                                    # tilt (robot ~square to the cross). A skewed
                                    # approach (coming off a curve) gives garbage
@@ -234,11 +238,14 @@ def _classify_options(cands, inl_set, row_y, zp: ZebraParams, row_x=0.0):
         if k in inl_set:
             bucket_of[k] = "row"
             continue
-        if c[1] < row_y + zp.opt_margin_cm:
-            continue
         X, Y = c[0] - row_x, c[1]   # X relative to the cross center
         name = ("left" if X < -zp.opt_side_cm
                 else "right" if X > zp.opt_side_cm else "straight")
+        y_min = (row_y - zp.opt_side_back_cm
+                 if name in ("left", "right") and row_y >= zp.opt_side_relaxed_min_y_cm
+                 else row_y + zp.opt_margin_cm)
+        if Y < y_min:
+            continue
         buckets[name].append((X, Y))
         bucket_of[k] = name
     opts, reasons = [], {}
@@ -248,13 +255,32 @@ def _classify_options(cands, inl_set, row_y, zp: ZebraParams, row_x=0.0):
             reasons[name] = f"reject: {len(pts)}<{zp.opt_min_dashes} dashes"
             continue
         if name in ("left", "right"):
-            x_span = max(p[0] for p in pts) - min(p[0] for p in pts)
-            y_span = max(p[1] for p in pts) - min(p[1] for p in pts)
-            if x_span < zp.opt_min_span_cm or x_span < y_span:
-                reasons[name] = (f"reject: not transverse "
-                                 f"(xspan{x_span:.0f}<{zp.opt_min_span_cm:.0f} "
-                                 f"or <yspan{y_span:.0f})")
-                continue
+            relaxed_side = row_y >= zp.opt_side_relaxed_min_y_cm
+            if relaxed_side:
+                if len(pts) < zp.opt_side_relaxed_min_dashes:
+                    reasons[name] = f"reject: {len(pts)}<{zp.opt_side_relaxed_min_dashes} side dashes"
+                    continue
+                arr = np.array(pts, dtype=np.float64)
+                ctr = arr.mean(axis=0)
+                _, _s, vt = np.linalg.svd(arr - ctr, full_matrices=False)
+                axis = vt[0]
+                along = (arr - ctr) @ axis
+                perp = np.abs((arr - ctr) @ np.array([-axis[1], axis[0]]))
+                line_span = float(along.max() - along.min())
+                line_err = float(perp.max()) if len(perp) else 0.0
+                if line_span < zp.opt_min_span_cm or line_err > zp.opt_side_line_tol_cm:
+                    reasons[name] = (f"reject: side line "
+                                     f"(span{line_span:.0f}<{zp.opt_min_span_cm:.0f} "
+                                     f"or err{line_err:.1f}>{zp.opt_side_line_tol_cm:.1f})")
+                    continue
+            else:
+                x_span = max(p[0] for p in pts) - min(p[0] for p in pts)
+                y_span = max(p[1] for p in pts) - min(p[1] for p in pts)
+                if x_span < zp.opt_min_span_cm or x_span < y_span:
+                    reasons[name] = (f"reject: not transverse "
+                                     f"(xspan{x_span:.0f}<{zp.opt_min_span_cm:.0f} "
+                                     f"or <yspan{y_span:.0f})")
+                    continue
         opts.append(name)
         reasons[name] = f"OK: {len(pts)} dashes"
     return opts, bucket_of, reasons
