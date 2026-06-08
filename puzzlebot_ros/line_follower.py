@@ -210,10 +210,29 @@ class AutonomousRacer(Node):
         self.declare_parameter('traffic_light_plate_max_sat', float(traffic_saved.get('traffic_light_plate_max_sat', 70.0)))
         self.declare_parameter('traffic_light_plate_min_val', float(traffic_saved.get('traffic_light_plate_min_val', 45.0)))
         self.declare_parameter('traffic_light_plate_max_val', float(traffic_saved.get('traffic_light_plate_max_val', 210.0)))
+        self.declare_parameter('traffic_light_position_classify', bool(traffic_saved.get('traffic_light_position_classify', True)))
+        self.declare_parameter('traffic_light_position_map', str(traffic_saved.get('traffic_light_position_map', 'GREEN,YELLOW,RED')))
+        self.declare_parameter('traffic_light_position_anchors_pct',
+                               str(traffic_saved.get('traffic_light_position_anchors_pct', '27,39,50')))
+        self.declare_parameter('traffic_light_position_max_slot_error_pct',
+                               float(traffic_saved.get('traffic_light_position_max_slot_error_pct', 8.0)))
+        self.declare_parameter('traffic_light_plate_min_area',
+                               float(traffic_saved.get('traffic_light_plate_min_area', 900.0)))
         self._tl_require_plate = bool(self.get_parameter('traffic_light_require_plate').value)
         self._tl_plate_max_sat = float(self.get_parameter('traffic_light_plate_max_sat').value)
         self._tl_plate_min_val = float(self.get_parameter('traffic_light_plate_min_val').value)
         self._tl_plate_max_val = float(self.get_parameter('traffic_light_plate_max_val').value)
+        self._tl_position_classify = bool(self.get_parameter('traffic_light_position_classify').value)
+        self._tl_position_map = self._parse_tl_position_map(
+            str(self.get_parameter('traffic_light_position_map').value)
+        )
+        self._tl_position_anchors = self._parse_tl_position_anchors(
+            str(self.get_parameter('traffic_light_position_anchors_pct').value)
+        )
+        self._tl_position_max_slot_error = (
+            float(self.get_parameter('traffic_light_position_max_slot_error_pct').value) / 100.0
+        )
+        self._tl_plate_min_area = float(self.get_parameter('traffic_light_plate_min_area').value)
         self._tl_roi_y_pct = int(self.get_parameter('traffic_light_roi_y_pct').value)
         self._tl_min_area = float(self.get_parameter('traffic_light_min_area').value)
         self._tl_max_area = float(self.get_parameter('traffic_light_max_area').value)
@@ -1064,6 +1083,16 @@ class AutonomousRacer(Node):
                 self._tl_plate_min_val = float(p.value)
             elif p.name == "traffic_light_plate_max_val":
                 self._tl_plate_max_val = float(p.value)
+            elif p.name == "traffic_light_position_classify":
+                self._tl_position_classify = bool(p.value)
+            elif p.name == "traffic_light_position_map":
+                self._tl_position_map = self._parse_tl_position_map(str(p.value))
+            elif p.name == "traffic_light_position_anchors_pct":
+                self._tl_position_anchors = self._parse_tl_position_anchors(str(p.value))
+            elif p.name == "traffic_light_position_max_slot_error_pct":
+                self._tl_position_max_slot_error = float(p.value) / 100.0
+            elif p.name == "traffic_light_plate_min_area":
+                self._tl_plate_min_area = float(p.value)
             elif p.name == 'workers_speed_factor':
                 self._workers_speed_factor = float(p.value)
             elif p.name == 'workers_slow_s':
@@ -1176,6 +1205,15 @@ class AutonomousRacer(Node):
                 'traffic_light_aspect_tol': self._tl_aspect_tol,
                 'traffic_light_min_fill': self._tl_min_fill,
                 'traffic_light_max_fill': self._tl_max_fill,
+                'traffic_light_require_plate': self._tl_require_plate,
+                'traffic_light_plate_max_sat': self._tl_plate_max_sat,
+                'traffic_light_plate_min_val': self._tl_plate_min_val,
+                'traffic_light_plate_max_val': self._tl_plate_max_val,
+                'traffic_light_position_classify': self._tl_position_classify,
+                'traffic_light_position_map': ','.join(self._tl_position_map),
+                'traffic_light_position_anchors_pct': ','.join(f'{anchor * 100.0:.1f}' for anchor in self._tl_position_anchors),
+                'traffic_light_position_max_slot_error_pct': self._tl_position_max_slot_error * 100.0,
+                'traffic_light_plate_min_area': self._tl_plate_min_area,
                 'snapshot_interval': self._snapshot_interval,
             }, indent=2))
             zebra_path = self._config_save_path('zebra_params.json')
@@ -1211,9 +1249,16 @@ class AutonomousRacer(Node):
         cx, cy = cand["center"]
         radius = cand["radius"]
         x, y, bw, bh = cand["bbox"]
+        plate = cand.get("plate_bbox")
+        if plate is not None:
+            px, py, pw, ph = plate
+            cv2.rectangle(frame, (px, py), (px + pw, py + ph), (180, 180, 180), 1)
         cv2.rectangle(frame, (x, y), (x + bw, y + bh), col, 2)
         cv2.circle(frame, (int(cx), int(cy)), int(radius), col, 2)
-        txt = f"TL {cand['color']} c={cand['circularity']:.2f} fill={cand['fill']:.2f}"
+        slot = cand.get('slot')
+        pos = f" pos={slot:.2f}" if isinstance(slot, (int, float)) else ""
+        hsv_name = cand.get('hsv_color') or cand.get('color')
+        txt = f"TL {cand['color']} hsv={hsv_name}{pos} c={cand['circularity']:.2f} fill={cand['fill']:.2f}"
         cv2.putText(frame, txt, (x, max(18, y - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
 
@@ -1829,6 +1874,103 @@ class AutonomousRacer(Node):
     # =============================================================
     # TRAFFIC LIGHT DETECTOR
     # =============================================================
+    def _parse_tl_position_map(self, value):
+        colors = [part.strip().upper() for part in str(value).split(',') if part.strip()]
+        valid = {"GREEN", "YELLOW", "RED"}
+        if len(colors) != 3 or any(color not in valid for color in colors):
+            self.get_logger().warn(
+                f"Invalid traffic_light_position_map={value!r}; using GREEN,YELLOW,RED"
+            )
+            return ["GREEN", "YELLOW", "RED"]
+        return colors
+
+    def _parse_tl_position_anchors(self, value):
+        try:
+            anchors = [float(part.strip()) / 100.0 for part in str(value).split(',') if part.strip()]
+        except ValueError:
+            anchors = []
+        if len(anchors) != 3 or any(anchor <= 0.0 or anchor >= 1.0 for anchor in anchors):
+            self.get_logger().warn(
+                f"Invalid traffic_light_position_anchors_pct={value!r}; using 27,39,50"
+            )
+            return [0.27, 0.39, 0.50]
+        return anchors
+
+    def _estimate_tl_plate_bbox(self, hsv, cand):
+        if hsv is None or cand is None:
+            return None
+        h, w = hsv.shape[:2]
+        cx, cy = cand["center"]
+        radius = max(1.0, float(cand["radius"]))
+        roi_y = int(h * max(1, min(100, self._tl_roi_y_pct)) / 100.0)
+        y0 = max(0, int(cy - 8.0 * radius))
+        y1 = min(roi_y, int(cy + 8.0 * radius))
+        x0 = max(0, int(cx - 8.0 * radius))
+        x1 = min(w, int(cx + 8.0 * radius))
+        if y1 <= y0 or x1 <= x0:
+            return None
+
+        roi = hsv[y0:y1, x0:x1]
+        gray = cv2.inRange(
+            roi,
+            np.array([0, 0, int(self._tl_plate_min_val)], dtype=np.uint8),
+            np.array([180, int(self._tl_plate_max_sat), int(self._tl_plate_max_val)], dtype=np.uint8),
+        )
+        kernel = np.ones((5, 5), np.uint8)
+        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel, iterations=2)
+        gray = cv2.morphologyEx(gray, cv2.MORPH_OPEN, kernel)
+
+        contours, _ = cv2.findContours(gray, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        best = None
+        best_area = 0.0
+        local_cx = cx - x0
+        local_cy = cy - y0
+        for c in contours:
+            area = float(cv2.contourArea(c))
+            if area < self._tl_plate_min_area:
+                continue
+            px, py, pw, ph = cv2.boundingRect(c)
+            if not (px <= local_cx <= px + pw and py <= local_cy <= py + ph):
+                continue
+            if pw < 2.4 * radius or ph < 4.0 * radius:
+                continue
+            if area > best_area:
+                best_area = area
+                best = (x0 + px, y0 + py, pw, ph)
+        return best
+
+    def _classify_tl_candidate_by_position(self, cand, hsv):
+        if cand is None:
+            return None
+        cand = dict(cand)
+        cand["hsv_color"] = cand.get("color")
+        if not self._tl_position_classify:
+            return cand
+
+        plate = self._estimate_tl_plate_bbox(hsv, cand)
+        if plate is None:
+            return None
+        _px, _py, _pw, _ph = plate
+        _cx, cy = cand["center"]
+        h = hsv.shape[0] if hsv is not None else 1
+        roi_y = int(h * max(1, min(100, self._tl_roi_y_pct)) / 100.0)
+        rel_y = float(cy) / float(max(1, roi_y))
+        slot_idx = min(range(3), key=lambda idx: abs(rel_y - self._tl_position_anchors[idx]))
+        slot_err = abs(rel_y - self._tl_position_anchors[slot_idx])
+        if slot_err > self._tl_position_max_slot_error:
+            return None
+
+        position_color = self._tl_position_map[slot_idx]
+        hsv_color = cand.get("hsv_color")
+        if hsv_color in {"RED", "YELLOW", "GREEN"} and hsv_color != position_color:
+            return None
+
+        cand["color"] = position_color
+        cand["slot"] = float(rel_y)
+        cand["slot_error"] = float(slot_err)
+        cand["plate_bbox"] = tuple(int(v) for v in plate)
+        return cand
+
     def detect_color(self, mask, color_name="UNKNOWN", hsv=None):
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -2145,13 +2287,18 @@ class AutonomousRacer(Node):
         green_area, green_cand, _ = self.detect_color(green_mask, "GREEN", hsv)
 
         detected_color = "UNKNOWN"
-        candidates = [("RED", red_area, red_cand),
-                      ("YELLOW", yellow_area, yellow_cand),
-                      ("GREEN", green_area, green_cand)]
-        best_color, best_area, best_cand = max(candidates, key=lambda item: item[1])
+        raw_candidates = [red_cand, yellow_cand, green_cand]
+        candidates = [
+            classified for classified in (
+                self._classify_tl_candidate_by_position(cand, hsv)
+                for cand in raw_candidates
+            )
+            if classified is not None
+        ]
+        best_cand = max(candidates, key=lambda item: item["area"], default=None)
         self._traffic_light_candidate = best_cand
         if best_cand is not None:
-            detected_color = best_color
+            detected_color = best_cand["color"]
             self._draw_traffic_light_overlay(frame, best_cand)
 
         self.get_logger().info(
