@@ -157,49 +157,52 @@ camera; the WASD bridge only touches `/cmd_vel`, so they coexist. Saved frames a
 
 ## 5. Intersections (robust: curve→cross, straight→cross, doubles)
 
-Flow (geometry-agnostic, Duckietown-style): **FOLLOW → (zebra seen) slow-zone →
-APPROACH (center + align heading) → WAIT (decision) → COMMIT (open-loop turn) →
-re-acquire lane → travel guard**. Key design points already wired in:
+Current machine (vision-anchored): **FOLLOW → DETECT (zebra ≤ `detect_distance_cm`)
+→ ADVANCE (go straight to the cross, stop on the FIRST row by vision) → READ
+(square-up if skewed, then wait for the decision) → COMMIT (cross by time) →
+re-acquire lane → travel guard**. Key points:
 
-- APPROACH triggers on `entry_seen` (debounced, **does not require being centered**),
-  so a skewed curve-exit still catches the cross. It then **actively straightens**
-  (lateral centering + `k_align`·entry-slope) until centered, with a timeout that
-  falls back to FOLLOW if it can't.
-- The **feedforward is relaxed and speed is capped** (`intersection_slow_speed`) the
-  moment a zebra is seen → no overshoot into the cuadrito.
-- The **turn is an open-loop maneuver** (`commit_speed`/`commit_turn_w`/`commit_duration`),
-  then the bird's-eye follower re-acquires the branch. A **distance guard**
-  (`intersection_min_travel_m`) stops a double intersection from re-firing the one
-  you just left.
+- **DETECT → ADVANCE** fires when a zebra is seen within `detect_distance_cm`.
+  ADVANCE goes **straight** (`advance_center_gain` 0, no lane steering, so it
+  doesn't veer into the side dashes) at `approach_speed`.
+- ADVANCE **stops on the first cross row by VISION** — a jump in the zebra
+  distance (`read_cross_jump_cm`) or `dist ≤ read_distance_cm` — **not** by odom
+  (the command overestimates real distance; see the handoff). No square-up if it
+  arrived straight (`align_skip_when_straight`).
+- The **turn is open-loop** (`commit_turn_w` / `commit_duration`, straight uses
+  `commit_duration_straight`), with a minimum (`commit_min_s` /
+  `commit_straight_min_s`) so it fully **crosses the intersection and re-acquires
+  the continuing black line** (does not follow the dashes). A distance guard
+  (`intersection_min_travel_m`) stops a double cross from re-firing.
 
-Send the decision (or use the tuner keys `1/2/3` = L/S/R, `0` = reset):
+Send the decision (or use the tuner / control panel keys `1/2/3` = L/S/R, `0` = reset):
 ```bash
 scripts/set_intersection_jetson.sh left      # left | right | straight | reset
 ```
 
-**Params to tune on the robot** (live in the tuner, no rebuild):
+**Params to tune on the robot** (live, no rebuild — defaults in parens):
 
-| Param | What | Start |
+| Phase | Param | What |
 |---|---|---|
-| `commit_turn_w` + `commit_duration` | the actual ~90° L/R turn (biggest one) | 0.6 / 2.0 s |
-| `commit_duration_straight` | go-straight maneuver length | 1.5 s |
-| `k_align` | how hard APPROACH straightens a skewed entry (too high = wobble) | 0.6 |
-| `intersection_slow_speed` | slow-zone speed near a cross (keep > ~0.08 deadband) | 0.08 |
-| `intersection_min_travel_m` | gap before the next cross can fire (doubles) | 0.25 m |
-| `approach_timeout_s` | give up centering after this and resume FOLLOW | 6 s |
+| DETECT | `detect_distance_cm` (22) | zebra distance that triggers ADVANCE |
+| ADVANCE | `approach_speed` (0.06) | straight crawl to the cross (keep > ~0.08 cmd deadband in mind) |
+| ADVANCE | `advance_center_gain` (0) | lane steering during advance — keep 0 (go straight) |
+| ADVANCE→READ | `read_distance_cm` (6) | stop when the cross row is this close |
+| ADVANCE→READ | `read_cross_jump_cm` (8) | stop on a distance jump (crossing the first row) |
+| READ | `align_in_place` (off) / `align_skip_when_straight` (on) | square-up the heading, but skip it if it arrived straight |
+| COMMIT | `commit_turn_w` (0.6) + `commit_duration` (3.5 s) | the ~90° L/R turn |
+| COMMIT | `commit_duration_straight` (6 s) | go-straight maneuver length |
+| COMMIT | `commit_min_s` (2) / `commit_straight_min_s` (4.5) | minimum cross time so it clears the cross before re-acquiring |
+| guard | `intersection_min_travel_m` (0.25) | gap before the next cross can fire (doubles) |
 
-> Note `k_align`'s sign: if APPROACH turns the **wrong** way to straighten, flip
-> `k_align` negative. Tune `commit_turn_w`/`commit_duration` first on a single cross
-> until L/R land on the exit lane, then test a double.
+> Tune `commit_turn_w`/`commit_duration` first on a single cross until L/R land on
+> the exit lane, then raise `commit_*_min_s` until it always clears the dashes and
+> re-locks the continuing line, then test a double. Curve→cross arrives skewed —
+> `align_in_place` helps but is still imperfect (see the handoff open issues).
 
 Future (not yet implemented): a **topological map** of the track (graph of crosses +
-route) for known sequences — see `docs/LANE_FOLLOWING.md`.
-
-> The current node uses a vision-anchored machine **FOLLOW → DETECT → ADVANCE
-> (stop on the first cross row by vision) → READ (manual `1/2/3` or a latched
-> sign) → COMMIT**. Param names and behaviour are in
-> [`docs/HANDOFF_2026-06-08.md`](HANDOFF_2026-06-08.md); the table above is the
-> older APPROACH/WAIT framing kept for tuning intuition.
+route) for known sequences — see `docs/LANE_FOLLOWING.md`. Full behaviour & open
+issues: [`docs/HANDOFF_2026-06-08.md`](HANDOFF_2026-06-08.md).
 
 ---
 
