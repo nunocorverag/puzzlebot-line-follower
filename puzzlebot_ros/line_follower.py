@@ -207,7 +207,7 @@ class AutonomousRacer(Node):
         # the ring just outside the disc must be grayish. Rejects loose colored
         # objects (red cable, chair) not inside the panel.
         self.declare_parameter('traffic_light_require_plate', bool(traffic_saved.get('traffic_light_require_plate', True)))
-        self.declare_parameter('traffic_light_plate_max_sat', float(traffic_saved.get('traffic_light_plate_max_sat', 95.0)))
+        self.declare_parameter('traffic_light_plate_max_sat', float(traffic_saved.get('traffic_light_plate_max_sat', 70.0)))
         self.declare_parameter('traffic_light_plate_min_val', float(traffic_saved.get('traffic_light_plate_min_val', 45.0)))
         self.declare_parameter('traffic_light_plate_max_val', float(traffic_saved.get('traffic_light_plate_max_val', 210.0)))
         self._tl_require_plate = bool(self.get_parameter('traffic_light_require_plate').value)
