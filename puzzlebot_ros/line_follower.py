@@ -189,6 +189,28 @@ class AutonomousRacer(Node):
         # =========================================================
         self.min_area = 500
         self.threshold_frames = 3
+        traffic_saved = {}
+        traffic_found = self._find_config('control_params.json')
+        if traffic_found is not None:
+            try:
+                traffic_saved = json.loads(traffic_found.read_text())
+            except (OSError, json.JSONDecodeError):
+                traffic_saved = {}
+        self.declare_parameter('traffic_light_roi_y_pct', int(traffic_saved.get('traffic_light_roi_y_pct', 55)))
+        self.declare_parameter('traffic_light_min_area', float(traffic_saved.get('traffic_light_min_area', 80.0)))
+        self.declare_parameter('traffic_light_max_area', float(traffic_saved.get('traffic_light_max_area', 5000.0)))
+        self.declare_parameter('traffic_light_min_circularity', float(traffic_saved.get('traffic_light_min_circularity', 0.65)))
+        self.declare_parameter('traffic_light_aspect_tol', float(traffic_saved.get('traffic_light_aspect_tol', 0.35)))
+        self.declare_parameter('traffic_light_min_fill', float(traffic_saved.get('traffic_light_min_fill', 0.45)))
+        self.declare_parameter('traffic_light_max_fill', float(traffic_saved.get('traffic_light_max_fill', 1.15)))
+        self._tl_roi_y_pct = int(self.get_parameter('traffic_light_roi_y_pct').value)
+        self._tl_min_area = float(self.get_parameter('traffic_light_min_area').value)
+        self._tl_max_area = float(self.get_parameter('traffic_light_max_area').value)
+        self._tl_min_circularity = float(self.get_parameter('traffic_light_min_circularity').value)
+        self._tl_aspect_tol = float(self.get_parameter('traffic_light_aspect_tol').value)
+        self._tl_min_fill = float(self.get_parameter('traffic_light_min_fill').value)
+        self._tl_max_fill = float(self.get_parameter('traffic_light_max_fill').value)
+        self._traffic_light_candidate = None
 
         # Default GREEN: with the optional light (default) the robot drives unless a
         # RED is actually seen. In strict mode this is corrected by the HSV machine.
@@ -996,6 +1018,20 @@ class AutonomousRacer(Node):
                 self._commit_closed_loop = bool(p.value)
             elif p.name == 'stream_debug':
                 self._stream_debug = bool(p.value)
+            elif p.name == "traffic_light_roi_y_pct":
+                self._tl_roi_y_pct = int(p.value)
+            elif p.name == "traffic_light_min_area":
+                self._tl_min_area = float(p.value)
+            elif p.name == "traffic_light_max_area":
+                self._tl_max_area = float(p.value)
+            elif p.name == "traffic_light_min_circularity":
+                self._tl_min_circularity = float(p.value)
+            elif p.name == "traffic_light_aspect_tol":
+                self._tl_aspect_tol = float(p.value)
+            elif p.name == "traffic_light_min_fill":
+                self._tl_min_fill = float(p.value)
+            elif p.name == "traffic_light_max_fill":
+                self._tl_max_fill = float(p.value)
             elif p.name == 'workers_speed_factor':
                 self._workers_speed_factor = float(p.value)
             elif p.name == 'workers_slow_s':
@@ -1099,6 +1135,13 @@ class AutonomousRacer(Node):
                 'align_straight_off': self._align_straight_off,
                 'align_straight_curv': self._align_straight_curv,
                 'read_after_entry_max_cm': self._read_after_entry_max_cm,
+                'traffic_light_roi_y_pct': self._tl_roi_y_pct,
+                'traffic_light_min_area': self._tl_min_area,
+                'traffic_light_max_area': self._tl_max_area,
+                'traffic_light_min_circularity': self._tl_min_circularity,
+                'traffic_light_aspect_tol': self._tl_aspect_tol,
+                'traffic_light_min_fill': self._tl_min_fill,
+                'traffic_light_max_fill': self._tl_max_fill,
                 'snapshot_interval': self._snapshot_interval,
             }, indent=2))
             zebra_path = self._config_save_path('zebra_params.json')
@@ -1116,15 +1159,29 @@ class AutonomousRacer(Node):
         effective = "GREEN" if self._ignore_traffic_light else self.current_state
         if effective == "RED":
             return ("STOP: red light", (0, 0, 255))
-        if self.intersection_phase == 'wait':
+        if self.intersection_phase == "wait":
             return ("READ: decision", (0, 0, 255))
-        if self.intersection_phase == 'approach':
+        if self.intersection_phase == "approach":
             return ("ADVANCE", (0, 255, 255))
         if self.commit_direction is not None:
             return (f"COMMIT {self.commit_direction}", (255, 160, 0))
         if self.time_line_lost is not None:
             return ("RECOVER: line lost", (0, 128, 255))
         return ("FOLLOW", (0, 255, 0))
+
+    def _draw_traffic_light_overlay(self, frame, cand):
+        if cand is None:
+            return
+        color_map = {"RED": (0, 0, 255), "YELLOW": (0, 255, 255), "GREEN": (0, 255, 0)}
+        col = color_map.get(cand.get("color"), (255, 255, 255))
+        cx, cy = cand["center"]
+        radius = cand["radius"]
+        x, y, bw, bh = cand["bbox"]
+        cv2.rectangle(frame, (x, y), (x + bw, y + bh), col, 2)
+        cv2.circle(frame, (int(cx), int(cy)), int(radius), col, 2)
+        txt = f"TL {cand['color']} c={cand['circularity']:.2f} fill={cand['fill']:.2f}"
+        cv2.putText(frame, txt, (x, max(18, y - 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
 
     def _draw_status_hud(self, frame, cmd):
         """Translucent top banner: state, drive/light, lane metrics, gains, cmd."""
@@ -1141,6 +1198,13 @@ class AutonomousRacer(Node):
         curv = lr.curvature_norm if lr is not None else 0.0
         light = "IGN" if self._ignore_traffic_light else self.current_state
 
+        tlextra = ""
+        tl = self._traffic_light_candidate
+        if tl is not None:
+            cx, cy = tl["center"]
+            tlextra = " TL:{}@{:.0f},{:.0f} r{:.0f}".format(
+                tl["color"], cx, cy, tl["radius"])
+
         zextra = ""
         if self._use_zebra_bev and self.zebra_result is not None and self.zebra_result.seen:
             zr = self.zebra_result
@@ -1150,7 +1214,7 @@ class AutonomousRacer(Node):
         cv2.putText(frame, label, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
         line2 = (f"drive:{'ON' if self._drive_enabled else 'off'}  light:{light}  "
                  f"{src} off:{off:+.2f} conf:{conf:.2f} curv:{curv:+.2f}  "
-                 f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}{zextra}")
+                 f"v:{cmd.linear.x:.3f} w:{cmd.angular.z:+.2f}{tlextra}{zextra}")
         cv2.putText(frame, line2, (10, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
                     (255, 255, 255), 1)
         gains = (f"kp:{self.kp:.4f} kd:{self.kd:.4f} ff:{self.ff_gain:.2f} "
@@ -1731,29 +1795,53 @@ class AutonomousRacer(Node):
     # =============================================================
     # TRAFFIC LIGHT DETECTOR
     # =============================================================
-    def detect_color(self, mask):
+    def detect_color(self, mask, color_name="UNKNOWN"):
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
+        h, _w = mask.shape[:2]
+        roi_y = int(h * max(1, min(100, self._tl_roi_y_pct)) / 100.0)
+        if roi_y < h:
+            mask[roi_y:, :] = 0
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        largest_area = 0
-        largest_contour = None
-
+        best = None
         for c in contours:
-            area = cv2.contourArea(c)
-            if area > largest_area:
-                largest_area = area
-                largest_contour = c
+            area = float(cv2.contourArea(c))
+            if not (self._tl_min_area <= area <= self._tl_max_area):
+                continue
+            perim = float(cv2.arcLength(c, True))
+            if perim <= 1e-3:
+                continue
+            x, y, bw, bh = cv2.boundingRect(c)
+            aspect = bw / float(max(1, bh))
+            if not (1.0 - self._tl_aspect_tol <= aspect <= 1.0 + self._tl_aspect_tol):
+                continue
+            circularity = 4.0 * math.pi * area / (perim * perim)
+            if circularity < self._tl_min_circularity:
+                continue
+            (cx, cy), radius = cv2.minEnclosingCircle(c)
+            circle_area = math.pi * radius * radius
+            fill = area / circle_area if circle_area > 1e-3 else 0.0
+            if not (self._tl_min_fill <= fill <= self._tl_max_fill):
+                continue
+            cand = {
+                "color": color_name, "area": area, "center": (float(cx), float(cy)),
+                "radius": float(radius), "bbox": (int(x), int(y), int(bw), int(bh)),
+                "circularity": float(circularity), "fill": float(fill),
+            }
+            if best is None or cand["area"] > best["area"]:
+                best = cand
 
-        return largest_area, largest_contour, mask
+        return (0.0 if best is None else best["area"]), best, mask
 
     # =============================================================
     # ANCHOR ASSIGNMENT HELPER
     # Matches a pool of candidates to three named anchors using a
-    # greedy nearest-neighbour approach.  Each candidate can only
+    # greedy nearest-neighbour approach. Each candidate can only
     # be consumed once, and candidates that are too far from any
-    # anchor are ignored.  If an anchor has no matching candidate
+    # anchor are ignored. If an anchor has no matching candidate
     # its previous position is kept (freeze-last-known).
     # =============================================================
     def _assign_to_anchors(self, candidates, anchor_left, anchor_middle, anchor_right, x_start, y_start):
@@ -1990,19 +2078,23 @@ class AutonomousRacer(Node):
         yellow_mask = cv2.inRange(hsv, np.array([20, 150, 120]), np.array([32, 255, 255]))
         green_mask  = cv2.inRange(hsv, np.array([40, 120, 120]), np.array([85, 255, 255]))
 
-        red_area,    _, _ = self.detect_color(red_mask)
-        yellow_area, _, _ = self.detect_color(yellow_mask)
-        green_area,  _, _ = self.detect_color(green_mask)
+        red_area, red_cand, _ = self.detect_color(red_mask, "RED")
+        yellow_area, yellow_cand, _ = self.detect_color(yellow_mask, "YELLOW")
+        green_area, green_cand, _ = self.detect_color(green_mask, "GREEN")
 
         detected_color = "UNKNOWN"
-        if max(red_area, yellow_area, green_area) > self.min_area:
-            if   red_area    > yellow_area and red_area    > green_area:  detected_color = "RED"
-            elif yellow_area > red_area    and yellow_area > green_area:  detected_color = "YELLOW"
-            elif green_area  > red_area    and green_area  > yellow_area: detected_color = "GREEN"
+        candidates = [("RED", red_area, red_cand),
+                      ("YELLOW", yellow_area, yellow_cand),
+                      ("GREEN", green_area, green_cand)]
+        best_color, best_area, best_cand = max(candidates, key=lambda item: item[1])
+        self._traffic_light_candidate = best_cand
+        if best_cand is not None:
+            detected_color = best_color
+            self._draw_traffic_light_overlay(frame, best_cand)
 
         self.get_logger().info(
             f"[VISION] Areas -> R:{red_area:.0f} Y:{yellow_area:.0f} G:{green_area:.0f} "
-            f"| Raw Detect: {detected_color} | Active State: {self.current_state}",
+            f"| Raw Detect: {detected_color} | Active State: {self.current_state} | TL: {self._traffic_light_candidate}",
             throttle_duration_sec=1.0,
         )
 
