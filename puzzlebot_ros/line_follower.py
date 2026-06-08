@@ -190,7 +190,9 @@ class AutonomousRacer(Node):
         self.min_area = 500
         self.threshold_frames = 3
 
-        self.current_state = "RED"
+        # Default GREEN: with the optional light (default) the robot drives unless a
+        # RED is actually seen. In strict mode this is corrected by the HSV machine.
+        self.current_state = "GREEN"
         self.last_state = "UNKNOWN"
 
         self.red_count = 0
@@ -299,6 +301,14 @@ class AutonomousRacer(Node):
         # without needing to see a real GREEN light.
         self.declare_parameter('ignore_traffic_light', False)
         self._ignore_traffic_light = bool(self.get_parameter('ignore_traffic_light').value)
+        # OPTIONAL traffic light (default): drive by default (as if GREEN) and only
+        # OBEY the light when one is actually seen -- a sustained RED stops, and when
+        # the light leaves view it returns to GREEN. This is what the user wants:
+        # "the light is off at the start; only act on it if it appears." Set
+        # traffic_light_optional:=false for STRICT mode (must see GREEN to move).
+        self.declare_parameter('traffic_light_optional', True)
+        self._traffic_light_optional = bool(self.get_parameter('traffic_light_optional').value)
+        self._tl_unknown_count = 0
 
         # --- YOLO traffic signs (best.pt) -------------------------------------
         # Gated by use_signs (default False so it can NEVER break line following;
@@ -1998,16 +2008,25 @@ class AutonomousRacer(Node):
 
         if detected_color == "RED":
             self.red_count    += 1; self.yellow_count  = 0; self.green_count = 0
+            self._tl_unknown_count = 0
         elif detected_color == "YELLOW":
             self.yellow_count += 1; self.red_count     = 0; self.green_count = 0
+            self._tl_unknown_count = 0
         elif detected_color == "GREEN":
             self.green_count  += 1; self.red_count     = 0; self.yellow_count = 0
+            self._tl_unknown_count = 0
         else:
             self.red_count = 0; self.yellow_count = 0; self.green_count = 0
+            self._tl_unknown_count += 1
 
         if   self.red_count    >= self.threshold_frames: self.current_state = "RED"
         elif self.yellow_count >= self.threshold_frames: self.current_state = "YELLOW"
         elif self.green_count  >= self.threshold_frames: self.current_state = "GREEN"
+        # OPTIONAL light: no light in view for a while -> drive (GREEN). So a RED
+        # only holds while the light is actually visible; it never strands the robot.
+        elif (self._traffic_light_optional
+              and self._tl_unknown_count >= self.threshold_frames):
+            self.current_state = "GREEN"
 
         if self.current_state != self.last_state:
             self.get_logger().info(

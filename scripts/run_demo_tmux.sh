@@ -19,7 +19,9 @@ source "${SCRIPT_DIR}/lib/common.sh"
 
 SESSION="${SESSION:-line_follower_demo}"
 READY_FILE="/tmp/${SESSION}_ready"
-IGNORE_TRAFFIC_LIGHT="${IGNORE_TRAFFIC_LIGHT:-1}"
+IGNORE_TRAFFIC_LIGHT="${IGNORE_TRAFFIC_LIGHT:-0}"   # 0 = optional light (obey RED only if seen)
+TRAFFIC_LIGHT_OPTIONAL="${TRAFFIC_LIGHT_OPTIONAL:-1}"
+USE_SIGNS="${USE_SIGNS:-0}"                         # 1 = enable YOLO signs
 NO_BUILD="${NO_BUILD:-0}"
 DASH="${DASH:-1}"
 MOTOR_BOOT_WAIT_S="${MOTOR_BOOT_WAIT_S:-4}"
@@ -71,7 +73,7 @@ tmux send-keys -t "${P_BUILD}" "echo '[build] sync -> Jetson'; scripts/sync_to_j
 tmux send-keys -t "${P_MOTOR}" "while [ ! -f '${READY_FILE}' ]; do echo '[motor] waiting for build...'; sleep 1; done; echo '[motor] starting micro-ROS agent'; scripts/run_motor_agent_jetson.sh; exec bash" C-m
 
 # 3. Follower (after build + a motor head start). Drive stays off until 'd'.
-tmux send-keys -t "${P_FOLLOWER}" "while [ ! -f '${READY_FILE}' ]; do echo '[follower] waiting for build...'; sleep 1; done; echo '[follower] motor head start ${MOTOR_BOOT_WAIT_S}s'; sleep '${MOTOR_BOOT_WAIT_S}'; echo '[follower] starting'; IGNORE_TRAFFIC_LIGHT='${IGNORE_TRAFFIC_LIGHT}' STREAM='${STREAM}' scripts/run_line_follower_jetson.sh; rc=\$?; echo '[follower] exited rc='\$rc; exec bash" C-m
+tmux send-keys -t "${P_FOLLOWER}" "while [ ! -f '${READY_FILE}' ]; do echo '[follower] waiting for build...'; sleep 1; done; echo '[follower] motor head start ${MOTOR_BOOT_WAIT_S}s'; sleep '${MOTOR_BOOT_WAIT_S}'; echo '[follower] starting'; IGNORE_TRAFFIC_LIGHT='${IGNORE_TRAFFIC_LIGHT}' TRAFFIC_LIGHT_OPTIONAL='${TRAFFIC_LIGHT_OPTIONAL}' USE_SIGNS='${USE_SIGNS}' STREAM='${STREAM}' scripts/run_line_follower_jetson.sh; rc=\$?; echo '[follower] exited rc='\$rc; exec bash" C-m
 
 # 4. Dashboard (UDP telemetry; skipped when DASH=0).
 if [ "${DASH}" = "1" ]; then

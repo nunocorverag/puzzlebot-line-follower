@@ -26,6 +26,13 @@ fi
 if [ "${IGNORE_TRAFFIC_LIGHT:-0}" = "1" ]; then
   PARAMS="${PARAMS} -p ignore_traffic_light:=true"
 fi
+# Optional traffic light (default on): drive unless a RED is actually seen.
+# Set TRAFFIC_LIGHT_OPTIONAL=0 for strict (must see GREEN to move).
+PARAMS="${PARAMS} -p traffic_light_optional:=$([ "${TRAFFIC_LIGHT_OPTIONAL:-1}" = "1" ] && echo true || echo false)"
+# YOLO signs (workers/stop/give_way/turn/straight). USE_SIGNS=1 to enable.
+if [ "${USE_SIGNS:-0}" = "1" ]; then
+  PARAMS="${PARAMS} -p use_signs:=true"
+fi
 if [ "${CONTROLLER_LOG:-1}" = "1" ]; then
   PARAMS="${PARAMS} -p controller_log:=true"   # CSV -> puzzlebot_ros/controller_data.csv
 fi
