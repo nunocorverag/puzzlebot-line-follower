@@ -213,7 +213,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('traffic_light_position_classify', bool(traffic_saved.get('traffic_light_position_classify', True)))
         self.declare_parameter('traffic_light_position_map', str(traffic_saved.get('traffic_light_position_map', 'GREEN,YELLOW,RED')))
         self.declare_parameter('traffic_light_position_anchors_pct',
-                               str(traffic_saved.get('traffic_light_position_anchors_pct', '27,39,50')))
+                               str(traffic_saved.get('traffic_light_position_anchors_pct', '27,50,73')))
         self.declare_parameter('traffic_light_position_max_slot_error_pct',
                                float(traffic_saved.get('traffic_light_position_max_slot_error_pct', 8.0)))
         self.declare_parameter('traffic_light_plate_min_area',
@@ -1891,9 +1891,9 @@ class AutonomousRacer(Node):
             anchors = []
         if len(anchors) != 3 or any(anchor <= 0.0 or anchor >= 1.0 for anchor in anchors):
             self.get_logger().warn(
-                f"Invalid traffic_light_position_anchors_pct={value!r}; using 27,39,50"
+                f"Invalid traffic_light_position_anchors_pct={value!r}; using 27,50,73"
             )
-            return [0.27, 0.39, 0.50]
+            return [0.27, 0.50, 0.73]
         return anchors
 
     def _estimate_tl_plate_bbox(self, hsv, cand):
