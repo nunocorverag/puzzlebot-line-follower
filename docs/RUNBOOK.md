@@ -195,6 +195,42 @@ scripts/set_intersection_jetson.sh left      # left | right | straight | reset
 Future (not yet implemented): a **topological map** of the track (graph of crosses +
 route) for known sequences — see `docs/LANE_FOLLOWING.md`.
 
+> The current node uses a vision-anchored machine **FOLLOW → DETECT → ADVANCE
+> (stop on the first cross row by vision) → READ (manual `1/2/3` or a latched
+> sign) → COMMIT**. Param names and behaviour are in
+> [`docs/HANDOFF_2026-06-08.md`](HANDOFF_2026-06-08.md); the table above is the
+> older APPROACH/WAIT framing kept for tuning intuition.
+
+---
+
+## 6. Traffic signs (YOLO) & traffic light
+
+Both are **opt-in and non-blocking** — they never break line following.
+
+**Signs** (off by default) — enable with `USE_SIGNS=1`:
+
+```bash
+USE_SIGNS=1 scripts/run_demo_tmux.sh        # or USE_SIGNS=1 scripts/run_line_follower_jetson.sh
+```
+
+- `trabajadores` → slow (`workers_speed_factor`) for `workers_slow_s`.
+- `stop`/`give-way` → halt `stop_seconds`/`giveway_seconds`, **only when close**
+  (`area_pct ≥ sign_act_area_pct`).
+- arrows / `straight` → latch the next cross decision (manual `1/2/3` overrides).
+- `USE_SIGNS=1` preloads torch's libgomp and keeps user-site so ultralytics
+  imports on the Jetson; the log line `[signs] model loaded` confirms it.
+- `best.pt` classes are Spanish; the detector maps them by substring.
+
+**Traffic light** — optional by default (`traffic_light_optional`): the robot
+drives without waiting for green and only obeys a RED/YELLOW it actually sees,
+validated by circular shape on the gray screen/plate. To require a GREEN before
+moving: `TRAFFIC_LIGHT_OPTIONAL=0`. To ignore the light entirely (testing):
+`IGNORE_TRAFFIC_LIGHT=1`.
+
+> Known issue: a red reflection near the screen can be marked as a false RED
+> (debounce protects behaviour). Robust fix (classify by disc position on the
+> screen) is pending — see the handoff.
+
 ---
 
 ## Cleanup
@@ -221,6 +257,8 @@ ssh puzzlebot@10.10.0.100 "pgrep -af 'line_follower|micro_ros_agent|param_tuner'
 | Wheels don't move with `drive on` | Motor agent (T1) not running, or robot/board power off. |
 | Robot stuck in `WAIT` on a straight | False intersection (puzzle-floor seams look like zebra). `set_intersection_jetson.sh reset`. |
 | Weird/contradictory motion | Multiple followers running → `stop_demo.sh`, then start ONE. |
+| Signs not detected / no `[signs] model loaded` | Launch with `USE_SIGNS=1`; check `config/best.pt` exists and ultralytics imports (`python3 -c "import ultralytics"` on the Jetson). |
+| Robot stops for no light | False RED reflection near the screen; raise `traffic_light_plate_max_sat` strictness or run with `IGNORE_TRAFFIC_LIGHT=1` to confirm. |
 
 ---
 

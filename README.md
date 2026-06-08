@@ -6,17 +6,24 @@ laptop/Jetson workflow used in the Manchester projects.
 
 ## Handoff / Working Memory
 
-For the full current context of what has been implemented, what worked, what failed, current calibration values, and next steps, read:
+For the full current context of what has been implemented, what worked, what failed, current calibration values, and next steps, read the latest handoff:
 
 ```text
-docs/HANDOFF_CONTEXT.md
+docs/HANDOFF_2026-06-08.md
 ```
+
+(Older handoffs `docs/HANDOFF_2026-06-04.md` / `docs/HANDOFF_CONTEXT.md` are kept
+for history but are superseded.)
 
 ## Layout
 
 - `puzzlebot_ros/line_follower.py`: current autonomous racer node. It reads the
-  Jetson CSI camera, follows the line, handles traffic-light state, publishes
-  `/cmd_vel`, and exposes MJPEG on `http://10.10.0.100:8080`.
+  Jetson CSI camera, follows the line, runs the cross/intersection state machine,
+  the optional traffic light and optional YOLO signs, publishes `/cmd_vel`, and
+  exposes MJPEG on `http://10.10.0.100:8080`.
+- `puzzlebot_ros/perception/`: ROS-free perception modules shared by the node and
+  the offline tools — `lane.py` (line follower), `zebra.py` (cross detector),
+  `signs.py` (YOLO sign detector).
 - `puzzlebot_ros/traffic_light.py`: standalone HSV traffic-light node.
 - `puzzlebot_ros/pictures.py`: chessboard capture for camera intrinsics.
 - `puzzlebot_ros/stopnoise.py`: emergency zero-`/cmd_vel` helper node.
@@ -114,6 +121,30 @@ ros2 topic pub --once /intersection_decision std_msgs/msg/String "{data: 'right'
 Spanish aliases also work: `izquierda`, `recto`, `adelante`, `derecha`.
 After receiving a valid decision, the robot performs a short slow commit
 maneuver and then resumes normal line following.
+
+## Traffic Signs (YOLO) & Traffic Light
+
+Both are **opt-in / non-blocking** — they never break line following.
+
+YOLO signs (off by default) are enabled with `USE_SIGNS=1`:
+
+```bash
+USE_SIGNS=1 scripts/run_demo_tmux.sh
+```
+
+`best.pt` (Spanish classes) maps to driving actions: `trabajadores` slows down,
+`stop`/`give-way` halt for a few seconds (only when close), and the arrows /
+`straight` latch the next cross decision (the manual `1/2/3` still overrides).
+`USE_SIGNS=1` makes the run script preload torch's libgomp and keep user-site so
+ultralytics imports on the Jetson.
+
+The **traffic light is optional** (`traffic_light_optional`, default on): the
+robot drives by default and only obeys a RED/YELLOW that is actually seen — it
+does not wait for green. The light is validated by circular shape on the gray
+screen/plate so stray colored objects (and a STOP sign's red) are rejected.
+
+See **[docs/HANDOFF_2026-06-08.md](docs/HANDOFF_2026-06-08.md)** for the full
+behaviour, params, and current open issues.
 
 ## Camera Undistortion
 
