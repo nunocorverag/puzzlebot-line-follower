@@ -75,6 +75,15 @@ class ZebraParams:
                                    # tilt (robot ~square to the cross). A skewed
                                    # approach (coming off a curve) gives garbage
                                    # exits, so we refuse to guess until aligned.
+    # --- straight exit classification ---
+    straight_by_line: bool = True   # straight is the continuous black lane, not dashes
+    straight_min_len_cm: float = 8.0
+    straight_corridor_cm: float = 11.8
+    straight_black_thresh: int = 90
+    straight_max_width_cm: float = 7.0
+    straight_aspect_min: float = 1.35
+    straight_lookahead_cm: float = 34.0
+    straight_entry_gap_cm: float = 4.0
     # --- debounce / motion ---
     stable_frames_needed: int = 3
     slow_distance_cm: float = 30.0  # start slowing when row within this
@@ -102,6 +111,7 @@ class ZebraResult:
                                                         # straight/right/none
     option_debug: dict = field(default_factory=dict)    # per-option accept/reject
                                                         # reason (why it offered X)
+    straight_line_px: tuple | None = None                # bbox in wide-BEV px
 
 
 # --------------------------------------------------------------------------- #
@@ -249,13 +259,72 @@ def _classify_options(cands, inl_set, row_y, zp: ZebraParams, row_x=0.0):
     return opts, bucket_of, reasons
 
 
+def _detect_straight_line(gray, row_y, row_x, zp: ZebraParams):
+    """Detect STRAIGHT as a continuous black component ahead of the entry row.
+
+    Dashes are short in Y; the true straight option is the solid lane line
+    crossing the zebra and continuing forward in the center corridor.
+    """
+    if not zp.straight_by_line:
+        return False, None, "disabled"
+
+    y_near_cm = row_y + zp.opt_margin_cm
+    y_far_cm = min(zp.max_fwd_cm, row_y + zp.straight_lookahead_cm)
+    if y_far_cm <= y_near_cm:
+        return False, None, "reject: no forward ROI"
+
+    x_center = zp.warp_w / 2.0 + row_x * zp.px_per_cm_x
+    half_w = max(2.0, 0.5 * zp.straight_corridor_cm * zp.px_per_cm_x)
+    x0 = int(max(0, round(x_center - half_w)))
+    x1 = int(min(zp.warp_w, round(x_center + half_w)))
+    y0 = int(max(0, round(zp.warp_h - y_far_cm * zp.px_per_cm_y)))
+    y1 = int(min(zp.warp_h, round(zp.warp_h - y_near_cm * zp.px_per_cm_y)))
+    if x1 <= x0 + 2 or y1 <= y0 + 2:
+        return False, None, "reject: empty ROI"
+
+    roi_gray = gray[y0:y1, x0:x1]
+    if zp.straight_black_thresh > 0:
+        roi = (roi_gray < int(zp.straight_black_thresh)).astype(np.uint8) * 255
+        roi = cv2.morphologyEx(roi, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    else:
+        roi = warped_black_mask(roi_gray, LaneParams())
+    n, _labels, stats, _cent = cv2.connectedComponentsWithStats(roi, 8)
+    best = None
+    best_h = 0.0
+    entry_gap_px = max(1.0, zp.straight_entry_gap_cm * zp.px_per_cm_y)
+    for label in range(1, n):
+        lx, ly, bw, bh, area = stats[label]
+        if area <= 0:
+            continue
+        h_cm = bh / zp.px_per_cm_y
+        w_cm = bw / zp.px_per_cm_x
+        bottom_gap_px = y1 - (y0 + ly + bh)
+        if h_cm < zp.straight_min_len_cm:
+            continue
+        if bottom_gap_px > entry_gap_px:
+            continue
+        if w_cm > zp.straight_max_width_cm:
+            continue
+        if h_cm < max(zp.straight_aspect_min * w_cm, zp.straight_min_len_cm):
+            continue
+        if h_cm > best_h:
+            best_h = h_cm
+            best = (x0 + lx, y0 + ly, bw, bh, h_cm, w_cm)
+
+    if best is None:
+        return (False, (x0, y0, x1 - x0, y1 - y0),
+                f"reject: no continuous line >= {zp.straight_min_len_cm:.0f}cm")
+    x, y, bw, bh, h_cm, w_cm = best
+    return True, (x, y, bw, bh), f"OK: line {h_cm:.0f}cm x {w_cm:.1f}cm"
+
+
 def analyze_zebra(frame_undistorted, lane_params: LaneParams, zp: ZebraParams,
                   M, stable_frames: int) -> ZebraResult:
     """One frame -> ZebraResult. ``M`` is the wide homography (cache it). Thread
     ``stable_frames`` across calls like the other detectors."""
     bev = cv2.warpPerspective(frame_undistorted, M, (zp.warp_w, zp.warp_h))
     gray = cv2.cvtColor(bev, cv2.COLOR_BGR2GRAY)
-    blobs, _mask = _bev_blobs(gray, lane_params)
+    blobs, mask = _bev_blobs(gray, lane_params)
     cands = _dash_filter(_to_cm(blobs, zp), zp)
     inl, dir_ = _ransac_transverse_row(cands, zp)
 
@@ -286,6 +355,14 @@ def analyze_zebra(frame_undistorted, lane_params: LaneParams, zp: ZebraParams,
                 opts, bucket_of, reasons = _classify_options(
                     cands, set(inl), float(np.median(ys)), zp,
                     row_x=float(np.median(xs)))
+                if zp.straight_by_line:
+                    opts = [o for o in opts if o != "straight"]
+                    ok, bbox, reason = _detect_straight_line(
+                        gray, float(np.median(ys)), float(np.median(xs)), zp)
+                    if ok:
+                        opts.append("straight")
+                    reasons["straight"] = reason
+                    res.straight_line_px = bbox
                 res.options = opts
                 res.dash_bucket = bucket_of
                 res.option_debug = reasons
@@ -321,6 +398,11 @@ def draw_zebra_overlay(bev, result: ZebraResult):
     for k, (px, py) in enumerate(result.dash_px):
         b = result.dash_bucket[k] if k < len(result.dash_bucket) else "none"
         cv2.circle(out, (int(px), int(py)), 6, _BUCKET_COLORS.get(b, (0, 200, 255)), -1)
+    if result.straight_line_px is not None:
+        x, y, w, h = [int(v) for v in result.straight_line_px[:4]]
+        ok = result.option_debug.get("straight", "").startswith("OK")
+        col = (0, 255, 0) if ok else (80, 80, 255)
+        cv2.rectangle(out, (x, y), (x + w, y + h), col, 2)
     d = "--" if result.distance_cm is None else f"{result.distance_cm:.0f}"
     a = "--" if result.angle_deg is None else f"{result.angle_deg:+.0f}"
     cv2.rectangle(out, (0, 0), (out.shape[1], 24), (0, 0, 0), -1)

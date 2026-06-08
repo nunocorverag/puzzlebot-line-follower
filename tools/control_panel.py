@@ -68,6 +68,13 @@ GROUPS = [
         ("zebra.option_align_deg",   "f", 1.0,    "max skew to trust options"),
         ("zebra.opt_min_dashes",     "i", 1,      "exit dashes required"),
         ("zebra.opt_min_span_cm",    "f", 1.0,    "exit lateral span"),
+        ("zebra.straight_by_line",  "b", 1,      "straight uses continuous line"),
+        ("zebra.straight_min_len_cm", "f", 1.0,    "min continuous straight line"),
+        ("zebra.straight_corridor_cm", "f", 1.0,   "central line corridor width"),
+        ("zebra.straight_black_thresh", "i", 5,     "dark threshold for straight line"),
+        ("zebra.straight_max_width_cm", "f", 0.5,    "max continuous line width"),
+        ("zebra.straight_aspect_min", "f", 0.05,     "min height/width ratio"),
+        ("zebra.straight_lookahead_cm", "f", 1.0,  "forward line search depth"),
     ]),
     ("Lane", [
         ("lane.eval_y_pct",          "i", 1,      "near steering read"),
@@ -112,7 +119,11 @@ DEFAULTS = {
     "zebra.stop_distance_cm": 10.0, "zebra.slow_distance_cm": 30.0,
     "zebra.min_dashes": 3, "zebra.min_span_cm": 7.0,
     "zebra.option_align_deg": 18.0, "zebra.opt_min_dashes": 2,
-    "zebra.opt_min_span_cm": 4.0, "zebra.widen_kx": 2.4,
+    "zebra.opt_min_span_cm": 4.0, "zebra.straight_by_line": True,
+    "zebra.straight_min_len_cm": 8.0, "zebra.straight_corridor_cm": 11.8,
+    "zebra.straight_black_thresh": 90, "zebra.straight_max_width_cm": 7.0,
+    "zebra.straight_aspect_min": 1.35, "zebra.straight_lookahead_cm": 34.0,
+    "zebra.widen_kx": 2.4,
     "lane.eval_y_pct": 72, "lane.lookahead_y_pct": 45,
     "lane.continuity": 1, "lane.base_hist_h_pct": 18,
     "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,
@@ -178,7 +189,10 @@ class Tuner(Node):
                 self.values[name] = val
 
     def set_value(self, name, kind, value):
-        value = round(value, 4) if kind == "f" else int(value)
+        if kind == "b":
+            value = bool(value)
+        else:
+            value = round(value, 4) if kind == "f" else int(value)
         self.values[name] = value
         if not self.set_cli.service_is_ready():
             self.msg = "param service not ready (follower running?)"
@@ -187,6 +201,9 @@ class Tuner(Node):
         if kind == "f":
             pv.type = ParameterType.PARAMETER_DOUBLE
             pv.double_value = float(value)
+        elif kind == "b":
+            pv.type = ParameterType.PARAMETER_BOOL
+            pv.bool_value = bool(value)
         else:
             pv.type = ParameterType.PARAMETER_INTEGER
             pv.integer_value = int(value)
@@ -285,11 +302,14 @@ def _draw(stdscr, tuner, page_idx, sel):
     row = 7
     for i, (name, kind, step, help_text) in enumerate(fields):
         val = tuner.values.get(name, 0.0)
-        valstr = f"{float(val):.4f}" if kind == "f" else f"{int(val)}"
+        if kind == "b":
+            valstr = "ON" if bool(val) else "off"
+        else:
+            valstr = f"{float(val):.4f}" if kind == "f" else f"{int(val)}"
         marker = ">" if i == sel else " "
         attr = curses.A_REVERSE if i == sel else curses.A_NORMAL
         eff = step * tuner.step_mult if kind == "f" else max(1, int(round(step * tuner.step_mult)))
-        eff_str = f"{eff:g}" if kind == "f" else f"{eff}"
+        eff_str = "toggle" if kind == "b" else (f"{eff:g}" if kind == "f" else f"{eff}")
         _safe_addstr(stdscr, row, 2,
                      f"{marker} {name:<26} {valstr:>8} st {eff_str:<5} {help_text}", attr)
         row += 1
@@ -332,11 +352,17 @@ def _loop(stdscr, tuner):
         elif key in (curses.KEY_UP, ord("k")):
             sel = (sel - 1) % len(fields)
         elif key in (curses.KEY_RIGHT, ord("="), ord("+"), ord(".")):
-            d = step * tuner.step_mult if kind == "f" else max(1, int(round(step * tuner.step_mult)))
-            tuner.set_value(name, kind, tuner.values[name] + d)
+            if kind == "b":
+                tuner.set_value(name, kind, True)
+            else:
+                d = step * tuner.step_mult if kind == "f" else max(1, int(round(step * tuner.step_mult)))
+                tuner.set_value(name, kind, tuner.values[name] + d)
         elif key in (curses.KEY_LEFT, ord("-"), ord("_"), ord(",")):
-            d = step * tuner.step_mult if kind == "f" else max(1, int(round(step * tuner.step_mult)))
-            tuner.set_value(name, kind, tuner.values[name] - d)
+            if kind == "b":
+                tuner.set_value(name, kind, False)
+            else:
+                d = step * tuner.step_mult if kind == "f" else max(1, int(round(step * tuner.step_mult)))
+                tuner.set_value(name, kind, tuner.values[name] - d)
         elif key in (ord("]"), ord("}")):
             tuner.step_mult = _next_mult(tuner.step_mult, +1)
             tuner.msg = f"step x{tuner.step_mult:g}"
