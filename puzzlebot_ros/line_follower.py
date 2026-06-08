@@ -2088,9 +2088,12 @@ class AutonomousRacer(Node):
         frame_blur = cv2.GaussianBlur(frame, (5, 5), 0)
         hsv = cv2.cvtColor(frame_blur, cv2.COLOR_BGR2HSV)
 
-        red_mask = cv2.inRange(hsv, np.array([0, 150, 100]), np.array([8, 255, 255])) + \
-                   cv2.inRange(hsv, np.array([172, 150, 100]), np.array([180, 255, 255]))
-        yellow_mask = cv2.inRange(hsv, np.array([20, 150, 120]), np.array([32, 255, 255]))
+        # Wider RED/YELLOW so the painted light disc is caught (the old S>=150 was
+        # too strict and missed the red/amber disc). The circular-shape filter +
+        # upper ROI keep floor/tan/clutter out. Green kept (it already worked).
+        red_mask = cv2.inRange(hsv, np.array([0, 90, 70]), np.array([10, 255, 255])) + \
+                   cv2.inRange(hsv, np.array([168, 90, 70]), np.array([180, 255, 255]))
+        yellow_mask = cv2.inRange(hsv, np.array([16, 90, 90]), np.array([34, 255, 255]))
         green_mask  = cv2.inRange(hsv, np.array([40, 120, 120]), np.array([85, 255, 255]))
 
         # Don't let the RED of a YOLO sign (e.g. the STOP octagon) be read as a red
