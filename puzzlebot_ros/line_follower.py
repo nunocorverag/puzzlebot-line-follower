@@ -395,6 +395,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('stop_seconds', 3.0)
         self.declare_parameter('giveway_seconds', 1.5)
         self.declare_parameter('sign_cooldown_s', 6.0)   # don't re-fire same sign
+        self.declare_parameter('sign_forget_s', 8.0)     # discard pending_turn if sign not seen
         # stop/give_way only ACT when the sign is CLOSE (its box is big enough = near).
         # Arrow/workers latch from farther (just min_box_pct). area_pct is a distance
         # proxy: bigger box => closer sign.
@@ -406,6 +407,7 @@ class AutonomousRacer(Node):
         self._stop_seconds = float(self.get_parameter('stop_seconds').value)
         self._giveway_seconds = float(self.get_parameter('giveway_seconds').value)
         self._sign_cooldown_s = float(self.get_parameter('sign_cooldown_s').value)
+        self._sign_forget_s = float(self.get_parameter('sign_forget_s').value)
         self._sign_detector = None
         if self._use_signs:
             mp = str(self.get_parameter('signs_model_path').value).strip()
@@ -418,6 +420,7 @@ class AutonomousRacer(Node):
                 log=self.get_logger().info)
         self._sign_result = None             # last SignResult (for HUD/telemetry)
         self._pending_turn = None            # 'left'/'right'/'straight' from a sign
+        self._pending_turn_until = None      # timeout: discard pending_turn if sign not seen
         self._workers_until = None           # slow-zone end time from a workers sign
         self._stopsign_until = None          # hold-still end time (stop/give_way)
         self._sign_last_fired = {}           # sign name -> last action time (cooldown)
@@ -941,22 +944,94 @@ class AutonomousRacer(Node):
             return
         res = self._sign_detector.detect(frame)
         self._sign_result = res
+        
+        # Log all detections for debugging and events
+        if res.all_detections:
+            signs_summary = ", ".join([
+                f"{s['name']}(c:{s['conf']:.2f},a:{s['area_pct']:.1f}%,sc:{s['score']:.2f})"
+                for s in res.all_detections
+            ])
+            self.get_logger().info(
+                f"[SIGN] Detected: {signs_summary} | Selected: {res.name or 'none'}",
+                throttle_duration_sec=2.0
+            )
+            # Event: log all detections with vote details
+            detections_for_event = []
+            for s in res.all_detections:
+                det = {
+                    'name': s['name'],
+                    'conf': round(s['conf'], 3),
+                    'area_pct': round(s['area_pct'], 2),
+                    'score': round(s['score'], 3)
+                }
+                if s.get('original_name'):
+                    det['corrected_from'] = s['original_name']
+                if s.get('vote_details'):
+                    det['votes'] = s['vote_details']
+                detections_for_event.append(det)
+            
+            self._event('signs_detected', 
+                       detections=detections_for_event,
+                       selected=res.name,
+                       selected_conf=round(res.conf, 3) if res.name else None,
+                       selected_area=round(res.area_pct, 2) if res.name else None)
+        
+        # Check if we have a pending turn from a directional sign
+        if self._pending_turn is not None:
+            # If the sign is still visible, refresh the timeout
+            if res.name in ('turn_left', 'turn_right', 'go_straight'):
+                self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
+            # If timeout expired, discard the pending turn
+            elif self._pending_turn_until is not None and now >= self._pending_turn_until:
+                discarded_turn = self._pending_turn
+                self.get_logger().warn(
+                    f"[SIGN] Discarding pending turn '{discarded_turn}' - sign not seen for {self._sign_forget_s}s"
+                )
+                self._event('sign_timeout', 
+                           discarded_turn=discarded_turn,
+                           timeout_s=self._sign_forget_s)
+                self._pending_turn = None
+                self._pending_turn_until = None
+        
         if res.name is None:
             return
         last = self._sign_last_fired.get(res.name)
         if last is not None and (now - last).nanoseconds * 1e-9 < self._sign_cooldown_s:
             return
+        
         name = res.name
         if name in ('turn_left', 'turn_right', 'go_straight'):
+            # Only act on directional signs when they are CLOSE (area >= threshold)
+            # This prevents confusion when multiple signs are visible but far away
+            if res.area_pct < self._sign_act_area_pct:
+                self.get_logger().info(
+                    f"[SIGN] {name} seen far (area {res.area_pct:.1f}% < "
+                    f"{self._sign_act_area_pct:.1f}%) -> waiting to get closer",
+                    throttle_duration_sec=1.0)
+                return
             self._pending_turn = {'turn_left': 'left', 'turn_right': 'right',
                                   'go_straight': 'straight'}[name]
+            self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
             self._sign_last_fired[name] = now
             self.get_logger().warn(
-                f"[SIGN] {name} ({res.conf:.2f}) -> auto-{self._pending_turn} at next cross")
+                f"[SIGN] {name} ({res.conf:.2f}, area {res.area_pct:.1f}%) -> auto-{self._pending_turn} at next cross "
+                f"(expires in {self._sign_forget_s}s if not seen)")
+            self._event('sign_action', 
+                       sign_name=name,
+                       action='pending_turn',
+                       direction=self._pending_turn,
+                       conf=round(res.conf, 3),
+                       area_pct=round(res.area_pct, 2),
+                       expires_s=self._sign_forget_s)
         elif name == 'workers':
             self._workers_until = now + Duration(seconds=self._workers_slow_s)
             self._sign_last_fired[name] = now
             self.get_logger().warn(f"[SIGN] workers ({res.conf:.2f}) -> slowing")
+            self._event('sign_action',
+                       sign_name=name,
+                       action='slow_zone',
+                       conf=round(res.conf, 3),
+                       duration_s=self._workers_slow_s)
         elif name in ('stop', 'give_way'):
             # Only act when the sign is CLOSE (box big enough). Far away we wait.
             if res.area_pct < self._sign_act_area_pct:
@@ -971,6 +1046,12 @@ class AutonomousRacer(Node):
                 self._sign_last_fired[name] = now
                 self.get_logger().warn(
                     f"[SIGN] {name} ({res.conf:.2f}, area {res.area_pct:.1f}) -> hold {dur:.1f}s")
+                self._event('sign_action',
+                           sign_name=name,
+                           action='stop_hold',
+                           conf=round(res.conf, 3),
+                           area_pct=round(res.area_pct, 2),
+                           duration_s=dur)
 
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
@@ -1652,8 +1733,33 @@ class AutonomousRacer(Node):
         # ADVANCE. Freeze a travel target from the MEASURED distance now, then drive
         # that far by ODOMETRY to the reading window, so we no longer need the row
         # in view while moving onto the cross (it leaves the camera when close).
+        # ROBUSTNESS: Only trigger if:
+        # 1. Zebra is seen and within range
+        # 2. No intersection phase active
+        # 3. Cooldown expired (prevent re-trigger after recent commit)
+        # 4. Sufficient stability (prevent false triggers)
+        # NOTE: pending_turn is OK - it will be used as auto-decision at the intersection
+        cooldown_ok = (self.intersection_cooldown_until is None 
+                      or now >= self.intersection_cooldown_until)
+        stable_ok = zres.stable_frames >= 3  # Require at least 3 consecutive frames
+        
+        # Debug: log why approach is rejected
         if (zres is not None and zres.seen and dist is not None
-                and dist <= self._detect_distance_cm and self.intersection_phase is None):
+                and dist <= self._detect_distance_cm 
+                and self.intersection_phase is None):
+            if not cooldown_ok:
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: cooldown active",
+                    throttle_duration_sec=2.0)
+            elif not stable_ok:
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: insufficient stability ({zres.stable_frames}/3 frames)",
+                    throttle_duration_sec=2.0)
+        
+        if (zres is not None and zres.seen and dist is not None
+                and dist <= self._detect_distance_cm 
+                and self.intersection_phase is None
+                and cooldown_ok and stable_ok):
             self.intersection_phase = 'approach'   # ADVANCE
             self._zebra_opt_votes = {}
             self._adv_odom0 = self._odom_m()
@@ -2054,14 +2160,48 @@ class AutonomousRacer(Node):
             # The light must sit ON the gray screen/plate: the ring just outside the
             # disc must be grayish (low saturation, mid value). This rejects loose
             # colored objects (red cable, chair) that are NOT inside the panel.
+            # ENHANCED: Also check that the object is in the central region (not at edges)
             if self._tl_require_plate and hsv is not None:
+                # Reject objects too far to the left or right (e.g., HDMI cable on side)
+                # Use 10%-90% to allow slightly off-center traffic lights
+                if cx < _w * 0.10 or cx > _w * 0.90:
+                    continue   # too far to the side -> reject
+                
+                # Reject objects in bottom half (traffic lights are always in upper half)
+                if cy > h * 0.5:
+                    continue   # too low -> reject
+                
+                # Check ring around the light (gray plate)
                 ring = np.zeros((h, _w), np.uint8)
                 cv2.circle(ring, (int(cx), int(cy)), int(2.2 * radius), 255, -1)
                 cv2.circle(ring, (int(cx), int(cy)), int(1.4 * radius), 0, -1)
                 _, s_ring, v_ring, _ = cv2.mean(hsv, mask=ring)
+                # Use configurable plate saturation threshold (allows tuning)
                 if not (s_ring <= self._tl_plate_max_sat
                         and self._tl_plate_min_val <= v_ring <= self._tl_plate_max_val):
                     continue   # not on the gray plate -> reject
+                
+                # Additional check: verify there's a large gray rectangular area around it
+                # (real traffic lights are mounted on a big gray panel, reflections are not)
+                plate_h = int(8.0 * radius)
+                plate_w = int(3.0 * radius)
+                py0 = max(0, int(cy - plate_h / 2))
+                py1 = min(h, int(cy + plate_h / 2))
+                px0 = max(0, int(cx - plate_w / 2))
+                px1 = min(_w, int(cx + plate_w / 2))
+                if py1 > py0 and px1 > px0:
+                    plate_roi = hsv[py0:py1, px0:px1]
+                    gray_in_plate = cv2.inRange(
+                        plate_roi,
+                        np.array([0, 0, int(self._tl_plate_min_val)], dtype=np.uint8),
+                        np.array([180, int(self._tl_plate_max_sat), int(self._tl_plate_max_val)], dtype=np.uint8),
+                    )
+                    gray_area = cv2.countNonZero(gray_in_plate)
+                    plate_area = (py1 - py0) * (px1 - px0)
+                    gray_ratio = gray_area / float(max(1, plate_area))
+                    # At least 30% of the surrounding area must be gray (traffic light panel)
+                    if gray_ratio < 0.30:
+                        continue   # not enough gray plate around -> likely a reflection
             cand = {
                 "color": color_name, "area": area, "center": (float(cx), float(cy)),
                 "radius": float(radius), "bbox": (int(x), int(y), int(bw), int(bh)),
@@ -2312,12 +2452,13 @@ class AutonomousRacer(Node):
         # Wider RED/YELLOW so the painted light disc is caught (the old S>=150 was
         # too strict and missed the red/amber disc). The circular-shape filter +
         # upper ROI keep floor/tan/clutter out. Green kept (it already worked).
-        red_mask = cv2.inRange(hsv, np.array([0, 90, 70]), np.array([10, 255, 255])) + \
-                   cv2.inRange(hsv, np.array([168, 90, 70]), np.array([180, 255, 255]))
-        # Yellow disc measured at HSV~(35,92,200): the old max H=34 missed it (it
-        # fell in the gap before green H>=40). Widen yellow to H[15..39], lower S.
-        yellow_mask = cv2.inRange(hsv, np.array([15, 80, 90]), np.array([39, 255, 255]))
-        green_mask  = cv2.inRange(hsv, np.array([42, 120, 120]), np.array([85, 255, 255]))
+        # RED: Increased min saturation to 120 to reject low-saturation red objects (HDMI cable)
+        red_mask = cv2.inRange(hsv, np.array([0, 120, 80]), np.array([10, 255, 255])) + \
+                   cv2.inRange(hsv, np.array([168, 120, 80]), np.array([180, 255, 255]))
+        # YELLOW: Widened range H[15..42] and lowered saturation to 60 for better far detection
+        yellow_mask = cv2.inRange(hsv, np.array([15, 60, 80]), np.array([42, 255, 255]))
+        # GREEN: Lowered saturation from 120 to 80 and value from 120 to 80 for better far detection
+        green_mask  = cv2.inRange(hsv, np.array([40, 80, 80]), np.array([90, 255, 255]))
 
         # Don't let the RED of a YOLO sign (e.g. the STOP octagon) be read as a red
         # traffic LIGHT: blank the detected sign's box (+margin) from the color masks.
@@ -2429,12 +2570,20 @@ class AutonomousRacer(Node):
             # Enter APPROACH on the centering-INDEPENDENT trigger (entry_seen). Coming
             # out of a curve the robot is skewed and would never satisfy the old
             # centered `dashed_detected` gate; APPROACH then actively straightens it.
+            # ROBUSTNESS: Same protections as zebra BEV path
+            stable_ok_legacy = self.intersection_stable >= 3
+            
             if (result is not None and result.entry_seen
                     and self.intersection_phase is None):
-                self.intersection_phase = 'approach'
-                self.intersection_options = result.options
-                self._approach_start_time = now
-                self.get_logger().info('[INTERSECTION] seen -> APPROACH (center + align)')
+                if not stable_ok_legacy:
+                    self.get_logger().info(
+                        f"[INTERSECTION] Approach blocked: insufficient stability ({self.intersection_stable}/3 frames)",
+                        throttle_duration_sec=2.0)
+                elif stable_ok_legacy:
+                    self.intersection_phase = 'approach'
+                    self.intersection_options = result.options
+                    self._approach_start_time = now
+                    self.get_logger().info('[INTERSECTION] seen -> APPROACH (center + align)')
 
             if self.intersection_phase in ('approach', 'wait') and self.intersection_result is not None:
                 self.intersection_options = self.intersection_result.options
