@@ -11,6 +11,7 @@
 #   NO_BUILD=1 scripts/run_demo_tmux.sh       # skip colcon build after sync
 #   DASH=0 scripts/run_demo_tmux.sh           # no local dashboard (frees UDP 5055)
 #   STREAM=none scripts/run_demo_tmux.sh      # no local H264 receiver
+#   USE_SIGNS=1 scripts/run_demo_tmux.sh     # enable YOLO traffic signs
 #   IGNORE_TRAFFIC_LIGHT=0 scripts/run_demo_tmux.sh  # require the traffic light
 set -euo pipefail
 
@@ -87,6 +88,7 @@ tmux send-keys -t "${P_PANEL}" "while [ ! -f '${READY_FILE}' ]; do echo '[panel]
 
 tmux select-window -t "${SESSION}:CONTROL"
 echo "tmux session '${SESSION}' started. Windows (Ctrl-b n/p):"
+echo "  knobs: USE_SIGNS=${USE_SIGNS} IGNORE_TRAFFIC_LIGHT=${IGNORE_TRAFFIC_LIGHT} TRAFFIC_LIGHT_OPTIONAL=${TRAFFIC_LIGHT_OPTIONAL} DASH=${DASH} NO_BUILD=${NO_BUILD}"
 echo "  CONTROL = the panel (press d / 1,2,3 here)."
 echo "  MONITOR = full-screen state-machine dashboard."
 echo "  LOGS    = build/motor/follower panes."
