@@ -34,11 +34,15 @@ class SignParams:
 # Tolerant mapping: match by substring so small naming differences in best.pt
 # (e.g. "turnLeft", "left_arrow", "roadworks", "yield") still resolve.
 _ALIASES = (
-    ("left", "turn_left"), ("right", "turn_right"),
-    ("straight", "go_straight"), ("ahead", "go_straight"), ("forward", "go_straight"),
-    ("stop", "stop"),
-    ("work", "workers"), ("men", "workers"), ("worker", "workers"),
-    ("give", "give_way"), ("yield", "give_way"),
+    # English + the Spanish class names trained in best.pt:
+    #   give-way, stop, straight, trabajadores, vuelta-derecha, vuelta-izquierda
+    ("izquierda", "turn_left"), ("left", "turn_left"),
+    ("derecha", "turn_right"), ("right", "turn_right"),
+    ("straight", "go_straight"), ("recto", "go_straight"),
+    ("ahead", "go_straight"), ("forward", "go_straight"), ("adelante", "go_straight"),
+    ("stop", "stop"), ("alto", "stop"),
+    ("trabaj", "workers"), ("work", "workers"), ("men", "workers"), ("obra", "workers"),
+    ("give", "give_way"), ("yield", "give_way"), ("ceda", "give_way"),
 )
 CANONICAL = {"turn_left", "turn_right", "go_straight", "stop", "workers", "give_way"}
 

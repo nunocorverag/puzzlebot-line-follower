@@ -69,6 +69,14 @@ ssh -X "${JETSON_USER}@${JETSON_HOST}" "bash -lc '
   source /opt/ros/humble/setup.bash
   source src/puzzlebot_ros/env_jetson.sh
   source install/setup.bash
-  export PYTHONNOUSERSITE=1
+  if [ \"${USE_SIGNS:-0}\" = \"1\" ]; then
+    # YOLO (ultralytics+torch) lives in ~/.local, so do NOT hide user-site here;
+    # and preload torch'\''s libgomp to avoid the Jetson static-TLS import error.
+    TLG=\$(ls \$HOME/.local/lib/python3.8/site-packages/torch.libs/libgomp-*.so* 2>/dev/null | head -1)
+    [ -n \"\$TLG\" ] && export LD_PRELOAD=\"\$TLG\"
+    echo \"[signs] user-site enabled, LD_PRELOAD=\$LD_PRELOAD\"
+  else
+    export PYTHONNOUSERSITE=1
+  fi
   ros2 run puzzlebot_ros \"${NODE}\" ${ROS_ARGS}
 '"
