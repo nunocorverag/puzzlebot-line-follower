@@ -210,7 +210,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('traffic_light_plate_max_sat', float(traffic_saved.get('traffic_light_plate_max_sat', 70.0)))
         self.declare_parameter('traffic_light_plate_min_val', float(traffic_saved.get('traffic_light_plate_min_val', 45.0)))
         self.declare_parameter('traffic_light_plate_max_val', float(traffic_saved.get('traffic_light_plate_max_val', 210.0)))
-        self.declare_parameter('traffic_light_position_classify', bool(traffic_saved.get('traffic_light_position_classify', True)))
+        self.declare_parameter('traffic_light_position_classify', bool(traffic_saved.get('traffic_light_position_classify', False)))
         self.declare_parameter('traffic_light_position_map', str(traffic_saved.get('traffic_light_position_map', 'GREEN,YELLOW,RED')))
         self.declare_parameter('traffic_light_position_anchors_pct',
                                str(traffic_saved.get('traffic_light_position_anchors_pct', '27,50,73')))
@@ -218,6 +218,16 @@ class AutonomousRacer(Node):
                                float(traffic_saved.get('traffic_light_position_max_slot_error_pct', 8.0)))
         self.declare_parameter('traffic_light_plate_min_area',
                                float(traffic_saved.get('traffic_light_plate_min_area', 900.0)))
+        self.declare_parameter('traffic_light_action_min_radius_px',
+                               float(traffic_saved.get('traffic_light_action_min_radius_px', 10.0)))
+        self.declare_parameter('traffic_light_action_max_radius_px',
+                               float(traffic_saved.get('traffic_light_action_max_radius_px', 80.0)))
+        self.declare_parameter('traffic_light_action_min_distance_cm',
+                               float(traffic_saved.get('traffic_light_action_min_distance_cm', 12.0)))
+        self.declare_parameter('traffic_light_action_max_distance_cm',
+                               float(traffic_saved.get('traffic_light_action_max_distance_cm', 45.0)))
+        self.declare_parameter('traffic_light_distance_k_cm_px',
+                               float(traffic_saved.get('traffic_light_distance_k_cm_px', 360.0)))
         self._tl_require_plate = bool(self.get_parameter('traffic_light_require_plate').value)
         self._tl_plate_max_sat = float(self.get_parameter('traffic_light_plate_max_sat').value)
         self._tl_plate_min_val = float(self.get_parameter('traffic_light_plate_min_val').value)
@@ -233,6 +243,11 @@ class AutonomousRacer(Node):
             float(self.get_parameter('traffic_light_position_max_slot_error_pct').value) / 100.0
         )
         self._tl_plate_min_area = float(self.get_parameter('traffic_light_plate_min_area').value)
+        self._tl_action_min_radius_px = float(self.get_parameter('traffic_light_action_min_radius_px').value)
+        self._tl_action_max_radius_px = float(self.get_parameter('traffic_light_action_max_radius_px').value)
+        self._tl_action_min_distance_cm = float(self.get_parameter('traffic_light_action_min_distance_cm').value)
+        self._tl_action_max_distance_cm = float(self.get_parameter('traffic_light_action_max_distance_cm').value)
+        self._tl_distance_k_cm_px = float(self.get_parameter('traffic_light_distance_k_cm_px').value)
         self._tl_roi_y_pct = int(self.get_parameter('traffic_light_roi_y_pct').value)
         self._tl_min_area = float(self.get_parameter('traffic_light_min_area').value)
         self._tl_max_area = float(self.get_parameter('traffic_light_max_area').value)
@@ -1093,6 +1108,16 @@ class AutonomousRacer(Node):
                 self._tl_position_max_slot_error = float(p.value) / 100.0
             elif p.name == "traffic_light_plate_min_area":
                 self._tl_plate_min_area = float(p.value)
+            elif p.name == "traffic_light_action_min_radius_px":
+                self._tl_action_min_radius_px = float(p.value)
+            elif p.name == "traffic_light_action_max_radius_px":
+                self._tl_action_max_radius_px = float(p.value)
+            elif p.name == "traffic_light_action_min_distance_cm":
+                self._tl_action_min_distance_cm = float(p.value)
+            elif p.name == "traffic_light_action_max_distance_cm":
+                self._tl_action_max_distance_cm = float(p.value)
+            elif p.name == "traffic_light_distance_k_cm_px":
+                self._tl_distance_k_cm_px = float(p.value)
             elif p.name == 'workers_speed_factor':
                 self._workers_speed_factor = float(p.value)
             elif p.name == 'workers_slow_s':
@@ -1214,6 +1239,11 @@ class AutonomousRacer(Node):
                 'traffic_light_position_anchors_pct': ','.join(f'{anchor * 100.0:.1f}' for anchor in self._tl_position_anchors),
                 'traffic_light_position_max_slot_error_pct': self._tl_position_max_slot_error * 100.0,
                 'traffic_light_plate_min_area': self._tl_plate_min_area,
+                'traffic_light_action_min_radius_px': self._tl_action_min_radius_px,
+                'traffic_light_action_max_radius_px': self._tl_action_max_radius_px,
+                'traffic_light_action_min_distance_cm': self._tl_action_min_distance_cm,
+                'traffic_light_action_max_distance_cm': self._tl_action_max_distance_cm,
+                'traffic_light_distance_k_cm_px': self._tl_distance_k_cm_px,
                 'snapshot_interval': self._snapshot_interval,
             }, indent=2))
             zebra_path = self._config_save_path('zebra_params.json')
@@ -1257,8 +1287,12 @@ class AutonomousRacer(Node):
         cv2.circle(frame, (int(cx), int(cy)), int(radius), col, 2)
         slot = cand.get('slot')
         pos = f" pos={slot:.2f}" if isinstance(slot, (int, float)) else ""
+        dist = cand.get('distance_cm')
+        dist_txt = f" d={dist:.0f}cm" if isinstance(dist, (int, float)) else ""
+        act_txt = "ACT" if cand.get('actionable', False) else "IGN"
         hsv_name = cand.get('hsv_color') or cand.get('color')
-        txt = f"TL {cand['color']} hsv={hsv_name}{pos} c={cand['circularity']:.2f} fill={cand['fill']:.2f}"
+        txt = (f"TL {cand['color']} {act_txt} hsv={hsv_name}{pos}{dist_txt} "
+               f"c={cand['circularity']:.2f} fill={cand['fill']:.2f}")
         cv2.putText(frame, txt, (x, max(18, y - 6)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1)
 
@@ -1971,6 +2005,21 @@ class AutonomousRacer(Node):
         cand["plate_bbox"] = tuple(int(v) for v in plate)
         return cand
 
+    def _annotate_tl_actionability(self, cand):
+        if cand is None:
+            return None
+        cand = dict(cand)
+        radius = max(1e-3, float(cand.get("radius", 0.0)))
+        distance_cm = float(self._tl_distance_k_cm_px) / radius
+        radius_ok = self._tl_action_min_radius_px <= radius <= self._tl_action_max_radius_px
+        distance_ok = self._tl_action_min_distance_cm <= distance_cm <= self._tl_action_max_distance_cm
+        cand["distance_cm"] = distance_cm
+        cand["actionable"] = bool(radius_ok and distance_ok)
+        cand["action_reason"] = "ok" if cand["actionable"] else (
+            f"dist={distance_cm:.1f}cm r={radius:.1f}px"
+        )
+        return cand
+
     def detect_color(self, mask, color_name="UNKNOWN", hsv=None):
         kernel = np.ones((5, 5), np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
@@ -2287,33 +2336,40 @@ class AutonomousRacer(Node):
         green_area, green_cand, _ = self.detect_color(green_mask, "GREEN", hsv)
 
         detected_color = "UNKNOWN"
+        action_color = "UNKNOWN"
         raw_candidates = [red_cand, yellow_cand, green_cand]
         candidates = [
-            classified for classified in (
-                self._classify_tl_candidate_by_position(cand, hsv)
-                for cand in raw_candidates
+            annotated for annotated in (
+                self._annotate_tl_actionability(classified)
+                for classified in (
+                    self._classify_tl_candidate_by_position(cand, hsv)
+                    for cand in raw_candidates
+                )
             )
-            if classified is not None
+            if annotated is not None
         ]
         best_cand = max(candidates, key=lambda item: item["area"], default=None)
         self._traffic_light_candidate = best_cand
         if best_cand is not None:
             detected_color = best_cand["color"]
+            if best_cand.get("actionable", False):
+                action_color = detected_color
             self._draw_traffic_light_overlay(frame, best_cand)
 
         self.get_logger().info(
             f"[VISION] Areas -> R:{red_area:.0f} Y:{yellow_area:.0f} G:{green_area:.0f} "
-            f"| Raw Detect: {detected_color} | Active State: {self.current_state} | TL: {self._traffic_light_candidate}",
+            f"| Raw Detect: {detected_color} | Action: {action_color} | Active State: {self.current_state} "
+            f"| TL: {self._traffic_light_candidate}",
             throttle_duration_sec=1.0,
         )
 
-        if detected_color == "RED":
+        if action_color == "RED":
             self.red_count    += 1; self.yellow_count  = 0; self.green_count = 0
             self._tl_unknown_count = 0
-        elif detected_color == "YELLOW":
+        elif action_color == "YELLOW":
             self.yellow_count += 1; self.red_count     = 0; self.green_count = 0
             self._tl_unknown_count = 0
-        elif detected_color == "GREEN":
+        elif action_color == "GREEN":
             self.green_count  += 1; self.red_count     = 0; self.yellow_count = 0
             self._tl_unknown_count = 0
         else:
