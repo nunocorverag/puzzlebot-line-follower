@@ -93,6 +93,7 @@ class ZebraParams:
     stable_frames_needed: int = 3
     slow_distance_cm: float = 30.0  # start slowing when row within this
     stop_distance_cm: float = 10.0  # stop when row within this
+    trigger_min_dashes: int = 6     # stricter FSM gate; visual detector can stay sensitive
     trigger_max_angle_deg: float = 18.0  # gate FSM trigger; skewed rows are curve clutter
     trigger_max_center_cm: float = 18.0  # 0 disables; row center must be near robot center
 

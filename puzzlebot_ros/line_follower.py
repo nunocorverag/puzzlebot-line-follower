@@ -1870,6 +1870,9 @@ class AutonomousRacer(Node):
                       or now >= self.intersection_cooldown_until)
         stable_frames = int(zres.stable_frames) if zres is not None else 0
         stable_ok = stable_frames >= 3  # Require at least 3 consecutive frames
+        dashes_ok = (
+            zres is not None
+            and int(zres.n_dashes) >= int(zp.trigger_min_dashes))
         angle_ok = (
             zres is not None and zres.angle_deg is not None
             and abs(float(zres.angle_deg)) <= float(zp.trigger_max_angle_deg))
@@ -1878,7 +1881,7 @@ class AutonomousRacer(Node):
             and (float(zp.trigger_max_center_cm) <= 0.0
                  or zres.row_center_cm is None
                  or abs(float(zres.row_center_cm)) <= float(zp.trigger_max_center_cm)))
-        trigger_ok = stable_ok and angle_ok and center_ok
+        trigger_ok = stable_ok and dashes_ok and angle_ok and center_ok
         
         # Debug: log why approach is rejected
         if (zres is not None and zres.seen and dist is not None
@@ -1896,6 +1899,12 @@ class AutonomousRacer(Node):
                 self.get_logger().info(
                     f"[ZEBRA] Approach blocked: insufficient stability ({stable_frames}/3 frames)",
                     throttle_duration_sec=2.0)
+            elif not dashes_ok:
+                nd = 0 if zres is None else int(zres.n_dashes)
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: weak row dashes={nd} "
+                    f"< {int(zp.trigger_min_dashes)}",
+                    throttle_duration_sec=1.0)
             elif not angle_ok:
                 za = '?' if zres.angle_deg is None else f'{zres.angle_deg:.1f}'
                 self.get_logger().info(
