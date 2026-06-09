@@ -504,7 +504,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
-        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 10.0)))
+        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 8.0)))
         # Commit must CROSS the intersection before re-acquiring. The robot stops
         # ~10 cm before the first dashed row and the cross is ~26 cm deep (double
         # cross), so straight must travel ~36 cm before it looks for the continuing
@@ -2925,19 +2925,17 @@ class AutonomousRacer(Node):
 
         if self.commit_direction is not None:
             lr = self._last_lane_result
-            # ROBUST re-acquisition for turns: require high confidence AND reasonable offset
-            # to avoid grabbing edge lines during the turn
+            # Re-acquisition: slightly stricter for turns to avoid edges, but not too strict
             is_turn = self.commit_direction in ('left', 'right')
             if is_turn:
-                # For turns: strict criteria to avoid edge detection
-                # - High confidence (0.7+) to ensure it's a real line
-                # - Reasonable offset (not too far to the side, < 0.6)
-                # - This prevents grabbing the intersection edge or wrong branch
+                # For turns: moderate criteria
+                # - Confidence >= 0.6 (slightly higher than straight)
+                # - Offset < 0.7 (allow some deviation but not extreme)
                 reacquired = (lr is not None and lr.detected
-                              and lr.confidence >= 0.7
-                              and abs(lr.offset_norm) < 0.6)
+                              and lr.confidence >= 0.6
+                              and abs(lr.offset_norm) < 0.7)
             else:
-                # For straight: more lenient (original criteria)
+                # For straight: original criteria
                 reacquired = (lr is not None and lr.detected
                               and lr.confidence >= 0.5)
             
@@ -2949,6 +2947,16 @@ class AutonomousRacer(Node):
             # clear the cross), or at the safety cap. A cross has no line to
             # follow, so we drive the turn/cross open-loop ONLY until the line of
             # the chosen branch reappears -- then hand straight back to FOLLOW.
+            
+            # Emergency logging if taking too long
+            elapsed = (now - (self.commit_until - Duration(seconds=self._commit_duration))).nanoseconds * 1e-9
+            if is_turn and elapsed > 2.5 and not reacquired:
+                self.get_logger().warn(
+                    f"[INTERSECTION] commit {self.commit_direction} taking long ({elapsed:.1f}s), "
+                    f"lane={lane_info if 'lane_info' in locals() else 'unknown'}, "
+                    f"will timeout at {self._commit_duration:.1f}s",
+                    throttle_duration_sec=1.0)
+            
             if past_max or (self._commit_closed_loop and past_min and reacquired):
                 self.get_logger().info(
                     f"[INTERSECTION] commit {self.commit_direction} done -> FOLLOW "
