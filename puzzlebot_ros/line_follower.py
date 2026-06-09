@@ -614,7 +614,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_params_path', '')
         self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
         self.declare_parameter('curve_min_scale', 0.4)   # never below this fraction
-        self.declare_parameter('curve_memory_s', 0.75)   # keep slowing briefly after a tight curve
+        self.declare_parameter('curve_memory_s', 1.20)   # keep slowing briefly after a tight curve
         self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
         self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
         self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
@@ -2986,10 +2986,21 @@ class AutonomousRacer(Node):
                 self.time_line_lost = None
                 # Capture the last CONFIDENT heading for the near-cross hysteresis.
                 if lane_result.confidence >= self._lane_hold_conf:
-                    self._lane_hold_center_x = steering_center_x
-                    self._lane_hold_far_x = steering_far_x
-                    self._lane_hold_curvature = lane_curvature
-                    self._lane_hold_time = now
+                    recent_curve_hold = (
+                        self._lane_hold_time is not None
+                        and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                        and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_curve_s
+                    )
+                    # Do not let a weak/flattened exit-frame erase a strong curve
+                    # target. In the tight lab curve the BEV briefly reports
+                    # curv~0.3-0.4 while the robot is still physically turning; if
+                    # that overwrites the hold target, the next low-confidence
+                    # frame accelerates and grabs a seam.
+                    if lane_curvature >= self._lane_hold_curve_min_curv or not recent_curve_hold:
+                        self._lane_hold_center_x = steering_center_x
+                        self._lane_hold_far_x = steering_far_x
+                        self._lane_hold_curvature = lane_curvature
+                        self._lane_hold_time = now
                 self.get_logger().info(
                     f"[LANE] off={lane_result.offset_norm:+.2f} "
                     f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
