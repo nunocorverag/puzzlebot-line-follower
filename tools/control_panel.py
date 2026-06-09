@@ -113,6 +113,9 @@ GROUPS = [
         ("lane_hold_curve_min_curv", "f", 0.05,   "min curve for BEV hold"),
         ("lane_base_max_jump_pct",   "i", 1,      "max base jump %% (branch guard)"),
         ("lane_base_hold_s",         "f", 0.1,    "sticky base hold s at cross"),
+        ("lane_curve_max_jump_pct",  "i", 1,      "max base jump %% in curves"),
+        ("lane_curve_guard_conf",    "f", 0.05,   "conf below this guards curve jumps"),
+        ("lane_curve_guard_max_offset", "f", 0.05, "max weak-fit offset in curves"),
     ]),
     ("Warp", [
         ("lane.src_top_y_pct",       "i", 1,      "warp top y"),
@@ -194,8 +197,10 @@ DEFAULTS = {
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
-    "lane_hold_curve_s": 0.45, "lane_hold_curve_min_curv": 0.55,
+    "lane_hold_curve_s": 0.80, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
+    "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
+    "lane_curve_guard_max_offset": 0.35,
 }
 
 

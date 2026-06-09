@@ -646,7 +646,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
-        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 0.45)))
+        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 0.80)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
@@ -670,8 +670,14 @@ class AutonomousRacer(Node):
         #     lane_base_max_jump_pct of the warp width from the last good base.
         self.declare_parameter('lane_base_hold_s', float(saved.get('lane_base_hold_s', 1.0)))
         self.declare_parameter('lane_base_max_jump_pct', int(saved.get('lane_base_max_jump_pct', 15)))
+        self.declare_parameter('lane_curve_max_jump_pct', int(saved.get('lane_curve_max_jump_pct', 10)))
+        self.declare_parameter('lane_curve_guard_conf', float(saved.get('lane_curve_guard_conf', 0.80)))
+        self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
+        self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
+        self._lane_curve_guard_conf = float(self.get_parameter('lane_curve_guard_conf').value)
+        self._lane_curve_guard_max_offset = float(self.get_parameter('lane_curve_guard_max_offset').value)
         self._lane_good_base = None      # last accepted base x (warped px)
         self._lane_good_base_time = None # when it was accepted (for the timeout)
 
@@ -1183,6 +1189,12 @@ class AutonomousRacer(Node):
                 self._lane_base_hold_s = float(p.value)
             elif p.name == 'lane_base_max_jump_pct':
                 self._lane_base_max_jump_pct = int(p.value)
+            elif p.name == 'lane_curve_max_jump_pct':
+                self._lane_curve_max_jump_pct = int(p.value)
+            elif p.name == 'lane_curve_guard_conf':
+                self._lane_curve_guard_conf = float(p.value)
+            elif p.name == 'lane_curve_guard_max_offset':
+                self._lane_curve_guard_max_offset = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -1347,6 +1359,9 @@ class AutonomousRacer(Node):
                 'lane_hold_curve_min_curv': self._lane_hold_curve_min_curv,
                 'lane_base_hold_s': self._lane_base_hold_s,
                 'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
+                'lane_curve_max_jump_pct': self._lane_curve_max_jump_pct,
+                'lane_curve_guard_conf': self._lane_curve_guard_conf,
+                'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -2888,23 +2903,56 @@ class AutonomousRacer(Node):
             base_x = lane_result.base_x
             near = self._near_intersection
 
-            # Branch guard (cross only): reject a base that jumped too far from the
-            # last good base -- that is the BEV re-locking onto a diverging side
-            # branch, not the continuing line. Away from a cross this never fires.
+            # Reject a base that jumped too far from the last good base.
+            # Near a cross this prevents side-branch lock. In a tight curve it
+            # prevents grabbing puzzle seams / outer edges that still score as a
+            # medium-confidence lane fit.
             base_jumped = False
-            if (near and now_good and base_x is not None
-                    and self._lane_base_max_jump_pct > 0
+            curve_fit_outlier = False
+            recent_base_dt = None
+            if self._lane_good_base_time is not None:
+                recent_base_dt = (now - self._lane_good_base_time).nanoseconds * 1e-9
+            recent_base = (
+                self._lane_good_base is not None
+                and recent_base_dt is not None
+                and recent_base_dt <= max(self._lane_base_hold_s, self._lane_hold_curve_s)
+            )
+            if (now_good and base_x is not None
                     and self._lane_good_base is not None
-                    and self._lane_good_base_time is not None
-                    and (now - self._lane_good_base_time).nanoseconds * 1e-9 <= self._lane_base_hold_s):
-                max_jump = self.lane_params.warp_w * self._lane_base_max_jump_pct / 100.0
-                if abs(base_x - self._lane_good_base) > max_jump:
-                    base_jumped = True
-                    self.get_logger().warn(
-                        f"[LANE] base jump {self._lane_good_base:.0f}->{base_x:.0f} "
-                        f"(> {max_jump:.0f}px) rejected -- side-branch guard",
-                        throttle_duration_sec=0.5)
-            accept = now_good and not base_jumped
+                    and recent_base):
+                in_curve = (
+                    abs(float(lane_result.curvature_norm)) >= self._lane_hold_curve_min_curv
+                    or self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                )
+                weak_curve_fit = lane_result.confidence < self._lane_curve_guard_conf
+                jump_reason = None
+                max_jump_pct = None
+                if near and self._lane_base_max_jump_pct > 0 and recent_base_dt <= self._lane_base_hold_s:
+                    max_jump_pct = self._lane_base_max_jump_pct
+                    jump_reason = "side-branch guard"
+                else:
+                    if (self._lane_curve_max_jump_pct > 0
+                            and (in_curve or weak_curve_fit)):
+                        max_jump_pct = self._lane_curve_max_jump_pct
+                        jump_reason = "curve continuity guard"
+                    if (self._lane_curve_guard_max_offset > 0.0
+                            and in_curve
+                            and weak_curve_fit
+                            and abs(float(lane_result.offset_norm)) > self._lane_curve_guard_max_offset):
+                        curve_fit_outlier = True
+                        self.get_logger().warn(
+                            f"[LANE] curve fit outlier off={lane_result.offset_norm:+.2f} "
+                            f"conf={lane_result.confidence:.2f} rejected",
+                            throttle_duration_sec=0.5)
+                if max_jump_pct is not None:
+                    max_jump = self.lane_params.warp_w * max_jump_pct / 100.0
+                    if abs(base_x - self._lane_good_base) > max_jump:
+                        base_jumped = True
+                        self.get_logger().warn(
+                            f"[LANE] base jump {self._lane_good_base:.0f}->{base_x:.0f} "
+                            f"(> {max_jump:.0f}px) rejected -- {jump_reason}",
+                            throttle_duration_sec=0.5)
+            accept = now_good and not base_jumped and not curve_fit_outlier
 
             # Thread the base x to the next frame for continuity (stay on the same
             # line through a curve). Near a cross keep it STICKY through brief
@@ -2916,8 +2964,9 @@ class AutonomousRacer(Node):
                 self._lane_prev_base = base_x
                 self._lane_good_base = base_x
                 self._lane_good_base_time = now
-            elif (near and self._lane_good_base_time is not None
-                  and (now - self._lane_good_base_time).nanoseconds * 1e-9 <= self._lane_base_hold_s):
+            elif ((near or base_jumped or curve_fit_outlier) and self._lane_good_base_time is not None
+                  and recent_base_dt is not None
+                  and recent_base_dt <= max(self._lane_base_hold_s, self._lane_hold_curve_s)):
                 pass  # sticky: keep _lane_prev_base anchored on the last good line
             else:
                 self._lane_prev_base = None
