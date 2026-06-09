@@ -120,6 +120,7 @@ GROUPS = [
         ("lane_curve_max_jump_pct",  "i", 1,      "max base jump %% in curves"),
         ("lane_curve_guard_conf",    "f", 0.05,   "conf below this guards curve jumps"),
         ("lane_curve_guard_max_offset", "f", 0.05, "max weak-fit offset in curves"),
+        ("lane_curve_hold_assist_conf", "f", 0.05, "use held curve lookahead below conf"),
     ]),
     ("Warp", [
         ("lane.src_top_y_pct",       "i", 1,      "warp top y"),
@@ -206,7 +207,7 @@ DEFAULTS = {
     "lane_hold_curve_s": 1.20, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
     "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
-    "lane_curve_guard_max_offset": 0.35,
+    "lane_curve_guard_max_offset": 0.35, "lane_curve_hold_assist_conf": 0.65,
 }
 
 

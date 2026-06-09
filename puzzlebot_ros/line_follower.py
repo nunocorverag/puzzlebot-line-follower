@@ -677,11 +677,13 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_curve_max_jump_pct', int(saved.get('lane_curve_max_jump_pct', 10)))
         self.declare_parameter('lane_curve_guard_conf', float(saved.get('lane_curve_guard_conf', 0.80)))
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
+        self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.65)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
         self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
         self._lane_curve_guard_conf = float(self.get_parameter('lane_curve_guard_conf').value)
         self._lane_curve_guard_max_offset = float(self.get_parameter('lane_curve_guard_max_offset').value)
+        self._lane_curve_hold_assist_conf = float(self.get_parameter('lane_curve_hold_assist_conf').value)
         self._lane_good_base = None      # last accepted base x (warped px)
         self._lane_good_base_time = None # when it was accepted (for the timeout)
 
@@ -1201,6 +1203,8 @@ class AutonomousRacer(Node):
                 self._lane_curve_guard_conf = float(p.value)
             elif p.name == 'lane_curve_guard_max_offset':
                 self._lane_curve_guard_max_offset = float(p.value)
+            elif p.name == 'lane_curve_hold_assist_conf':
+                self._lane_curve_hold_assist_conf = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -1369,6 +1373,7 @@ class AutonomousRacer(Node):
                 'lane_curve_max_jump_pct': self._lane_curve_max_jump_pct,
                 'lane_curve_guard_conf': self._lane_curve_guard_conf,
                 'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
+                'lane_curve_hold_assist_conf': self._lane_curve_hold_assist_conf,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -3001,6 +3006,14 @@ class AutonomousRacer(Node):
                         self._lane_hold_far_x = steering_far_x
                         self._lane_hold_curvature = lane_curvature
                         self._lane_hold_time = now
+                    elif (lane_result.confidence <= self._lane_curve_hold_assist_conf
+                          and self._lane_hold_far_x is not None):
+                        steering_far_x = self._lane_hold_far_x
+                        lane_curvature = max(lane_curvature, self._lane_hold_curvature)
+                        self.get_logger().warn(
+                            f"[LANE] assist curve lookahead from hold "
+                            f"(conf={lane_result.confidence:.2f}, curv={lane_curvature:.2f})",
+                            throttle_duration_sec=0.5)
                 self.get_logger().info(
                     f"[LANE] off={lane_result.offset_norm:+.2f} "
                     f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
