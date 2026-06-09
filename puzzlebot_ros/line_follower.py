@@ -391,6 +391,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('signs_model_path', '')
         self.declare_parameter('signs_conf', 0.55)
         self.declare_parameter('workers_speed_factor', 0.5)
+        self.declare_parameter('workers_min_speed', 0.04)
         self.declare_parameter('workers_slow_s', 4.0)
         self.declare_parameter('stop_seconds', 3.0)
         self.declare_parameter('giveway_seconds', 1.5)
@@ -405,6 +406,7 @@ class AutonomousRacer(Node):
         self._sign_turn_act_area_pct = float(self.get_parameter('sign_turn_act_area_pct').value)
         self._use_signs = bool(self.get_parameter('use_signs').value)
         self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
+        self._workers_min_speed = float(self.get_parameter('workers_min_speed').value)
         self._workers_slow_s = float(self.get_parameter('workers_slow_s').value)
         self._stop_seconds = float(self.get_parameter('stop_seconds').value)
         self._giveway_seconds = float(self.get_parameter('giveway_seconds').value)
@@ -1239,6 +1241,8 @@ class AutonomousRacer(Node):
                 self._tl_distance_k_cm_px = float(p.value)
             elif p.name == 'workers_speed_factor':
                 self._workers_speed_factor = float(p.value)
+            elif p.name == 'workers_min_speed':
+                self._workers_min_speed = float(p.value)
             elif p.name == 'workers_slow_s':
                 self._workers_slow_s = float(p.value)
             elif p.name == 'stop_seconds':
@@ -1339,6 +1343,7 @@ class AutonomousRacer(Node):
                 'sign_act_area_pct': self._sign_act_area_pct,
                 'sign_cooldown_s': self._sign_cooldown_s,
                 'sign_forget_s': self._sign_forget_s,
+                'workers_min_speed': self._workers_min_speed,
                 'align_in_place': self._align_in_place,
                 'align_tol_deg': self._align_tol_deg,
                 'align_max_w': self._align_max_w,
@@ -3236,6 +3241,8 @@ class AutonomousRacer(Node):
         if self.commit_direction is None and self._workers_until is not None:
             if now < self._workers_until:
                 cmd.linear.x *= self._workers_speed_factor
+                if cmd.linear.x > 0.0:
+                    cmd.linear.x = max(cmd.linear.x, self._workers_min_speed)
                 self.get_logger().info("[SIGN] workers: slowing", throttle_duration_sec=1.0)
             else:
                 self._workers_until = None
