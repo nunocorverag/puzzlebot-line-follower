@@ -207,7 +207,7 @@ DEFAULTS = {
     "lane_hold_curve_s": 1.20, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
     "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
-    "lane_curve_guard_max_offset": 0.35, "lane_curve_hold_assist_conf": 0.65,
+    "lane_curve_guard_max_offset": 0.35, "lane_curve_hold_assist_conf": 0.80,
 }
 
 

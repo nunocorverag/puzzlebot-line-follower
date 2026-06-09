@@ -678,7 +678,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_curve_max_jump_pct', int(saved.get('lane_curve_max_jump_pct', 10)))
         self.declare_parameter('lane_curve_guard_conf', float(saved.get('lane_curve_guard_conf', 0.80)))
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
-        self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.65)))
+        self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.80)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
         self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
