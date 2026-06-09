@@ -84,11 +84,11 @@ def _verify_arrow_direction(frame, box):
     roi = frame[y1:y2, x1:x2]
     
     if roi.size == 0:
-        return None
+        return None, {'all_votes': [], 'vote_counts': {}, 'winner': None, 'reason': 'empty_roi'}
     
     h, w = roi.shape[:2]
     if w < 20 or h < 20:  # Too small to analyze
-        return None
+        return None, {'all_votes': [], 'vote_counts': {}, 'winner': None, 'reason': 'small_roi'}
     
     # Convert to grayscale
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -393,7 +393,12 @@ class SignDetector:
                 
                 if name in ('turn_left', 'turn_right'):
                     box_full = (x1, yb1 + y0, x2, yb2 + y0)
-                    detected_direction, vote_details = _verify_arrow_direction(frame, box_full)
+                    try:
+                        detected_direction, vote_details = _verify_arrow_direction(frame, box_full)
+                    except Exception as exc:  # noqa: BLE001 - verification is advisory only
+                        self._log(f"[signs] arrow verification failed: {exc}")
+                        detected_direction = None
+                        vote_details = {'all_votes': [], 'vote_counts': {}, 'winner': None, 'error': str(exc)}
                     # Only accept turn_left or turn_right from verification, ignore go_straight
                     if detected_direction in ('turn_left', 'turn_right'):
                         # Use verified direction instead of model prediction

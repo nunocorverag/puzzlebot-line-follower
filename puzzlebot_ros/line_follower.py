@@ -557,6 +557,7 @@ class AutonomousRacer(Node):
         self._commit_turn_w = float(self.get_parameter('commit_turn_w').value)
         self._commit_turn_pre_advance_cm = float(self.get_parameter('commit_turn_pre_advance_cm').value)
         self._commit_odom0 = 0.0
+        self._commit_start_time = None
         self._commit_duration = float(self.get_parameter('commit_duration').value)
         self._commit_duration_straight = float(self.get_parameter('commit_duration_straight').value)
         self._commit_min_s = float(self.get_parameter('commit_min_s').value)
@@ -1972,6 +1973,7 @@ class AutonomousRacer(Node):
             self._commit_min_until = now + Duration(seconds=min_s)
             self._dist_since_commit = 0.0
             self._commit_odom0 = self._odom_m()
+            self._commit_start_time = now
             self._approach_start_time = None
             self.intersection_phase = None
             self.intersection_pending = False
@@ -2477,7 +2479,10 @@ class AutonomousRacer(Node):
         now = self.get_clock().now()
 
         # YOLO traffic signs: detect + latch actions (no-op if disabled).
-        self._run_signs(frame, now)
+        # During COMMIT the decision is locked; skip inference so a slow/bad sign
+        # frame cannot stall the camera/control loop mid-turn.
+        if self.commit_direction is None:
+            self._run_signs(frame, now)
 
         # ---------------------------------------------------------
         # 1. TRAFFIC LIGHT PERCEPTION
@@ -2680,6 +2685,7 @@ class AutonomousRacer(Node):
                 self._commit_min_until = now + Duration(seconds=self._commit_min_s)
                 self._dist_since_commit = 0.0        # start the double-cross travel guard
                 self._commit_odom0 = self._odom_m()  # baseline for turn pre-advance
+                self._commit_start_time = now
                 self._approach_start_time = None
                 self.intersection_phase = None
                 self.intersection_pending = False
@@ -2992,11 +2998,16 @@ class AutonomousRacer(Node):
                 self.commit_direction = None
                 self.commit_until = None
                 self._commit_min_until = None
+                self._commit_start_time = None
             else:
                 base_linear_x = self._commit_speed
                 pre_cm = (self._commit_turn_pre_advance_cm
                           if self.commit_direction in ("left", "right") else 0.0)
-                pre_done = (self._odom_m() - self._commit_odom0) * 100.0 >= pre_cm
+                pre_elapsed = (0.0 if self._commit_start_time is None else
+                               (now - self._commit_start_time).nanoseconds * 1e-9)
+                pre_odom_cm = (self._odom_m() - self._commit_odom0) * 100.0
+                pre_time_s = pre_cm / max(1e-3, self._commit_speed * 100.0)
+                pre_done = (pre_odom_cm >= pre_cm or pre_elapsed >= pre_time_s)
                 if not pre_done:
                     target_angular_z = 0.0
                 elif self.commit_direction == 'left':
@@ -3013,14 +3024,14 @@ class AutonomousRacer(Node):
                     self.get_logger().info(
                         f"[INTERSECTION] Committing {self.commit_direction}: "
                         f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
-                        f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm, "
+                        f"pre={min(pre_cm, pre_odom_cm):.0f}/{pre_cm:.0f}cm t={pre_elapsed:.1f}/{pre_time_s:.1f}s, "
                         f"lane={lane_info}, reacq={reacquired}",
                         throttle_duration_sec=0.5)
                 else:
                     self.get_logger().info(
                         f"[INTERSECTION] Committing {self.commit_direction}: "
                         f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
-                        f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm",
+                        f"pre={min(pre_cm, pre_odom_cm):.0f}/{pre_cm:.0f}cm t={pre_elapsed:.1f}/{pre_time_s:.1f}s",
                         throttle_duration_sec=0.5)
 
         # During APPROACH: drive a fixed creep AND actively align heading so the
@@ -3075,7 +3086,10 @@ class AutonomousRacer(Node):
 
         # In testing, ignore_traffic_light forces a GREEN supervisor so the robot
         # drives without needing to see a real light.
-        effective_state = "GREEN" if self._ignore_traffic_light else self.current_state
+        # Once COMMIT starts, finish it. Traffic-light or sign holds seen during
+        # the turn must not overwrite W and strand the robot inside the cross.
+        effective_state = ("GREEN" if (self._ignore_traffic_light or self.commit_direction is not None)
+                           else self.current_state)
 
         if effective_state == "RED":
             cmd.linear.x  = 0.0
@@ -3098,14 +3112,14 @@ class AutonomousRacer(Node):
 
         # --- TRAFFIC SIGN overrides (after the light, before the drive switch) ---
         # workers: cap/scale speed while the slow window is active.
-        if self._workers_until is not None:
+        if self.commit_direction is None and self._workers_until is not None:
             if now < self._workers_until:
                 cmd.linear.x *= self._workers_speed_factor
                 self.get_logger().info("[SIGN] workers: slowing", throttle_duration_sec=1.0)
             else:
                 self._workers_until = None
         # stop / give_way: hold still for the configured time, then release.
-        if self._stopsign_until is not None:
+        if self.commit_direction is None and self._stopsign_until is not None:
             if now < self._stopsign_until:
                 cmd.linear.x = 0.0
                 cmd.angular.z = 0.0
