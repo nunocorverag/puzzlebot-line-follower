@@ -360,7 +360,11 @@ class AutonomousRacer(Node):
         # cross grabs the edge dashes and veers off. Raise advance_center_gain only
         # if you want gentle centring on the zebra row center (sign tunable).
         self.declare_parameter('advance_center_gain', 0.0)
+        self.declare_parameter('advance_lane_keep_gain', 1.0)
+        self.declare_parameter('advance_lane_keep_max_w', 0.12)
         self._advance_center_gain = float(self.get_parameter('advance_center_gain').value)
+        self._advance_lane_keep_gain = float(self.get_parameter('advance_lane_keep_gain').value)
+        self._advance_lane_keep_max_w = float(self.get_parameter('advance_lane_keep_max_w').value)
         self._adv_odom0 = 0.0             # odometry mark at DETECT
         self._adv_target_m = 0.0          # distance to advance to the reading window
 
@@ -1195,6 +1199,10 @@ class AutonomousRacer(Node):
                 self._commit_straight_min_s = float(p.value)
             elif p.name == 'commit_closed_loop':
                 self._commit_closed_loop = bool(p.value)
+            elif p.name == 'advance_lane_keep_gain':
+                self._advance_lane_keep_gain = float(p.value)
+            elif p.name == 'advance_lane_keep_max_w':
+                self._advance_lane_keep_max_w = float(p.value)
             elif p.name == 'stream_debug':
                 self._stream_debug = bool(p.value)
             elif p.name == "traffic_light_roi_y_pct":
@@ -1344,6 +1352,8 @@ class AutonomousRacer(Node):
                 'sign_cooldown_s': self._sign_cooldown_s,
                 'sign_forget_s': self._sign_forget_s,
                 'workers_min_speed': self._workers_min_speed,
+                'advance_lane_keep_gain': self._advance_lane_keep_gain,
+                'advance_lane_keep_max_w': self._advance_lane_keep_max_w,
                 'align_in_place': self._align_in_place,
                 'align_tol_deg': self._align_tol_deg,
                 'align_max_w': self._align_max_w,
@@ -1853,7 +1863,11 @@ class AutonomousRacer(Node):
         if (zres is not None and zres.seen and dist is not None
                 and dist <= self._detect_distance_cm 
                 and self.intersection_phase is None):
-            if not cooldown_ok:
+            if not self._drive_enabled:
+                self.get_logger().info(
+                    "[ZEBRA] Approach blocked: drive disabled",
+                    throttle_duration_sec=2.0)
+            elif not cooldown_ok:
                 self.get_logger().info(
                     f"[ZEBRA] Approach blocked: cooldown active",
                     throttle_duration_sec=2.0)
@@ -1865,6 +1879,7 @@ class AutonomousRacer(Node):
         if (zres is not None and zres.seen and dist is not None
                 and dist <= self._detect_distance_cm 
                 and self.intersection_phase is None
+                and self._drive_enabled
                 and cooldown_ok and stable_ok):
             self.intersection_phase = 'approach'   # ADVANCE
             self._zebra_opt_votes = {}
@@ -3165,10 +3180,13 @@ class AutonomousRacer(Node):
         # or a straight). w_align rotates the fitted entry line toward horizontal;
         # the legacy centering above already handles lateral offset.
         if self.intersection_phase == 'approach':
+            lane_keep_w = target_angular_z
             if self._use_zebra_bev:
                 # ADVANCE: do NOT use the lane follower here (it flakes over the
                 # cross and grabs the side dashes -> veers left). Hold centre with
                 # the zebra ROW CENTER (stable) and go STRAIGHT if the row is lost.
+                # Before the entry row is crossed, keep a capped slice of lane
+                # steering so curved approaches do not drive straight off-line.
                 # End ADVANCE by ODOMETRY at the reading window (not the camera
                 # distance, which leaves view up close).
                 base_linear_x = self._approach_speed
@@ -3179,6 +3197,13 @@ class AutonomousRacer(Node):
                         self.max_w, -self._advance_center_gain * rc))
                 else:
                     target_angular_z = 0.0   # row lost: keep heading straight
+                if (not self._adv_at_entry and lane_ok
+                        and self._advance_lane_keep_gain > 0.0):
+                    keep = max(-self._advance_lane_keep_max_w,
+                               min(self._advance_lane_keep_max_w,
+                                   self._advance_lane_keep_gain * lane_keep_w))
+                    target_angular_z = max(-self.max_w, min(
+                        self.max_w, target_angular_z + keep))
                 advanced = self._odom_m() - self._adv_odom0
                 self.get_logger().info(
                     f"[ZEBRA] ADVANCE: V={base_linear_x:.3f} W={target_angular_z:.2f} "
