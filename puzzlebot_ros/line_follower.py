@@ -1828,7 +1828,8 @@ class AutonomousRacer(Node):
         # NOTE: pending_turn is OK - it will be used as auto-decision at the intersection
         cooldown_ok = (self.intersection_cooldown_until is None 
                       or now >= self.intersection_cooldown_until)
-        stable_ok = zres.stable_frames >= 3  # Require at least 3 consecutive frames
+        stable_frames = int(zres.stable_frames) if zres is not None else 0
+        stable_ok = stable_frames >= 3  # Require at least 3 consecutive frames
         
         # Debug: log why approach is rejected
         if (zres is not None and zres.seen and dist is not None
@@ -1840,7 +1841,7 @@ class AutonomousRacer(Node):
                     throttle_duration_sec=2.0)
             elif not stable_ok:
                 self.get_logger().info(
-                    f"[ZEBRA] Approach blocked: insufficient stability ({zres.stable_frames}/3 frames)",
+                    f"[ZEBRA] Approach blocked: insufficient stability ({stable_frames}/3 frames)",
                     throttle_duration_sec=2.0)
         
         if (zres is not None and zres.seen and dist is not None
