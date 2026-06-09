@@ -83,6 +83,8 @@ GROUPS = [
         ("zebra.opt_side_relaxed_min_dashes", "i", 1, "relaxed side dashes"),
         ("zebra.straight_by_line",  "b", 1,      "straight uses continuous line"),
         ("zebra.straight_center_on_row", "b", 1,   "center straight ROI on dash row"),
+        ("zebra.trigger_max_angle_deg", "f", 1.0,  "max skew to trigger ADVANCE"),
+        ("zebra.trigger_max_center_cm", "f", 1.0,  "max row center to trigger"),
         ("zebra.straight_min_len_cm", "f", 1.0,    "min continuous straight line"),
         ("zebra.straight_corridor_cm", "f", 1.0,   "central line corridor width"),
         ("zebra.straight_black_thresh", "i", 5,     "dark threshold for straight line"),
@@ -106,6 +108,8 @@ GROUPS = [
         ("lane.zebra_row_close_px",  "i", 1,      "close px to bridge dash gaps"),
         ("lane_hold_conf",           "f", 0.05,   "conf to refresh held heading"),
         ("lane_hold_s",              "f", 0.1,    "max s to hold heading at cross"),
+        ("lane_hold_curve_s",        "f", 0.05,   "hold BEV target in curves"),
+        ("lane_hold_curve_min_curv", "f", 0.05,   "min curve for BEV hold"),
         ("lane_base_max_jump_pct",   "i", 1,      "max base jump %% (branch guard)"),
         ("lane_base_hold_s",         "f", 0.1,    "sticky base hold s at cross"),
     ]),
@@ -163,6 +167,7 @@ DEFAULTS = {
     "zebra.opt_side_line_tol_cm": 2.5, "zebra.opt_side_relaxed_min_y_cm": 18.0,
     "zebra.opt_side_relaxed_min_dashes": 3, "zebra.straight_by_line": True,
     "zebra.straight_center_on_row": False,
+    "zebra.trigger_max_angle_deg": 18.0, "zebra.trigger_max_center_cm": 18.0,
     "zebra.straight_min_len_cm": 8.0, "zebra.straight_corridor_cm": 11.8,
     "zebra.straight_black_thresh": 90, "zebra.straight_max_width_cm": 7.0,
     "zebra.straight_aspect_min": 1.35, "zebra.straight_lookahead_cm": 34.0,
@@ -187,6 +192,7 @@ DEFAULTS = {
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
+    "lane_hold_curve_s": 0.45, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
 }
 

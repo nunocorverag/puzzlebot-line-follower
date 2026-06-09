@@ -646,10 +646,16 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
+        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 0.45)))
+        self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
         self._lane_hold_s = float(self.get_parameter('lane_hold_s').value)
+        self._lane_hold_curve_s = float(self.get_parameter('lane_hold_curve_s').value)
+        self._lane_hold_curve_min_curv = float(self.get_parameter('lane_hold_curve_min_curv').value)
         self._lane_hold_center_x = None  # last confident steering center (orig px)
+        self._lane_hold_far_x = None
+        self._lane_hold_curvature = 0.0
         self._lane_hold_time = None      # when it was captured (for the timeout)
 
         # Branch guard near a cross. At a fork the BEV can briefly drop the line
@@ -1169,6 +1175,10 @@ class AutonomousRacer(Node):
                 self._lane_hold_conf = float(p.value)
             elif p.name == 'lane_hold_s':
                 self._lane_hold_s = float(p.value)
+            elif p.name == 'lane_hold_curve_s':
+                self._lane_hold_curve_s = float(p.value)
+            elif p.name == 'lane_hold_curve_min_curv':
+                self._lane_hold_curve_min_curv = float(p.value)
             elif p.name == 'lane_base_hold_s':
                 self._lane_base_hold_s = float(p.value)
             elif p.name == 'lane_base_max_jump_pct':
@@ -1333,6 +1343,8 @@ class AutonomousRacer(Node):
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
+                'lane_hold_curve_s': self._lane_hold_curve_s,
+                'lane_hold_curve_min_curv': self._lane_hold_curve_min_curv,
                 'lane_base_hold_s': self._lane_base_hold_s,
                 'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
                 'k_align': self._k_align,
@@ -1858,6 +1870,15 @@ class AutonomousRacer(Node):
                       or now >= self.intersection_cooldown_until)
         stable_frames = int(zres.stable_frames) if zres is not None else 0
         stable_ok = stable_frames >= 3  # Require at least 3 consecutive frames
+        angle_ok = (
+            zres is not None and zres.angle_deg is not None
+            and abs(float(zres.angle_deg)) <= float(zp.trigger_max_angle_deg))
+        center_ok = (
+            zres is not None
+            and (float(zp.trigger_max_center_cm) <= 0.0
+                 or zres.row_center_cm is None
+                 or abs(float(zres.row_center_cm)) <= float(zp.trigger_max_center_cm)))
+        trigger_ok = stable_ok and angle_ok and center_ok
         
         # Debug: log why approach is rejected
         if (zres is not None and zres.seen and dist is not None
@@ -1875,12 +1896,24 @@ class AutonomousRacer(Node):
                 self.get_logger().info(
                     f"[ZEBRA] Approach blocked: insufficient stability ({stable_frames}/3 frames)",
                     throttle_duration_sec=2.0)
+            elif not angle_ok:
+                za = '?' if zres.angle_deg is None else f'{zres.angle_deg:.1f}'
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: skewed row angle={za}deg "
+                    f"> {zp.trigger_max_angle_deg:.1f}deg",
+                    throttle_duration_sec=1.0)
+            elif not center_ok:
+                rc = '?' if zres.row_center_cm is None else f'{zres.row_center_cm:.1f}'
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: row center={rc}cm "
+                    f"> {zp.trigger_max_center_cm:.1f}cm",
+                    throttle_duration_sec=1.0)
         
         if (zres is not None and zres.seen and dist is not None
                 and dist <= self._detect_distance_cm 
                 and self.intersection_phase is None
                 and self._drive_enabled
-                and cooldown_ok and stable_ok):
+                and cooldown_ok and trigger_ok):
             self.intersection_phase = 'approach'   # ADVANCE
             self._zebra_opt_votes = {}
             self._adv_odom0 = self._odom_m()
@@ -2889,6 +2922,8 @@ class AutonomousRacer(Node):
                 # Capture the last CONFIDENT heading for the near-cross hysteresis.
                 if lane_result.confidence >= self._lane_hold_conf:
                     self._lane_hold_center_x = steering_center_x
+                    self._lane_hold_far_x = steering_far_x
+                    self._lane_hold_curvature = lane_curvature
                     self._lane_hold_time = now
                 self.get_logger().info(
                     f"[LANE] off={lane_result.offset_norm:+.2f} "
@@ -2921,6 +2956,20 @@ class AutonomousRacer(Node):
             self.time_line_lost = None
             self.get_logger().warn(
                 f"[LANE] hold heading near cross (cx={steering_center_x:.0f})",
+                throttle_duration_sec=0.5,
+            )
+        elif (not lane_ok and self._use_birdseye and self._lane_hold_center_x is not None
+              and self._lane_hold_time is not None
+              and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+              and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_curve_s):
+            lane_ok = True
+            steering_center_x = self._lane_hold_center_x
+            steering_far_x = self._lane_hold_far_x
+            lane_curvature = self._lane_hold_curvature
+            self.time_line_lost = None
+            self.get_logger().warn(
+                f"[LANE] hold BEV curve target (cx={steering_center_x:.0f}, "
+                f"curv={lane_curvature:.2f})",
                 throttle_duration_sec=0.5,
             )
 
