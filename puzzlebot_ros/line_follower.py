@@ -395,7 +395,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('stop_seconds', 3.0)
         self.declare_parameter('giveway_seconds', 1.5)
         self.declare_parameter('sign_cooldown_s', 6.0)   # don't re-fire same sign
-        self.declare_parameter('sign_forget_s', 8.0)     # discard pending_turn if sign not seen
+        self.declare_parameter('sign_forget_s', 15.0)    # discard pending_turn if sign not seen
         # stop/give_way only ACT when the sign is CLOSE (its box is big enough = near).
         # Arrow signs must latch earlier so the turn survives until the next cross.
         # area_pct is a distance proxy: bigger box => closer sign.
@@ -1033,8 +1033,21 @@ class AutonomousRacer(Node):
                     f"{self._sign_turn_act_area_pct:.1f}%) -> waiting to get closer",
                     throttle_duration_sec=1.0)
                 return
-            self._pending_turn = {'turn_left': 'left', 'turn_right': 'right',
-                                  'go_straight': 'straight'}[name]
+            direction = {'turn_left': 'left', 'turn_right': 'right',
+                         'go_straight': 'straight'}[name]
+            if self._pending_turn is not None and self._pending_turn != direction:
+                self.get_logger().warn(
+                    f"[SIGN] ignoring conflicting {name}->{direction}; "
+                    f"pending {self._pending_turn} is already latched",
+                    throttle_duration_sec=1.0)
+                self._event('sign_conflict_ignored',
+                            sign_name=name,
+                            direction=direction,
+                            pending_turn=self._pending_turn,
+                            conf=round(res.conf, 3),
+                            area_pct=round(res.area_pct, 2))
+                return
+            self._pending_turn = direction
             self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
             self._sign_last_fired[name] = now
             self.get_logger().warn(
@@ -2053,7 +2066,7 @@ class AutonomousRacer(Node):
             self.zebra_result = None
             self.intersection_cooldown_until = now + Duration(seconds=1.5)
             self._event('commit_start', direction=self.commit_direction,
-                        duration_s=float(dur), min_s=float(self._commit_min_s),
+                        duration_s=float(dur), min_s=float(min_s),
                         pre_advance_cm=float(pre_turn_cm))
         return False
 
@@ -3067,16 +3080,32 @@ class AutonomousRacer(Node):
                         or now >= self._commit_min_until)
             past_max = (self.commit_until is not None
                         and now >= self.commit_until)
+            commit_elapsed = (0.0 if self._commit_start_time is None else
+                              (now - self._commit_start_time).nanoseconds * 1e-9)
+            straight_early_handoff = False
+            if (not is_turn and reacquired and lr is not None and lr.detected
+                    and commit_elapsed >= 1.5):
+                # On this lab the straight branch can immediately become a curve.
+                # Holding w=0 for the full straight min time hands FOLLOW a large
+                # offset. If the lane is already confidently reacquired and starts
+                # drifting/curving hard, return to FOLLOW early so it can steer.
+                straight_early_handoff = (
+                    abs(lr.offset_norm) >= 0.45
+                    or abs(lr.curvature_norm) >= 0.55)
             # End the maneuver when the lane is RE-ACQUIRED (after a min time to
             # clear the cross), or at the safety cap. A cross has no line to
             # follow, so we drive the turn/cross open-loop ONLY until the line of
             # the chosen branch reappears -- then hand straight back to FOLLOW.
-            if past_max or (self._commit_closed_loop and past_min and reacquired):
+            if (past_max
+                    or (self._commit_closed_loop and reacquired
+                        and (past_min or straight_early_handoff))):
                 self.get_logger().info(
                     f"[INTERSECTION] commit {self.commit_direction} done -> FOLLOW "
                     f"(reacquired={reacquired}, timeout={past_max})")
                 self._event('commit_end', direction=self.commit_direction,
-                            reacquired=bool(reacquired), timeout=bool(past_max))
+                            reacquired=bool(reacquired), timeout=bool(past_max),
+                            early_handoff=bool(straight_early_handoff),
+                            elapsed_s=round(float(commit_elapsed), 3))
                 self.commit_direction = None
                 self.commit_until = None
                 self._commit_min_until = None
@@ -3085,8 +3114,7 @@ class AutonomousRacer(Node):
                 base_linear_x = self._commit_speed
                 pre_cm = (self._commit_turn_pre_advance_cm
                           if self.commit_direction in ("left", "right") else 0.0)
-                pre_elapsed = (0.0 if self._commit_start_time is None else
-                               (now - self._commit_start_time).nanoseconds * 1e-9)
+                pre_elapsed = commit_elapsed
                 pre_odom_cm = (self._odom_m() - self._commit_odom0) * 100.0
                 pre_time_s = pre_cm / max(1e-3, self._commit_speed * 100.0)
                 pre_done = (pre_odom_cm >= pre_cm or pre_elapsed >= pre_time_s)

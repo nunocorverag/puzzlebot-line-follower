@@ -168,7 +168,7 @@ DEFAULTS = {
     "traffic_light_aspect_tol": 0.35, "traffic_light_min_fill": 0.45,
     "traffic_light_max_fill": 1.15,
     "sign_turn_act_area_pct": 1.4, "sign_act_area_pct": 6.0,
-    "sign_cooldown_s": 6.0, "sign_forget_s": 8.0,
+    "sign_cooldown_s": 6.0, "sign_forget_s": 15.0,
     "traffic_light_action_min_radius_px": 10.0,
     "traffic_light_action_max_radius_px": 80.0,
     "traffic_light_action_min_distance_cm": 12.0,

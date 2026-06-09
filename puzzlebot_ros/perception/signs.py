@@ -305,14 +305,22 @@ def _verify_arrow_direction(frame, box):
     
     vote_details['vote_counts'] = vote_counts
     
-    # Find winner (accept even single vote if it's the only one)
-    max_votes = max(vote_counts.values())
-    if max_votes >= 1:  # Changed from 2 to 1 - accept any vote
-        for direction, count in vote_counts.items():
-            if count == max_votes:
-                vote_details['winner'] = direction
-                return direction, vote_details
-    
+    # Only use this verifier as a left/right override when there is a real
+    # consensus. Single-vote corrections were flipping signs on noisy frames.
+    turn_counts = {k: v for k, v in vote_counts.items()
+                   if k in ('turn_left', 'turn_right')}
+    if turn_counts:
+        ranked = sorted(turn_counts.items(), key=lambda kv: kv[1], reverse=True)
+        winner, winner_count = ranked[0]
+        runner_up = ranked[1][1] if len(ranked) > 1 else 0
+        if winner_count >= 3 and winner_count - runner_up >= 2:
+            vote_details['winner'] = winner
+            return winner, vote_details
+        vote_details['winner'] = None
+        vote_details['reason'] = (
+            f'weak_turn_vote winner={winner} votes={winner_count} '
+            f'margin={winner_count - runner_up}')
+
     return None, vote_details  # No clear consensus
 
 
