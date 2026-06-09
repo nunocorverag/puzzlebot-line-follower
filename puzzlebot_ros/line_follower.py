@@ -504,7 +504,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
-        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 8.0)))
+        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 10.0)))
         # Commit must CROSS the intersection before re-acquiring. The robot stops
         # ~10 cm before the first dashed row and the cross is ~26 cm deep (double
         # cross), so straight must travel ~36 cm before it looks for the continuing
@@ -744,8 +744,11 @@ class AutonomousRacer(Node):
         # scripts/set_gain_jetson.sh). Registered LAST so it sees all declarations.
         self.add_on_set_parameters_callback(self._on_set_params)
 
-        # Timer (30 Hz)
-        self.timer = self.create_timer(0.033, self.control_loop)
+        # Timer (30 Hz). Use the SAFE wrapper so an unhandled exception in the
+        # control loop can never (a) crash the timer callback (which would freeze
+        # the camera read + leave the last cmd_vel latched -> runaway), nor
+        # (b) leave the robot driving. On error we publish STOP and recover next tick.
+        self.timer = self.create_timer(0.033, self._safe_control_loop)
 
         # MJPEG server (access from the PC: http://10.10.0.100:8080)
         _start_mjpeg_server(port=8080)
@@ -2426,6 +2429,24 @@ class AutonomousRacer(Node):
     # =============================================================
     # MAIN LOOP
     # =============================================================
+    def _safe_control_loop(self):
+        """Crash-proof wrapper around control_loop. An unhandled exception in the
+        timer callback would otherwise (a) stop the timer from firing (camera
+        appears to freeze: cap.read() is no longer called) and (b) leave the LAST
+        cmd_vel latched on the robot -> it keeps driving forward into a wall.
+        Here we catch everything, publish a STOP, and let the NEXT tick recover."""
+        try:
+            self.control_loop()
+        except Exception as exc:                       # noqa: BLE001
+            import traceback
+            self.get_logger().error(
+                f"[CONTROL] loop exception -> STOP + recover: {exc}\n"
+                f"{traceback.format_exc()}")
+            try:
+                self.cmd_pub.publish(Twist())          # fail safe: stop the robot
+            except Exception:                          # noqa: BLE001
+                pass
+
     def control_loop(self):
         ret, frame = self.cap.read()
         if not ret:
@@ -2643,6 +2664,7 @@ class AutonomousRacer(Node):
                 self.commit_until = now + Duration(seconds=dur)
                 self._commit_min_until = now + Duration(seconds=self._commit_min_s)
                 self._dist_since_commit = 0.0        # start the double-cross travel guard
+                self._commit_odom0 = self._odom_m()  # baseline for turn pre-advance
                 self._approach_start_time = None
                 self.intersection_phase = None
                 self.intersection_pending = False
@@ -2925,17 +2947,16 @@ class AutonomousRacer(Node):
 
         if self.commit_direction is not None:
             lr = self._last_lane_result
-            # Re-acquisition: slightly stricter for turns to avoid edges, but not too strict
+            # ROBUST re-acquisition for turns: require high confidence AND reasonable offset
+            # to avoid grabbing edge lines during the turn
             is_turn = self.commit_direction in ('left', 'right')
             if is_turn:
-                # For turns: moderate criteria
-                # - Confidence >= 0.6 (slightly higher than straight)
-                # - Offset < 0.7 (allow some deviation but not extreme)
+                # For turns: strict criteria to avoid edge detection
                 reacquired = (lr is not None and lr.detected
-                              and lr.confidence >= 0.6
-                              and abs(lr.offset_norm) < 0.7)
+                              and lr.confidence >= 0.7
+                              and abs(lr.offset_norm) < 0.6)
             else:
-                # For straight: original criteria
+                # For straight: more lenient (original criteria)
                 reacquired = (lr is not None and lr.detected
                               and lr.confidence >= 0.5)
             
@@ -2947,16 +2968,6 @@ class AutonomousRacer(Node):
             # clear the cross), or at the safety cap. A cross has no line to
             # follow, so we drive the turn/cross open-loop ONLY until the line of
             # the chosen branch reappears -- then hand straight back to FOLLOW.
-            
-            # Emergency logging if taking too long
-            elapsed = (now - (self.commit_until - Duration(seconds=self._commit_duration))).nanoseconds * 1e-9
-            if is_turn and elapsed > 2.5 and not reacquired:
-                self.get_logger().warn(
-                    f"[INTERSECTION] commit {self.commit_direction} taking long ({elapsed:.1f}s), "
-                    f"lane={lane_info if 'lane_info' in locals() else 'unknown'}, "
-                    f"will timeout at {self._commit_duration:.1f}s",
-                    throttle_duration_sec=1.0)
-            
             if past_max or (self._commit_closed_loop and past_min and reacquired):
                 self.get_logger().info(
                     f"[INTERSECTION] commit {self.commit_direction} done -> FOLLOW "
