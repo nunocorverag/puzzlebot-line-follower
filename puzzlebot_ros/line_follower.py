@@ -660,6 +660,7 @@ class AutonomousRacer(Node):
         self._lane_hold_center_x = None  # last confident steering center (orig px)
         self._lane_hold_far_x = None
         self._lane_hold_curvature = 0.0
+        self._lane_hold_signed_curvature = 0.0
         self._lane_hold_time = None      # when it was captured (for the timeout)
 
         # Branch guard near a cross. At a fork the BEV can briefly drop the line
@@ -2991,29 +2992,41 @@ class AutonomousRacer(Node):
                 self.time_line_lost = None
                 # Capture the last CONFIDENT heading for the near-cross hysteresis.
                 if lane_result.confidence >= self._lane_hold_conf:
+                    signed_curvature = float(lane_result.curvature_norm)
                     recent_curve_hold = (
                         self._lane_hold_time is not None
                         and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
                         and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_curve_s
                     )
-                    # Do not let a weak/flattened exit-frame erase a strong curve
-                    # target. In the tight lab curve the BEV briefly reports
-                    # curv~0.3-0.4 while the robot is still physically turning; if
-                    # that overwrites the hold target, the next low-confidence
-                    # frame accelerates and grabs a seam.
-                    if lane_curvature >= self._lane_hold_curve_min_curv or not recent_curve_hold:
-                        self._lane_hold_center_x = steering_center_x
-                        self._lane_hold_far_x = steering_far_x
-                        self._lane_hold_curvature = lane_curvature
-                        self._lane_hold_time = now
-                    elif (lane_result.confidence <= self._lane_curve_hold_assist_conf
-                          and self._lane_hold_far_x is not None):
+                    weak_fit = lane_result.confidence <= self._lane_curve_hold_assist_conf
+                    sign_flip = (
+                        recent_curve_hold
+                        and weak_fit
+                        and abs(signed_curvature) >= self._lane_hold_curve_min_curv
+                        and self._lane_hold_signed_curvature * signed_curvature < 0.0
+                    )
+                    flattened = (
+                        recent_curve_hold
+                        and weak_fit
+                        and lane_curvature < self._lane_hold_curve_min_curv
+                    )
+                    # Do not let a weak exit-frame erase a strong curve target.
+                    # In this lab the polynomial briefly flips curvature sign at
+                    # the apex even though the robot still needs the same turn.
+                    if ((sign_flip or flattened) and self._lane_hold_far_x is not None):
                         steering_far_x = self._lane_hold_far_x
                         lane_curvature = max(lane_curvature, self._lane_hold_curvature)
                         self.get_logger().warn(
                             f"[LANE] assist curve lookahead from hold "
-                            f"(conf={lane_result.confidence:.2f}, curv={lane_curvature:.2f})",
+                            f"(conf={lane_result.confidence:.2f}, "
+                            f"curv={signed_curvature:+.2f}->{self._lane_hold_signed_curvature:+.2f})",
                             throttle_duration_sec=0.5)
+                    elif lane_curvature >= self._lane_hold_curve_min_curv or not recent_curve_hold:
+                        self._lane_hold_center_x = steering_center_x
+                        self._lane_hold_far_x = steering_far_x
+                        self._lane_hold_curvature = lane_curvature
+                        self._lane_hold_time = now
+                        self._lane_hold_signed_curvature = signed_curvature
                 self.get_logger().info(
                     f"[LANE] off={lane_result.offset_norm:+.2f} "
                     f"curv={lane_result.curvature_norm:+.2f} conf={lane_result.confidence:.2f}",
