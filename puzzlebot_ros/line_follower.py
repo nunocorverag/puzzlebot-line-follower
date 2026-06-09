@@ -504,7 +504,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('approach_timeout_s', float(saved.get('approach_timeout_s', 10.0)))
         self.declare_parameter('commit_speed', float(saved.get('commit_speed', 0.08)))
         self.declare_parameter('commit_turn_w', float(saved.get('commit_turn_w', 0.6)))
-        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 4.0)))
+        self.declare_parameter('commit_turn_pre_advance_cm', float(saved.get('commit_turn_pre_advance_cm', 10.0)))
         # Commit must CROSS the intersection before re-acquiring. The robot stops
         # ~10 cm before the first dashed row and the cross is ~26 cm deep (double
         # cross), so straight must travel ~36 cm before it looks for the continuing
@@ -2925,8 +2925,22 @@ class AutonomousRacer(Node):
 
         if self.commit_direction is not None:
             lr = self._last_lane_result
-            reacquired = (lr is not None and lr.detected
-                          and lr.confidence >= 0.5)
+            # ROBUST re-acquisition for turns: require high confidence AND reasonable offset
+            # to avoid grabbing edge lines during the turn
+            is_turn = self.commit_direction in ('left', 'right')
+            if is_turn:
+                # For turns: strict criteria to avoid edge detection
+                # - High confidence (0.7+) to ensure it's a real line
+                # - Reasonable offset (not too far to the side, < 0.6)
+                # - This prevents grabbing the intersection edge or wrong branch
+                reacquired = (lr is not None and lr.detected
+                              and lr.confidence >= 0.7
+                              and abs(lr.offset_norm) < 0.6)
+            else:
+                # For straight: more lenient (original criteria)
+                reacquired = (lr is not None and lr.detected
+                              and lr.confidence >= 0.5)
+            
             past_min = (self._commit_min_until is None
                         or now >= self._commit_min_until)
             past_max = (self.commit_until is not None
@@ -2957,11 +2971,23 @@ class AutonomousRacer(Node):
                     target_angular_z = -self._commit_turn_w
                 else:
                     target_angular_z = 0.0
-                self.get_logger().info(
-                    f"[INTERSECTION] Committing {self.commit_direction}: "
-                    f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
-                    f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm",
-                    throttle_duration_sec=0.5)
+                # Detailed logging for turn commits
+                if is_turn:
+                    lane_info = "no_lane"
+                    if lr is not None and lr.detected:
+                        lane_info = f"conf={lr.confidence:.2f},off={lr.offset_norm:.2f}"
+                    self.get_logger().info(
+                        f"[INTERSECTION] Committing {self.commit_direction}: "
+                        f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
+                        f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm, "
+                        f"lane={lane_info}, reacq={reacquired}",
+                        throttle_duration_sec=0.5)
+                else:
+                    self.get_logger().info(
+                        f"[INTERSECTION] Committing {self.commit_direction}: "
+                        f"V={base_linear_x:.2f}, W={target_angular_z:.2f}, "
+                        f"pre={min(pre_cm, (self._odom_m() - self._commit_odom0) * 100.0):.0f}/{pre_cm:.0f}cm",
+                        throttle_duration_sec=0.5)
 
         # During APPROACH: drive a fixed creep AND actively align heading so the
         # robot straightens onto the zebra (works whether it arrived from a curve
