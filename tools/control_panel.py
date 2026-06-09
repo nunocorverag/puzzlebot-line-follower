@@ -102,6 +102,8 @@ GROUPS = [
         ("lane.continuity_search_half_w_pct", "i", 1, "prev-base search corridor"),
         ("lane.window_half_w_pct",   "i", 1,      "sliding window half width"),
         ("lane.min_pix",             "i", 10,     "pixels to recenter window"),
+        ("lane.line_open_px",        "i", 2,      "remove thin puzzle outlines"),
+        ("lane.fit_max_rmse_px",     "i", 2,      "reject scattered lane fits"),
     ]),
     ("AntiZebra", [
         ("lane.zebra_row_reject",    "i", 1,      "anti-zebra filter on/off"),
@@ -195,6 +197,7 @@ DEFAULTS = {
     "lane.src_bot_y_pct": 95, "lane.src_bot_half_w_pct": 42,
     "lane.base_search_half_w_pct": 26, "lane.continuity_search_half_w_pct": 12,
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
+    "lane.line_open_px": 5, "lane.fit_max_rmse_px": 28,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
     "lane_hold_curve_s": 0.80, "lane_hold_curve_min_curv": 0.55,

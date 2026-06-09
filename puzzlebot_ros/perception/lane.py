@@ -72,6 +72,8 @@ class LaneParams:
     adaptive_block: int = 41       # adaptive-threshold block size (forced odd)
     adaptive_c: int = 8            # adaptive-threshold constant subtracted
     blur_ksize: int = 5            # gaussian blur kernel (forced odd)
+    line_open_px: int = 5          # remove thin puzzle-piece outlines; the
+                                   # painted lane is much thicker and survives
 
     # --- Sliding-window line search ----------------------------------------
     nwindows: int = 12             # vertical windows stacked bottom -> top
@@ -127,6 +129,8 @@ class LaneParams:
                                    # further). Its offset minus the near offset is
                                    # the bend, used by the controller feedforward.
     min_windows_conf_pct: int = 40  # need this % of windows with pixels to trust
+    fit_max_rmse_px: int = 28       # reject fits made from scattered seams/noise
+                                   # (0 disables)
 
     # --- Optional metric scale ---------------------------------------------
     px_per_cm_x10: int = 0         # warped px per cm (x10). 0 = metric disabled
@@ -234,7 +238,8 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
     # here because it would rescale the very brightness this relies on.
     if getattr(params, "black_thresh", 0) > 0:
         _, mask = cv2.threshold(gray, int(params.black_thresh), 255, cv2.THRESH_BINARY_INV)
-        kernel = np.ones((3, 3), np.uint8)
+        open_px = max(1, int(getattr(params, "line_open_px", 5)) | 1)
+        kernel = np.ones((open_px, open_px), np.uint8)
         return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
     if params.use_clahe:
         clip = max(0.1, params.clahe_clip_x10 / 10.0)
@@ -249,7 +254,8 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
         )
     else:
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    kernel = np.ones((3, 3), np.uint8)
+    open_px = max(1, int(getattr(params, "line_open_px", 5)) | 1)
+    kernel = np.ones((open_px, open_px), np.uint8)
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 
@@ -321,6 +327,12 @@ def _track_from_base(nz_x, nz_y, base_x, h, w, params):
         coeffs = np.polyfit(ys, xs, deg)
         if deg == 1:
             coeffs = np.array([0.0, coeffs[0], coeffs[1]])
+        max_rmse = int(getattr(params, "fit_max_rmse_px", 28))
+        if max_rmse > 0:
+            pred = coeffs[0] * ys * ys + coeffs[1] * ys + coeffs[2]
+            rmse = float(np.sqrt(np.mean((xs - pred) ** 2)))
+            if rmse > max_rmse:
+                return None, found, centers
         fit = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
     return fit, found, centers
 
