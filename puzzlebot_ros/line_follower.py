@@ -397,10 +397,12 @@ class AutonomousRacer(Node):
         self.declare_parameter('sign_cooldown_s', 6.0)   # don't re-fire same sign
         self.declare_parameter('sign_forget_s', 8.0)     # discard pending_turn if sign not seen
         # stop/give_way only ACT when the sign is CLOSE (its box is big enough = near).
-        # Arrow/workers latch from farther (just min_box_pct). area_pct is a distance
-        # proxy: bigger box => closer sign.
+        # Arrow signs must latch earlier so the turn survives until the next cross.
+        # area_pct is a distance proxy: bigger box => closer sign.
         self.declare_parameter('sign_act_area_pct', 6.0)
+        self.declare_parameter('sign_turn_act_area_pct', 1.4)
         self._sign_act_area_pct = float(self.get_parameter('sign_act_area_pct').value)
+        self._sign_turn_act_area_pct = float(self.get_parameter('sign_turn_act_area_pct').value)
         self._use_signs = bool(self.get_parameter('use_signs').value)
         self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
         self._workers_slow_s = float(self.get_parameter('workers_slow_s').value)
@@ -1020,12 +1022,13 @@ class AutonomousRacer(Node):
         
         name = res.name
         if name in ('turn_left', 'turn_right', 'go_straight'):
-            # Only act on directional signs when they are CLOSE (area >= threshold)
-            # This prevents confusion when multiple signs are visible but far away
-            if res.area_pct < self._sign_act_area_pct:
+            # Directional signs latch earlier than STOP/give_way. In real runs the
+            # arrow often leaves the FOV before the zebra READ window; waiting for
+            # the stop-sign distance threshold means no pending_turn is ever set.
+            if res.area_pct < self._sign_turn_act_area_pct:
                 self.get_logger().info(
                     f"[SIGN] {name} seen far (area {res.area_pct:.1f}% < "
-                    f"{self._sign_act_area_pct:.1f}%) -> waiting to get closer",
+                    f"{self._sign_turn_act_area_pct:.1f}%) -> waiting to get closer",
                     throttle_duration_sec=1.0)
                 return
             self._pending_turn = {'turn_left': 'left', 'turn_right': 'right',
@@ -1041,6 +1044,7 @@ class AutonomousRacer(Node):
                        direction=self._pending_turn,
                        conf=round(res.conf, 3),
                        area_pct=round(res.area_pct, 2),
+                       threshold_pct=self._sign_turn_act_area_pct,
                        expires_s=self._sign_forget_s)
         elif name == 'workers':
             self._workers_until = now + Duration(seconds=self._workers_slow_s)
@@ -1228,8 +1232,12 @@ class AutonomousRacer(Node):
                 self._giveway_seconds = float(p.value)
             elif p.name == 'sign_cooldown_s':
                 self._sign_cooldown_s = float(p.value)
+            elif p.name == 'sign_forget_s':
+                self._sign_forget_s = float(p.value)
             elif p.name == 'sign_act_area_pct':
                 self._sign_act_area_pct = float(p.value)
+            elif p.name == 'sign_turn_act_area_pct':
+                self._sign_turn_act_area_pct = float(p.value)
             elif p.name == 'detect_distance_cm':
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
@@ -1312,6 +1320,10 @@ class AutonomousRacer(Node):
                 'commit_min_s': self._commit_min_s,
                 'commit_straight_min_s': self._commit_straight_min_s,
                 'commit_closed_loop': self._commit_closed_loop,
+                'sign_turn_act_area_pct': self._sign_turn_act_area_pct,
+                'sign_act_area_pct': self._sign_act_area_pct,
+                'sign_cooldown_s': self._sign_cooldown_s,
+                'sign_forget_s': self._sign_forget_s,
                 'align_in_place': self._align_in_place,
                 'align_tol_deg': self._align_tol_deg,
                 'align_max_w': self._align_max_w,

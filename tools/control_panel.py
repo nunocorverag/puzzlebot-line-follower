@@ -114,6 +114,12 @@ GROUPS = [
         ("lane.src_bot_half_w_pct",  "i", 1,      "warp bottom half width"),
         ("zebra.widen_kx",           "f", 0.1,    "wide zebra warp scale"),
     ]),
+    ("Signs", [
+        ("sign_turn_act_area_pct", "f", 0.1, "arrow area pct to latch"),
+        ("sign_act_area_pct", "f", 0.5,      "stop/yield area pct"),
+        ("sign_cooldown_s", "f", 0.5,       "same sign cooldown"),
+        ("sign_forget_s", "f", 0.5,         "turn forget while FOLLOW"),
+    ]),
     ("Traffic", [
         ("traffic_light_roi_y_pct", "i", 1,      "top image pct to search"),
         ("traffic_light_min_area", "f", 10.0,   "min circular blob area"),
@@ -161,6 +167,8 @@ DEFAULTS = {
     "traffic_light_max_area": 5000.0, "traffic_light_min_circularity": 0.65,
     "traffic_light_aspect_tol": 0.35, "traffic_light_min_fill": 0.45,
     "traffic_light_max_fill": 1.15,
+    "sign_turn_act_area_pct": 1.4, "sign_act_area_pct": 6.0,
+    "sign_cooldown_s": 6.0, "sign_forget_s": 8.0,
     "traffic_light_action_min_radius_px": 10.0,
     "traffic_light_action_max_radius_px": 80.0,
     "traffic_light_action_min_distance_cm": 12.0,
