@@ -981,26 +981,24 @@ class AutonomousRacer(Node):
         
         # Check if we have a pending turn from a directional sign
         if self._pending_turn is not None:
-            # Once we're approaching/at the cross, LOCK the decision: the sign has
-            # already left the camera FOV by design, so the timeout must NOT discard
-            # it here -- it will be consumed by the WAIT auto-decision.
-            in_intersection = (self.intersection_phase in ('approach', 'wait')
-                               or self.commit_direction is not None)
-            # FREEZE the forget timer whenever the robot is HELD in place (RED light,
-            # stop/give-way hold, or drive disabled). Otherwise wall-clock time spent
-            # waiting at a light -- while the sign is already out of the FOV -- eats
-            # the timeout budget and the turn is dropped before we ever reach the cross.
+            # The forget timer ONLY runs while purely FOLLOWING the line. In ANY
+            # other state -- approach/ADVANCE, wait/READ, commit, or while HELD by a
+            # red light / stop hold / drive disabled -- the sign is out of the FOV by
+            # design, so the countdown is FROZEN. Otherwise time spent at a light or
+            # advancing onto the cross would drop the turn before we can use it.
+            is_following = (self.intersection_phase is None
+                            and self.commit_direction is None)
             held_in_place = (
                 self.current_state == 'RED'
                 or (self._stopsign_until is not None and now < self._stopsign_until)
                 or not self._drive_enabled)
+            counter_active = is_following and not held_in_place
             # If the sign is still visible, refresh the timeout
             if res.name in ('turn_left', 'turn_right', 'go_straight'):
                 self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
-            # If held or already committed to the cross, pause the countdown
-            elif held_in_place or in_intersection:
+            # Only count down (and possibly discard) while purely FOLLOWING
+            elif not counter_active:
                 self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
-            # Otherwise (driving in FOLLOW, sign gone): allow the timeout to discard
             elif (self._pending_turn_until is not None
                   and now >= self._pending_turn_until):
                 discarded_turn = self._pending_turn
