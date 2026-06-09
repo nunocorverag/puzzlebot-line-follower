@@ -986,12 +986,22 @@ class AutonomousRacer(Node):
             # it here -- it will be consumed by the WAIT auto-decision.
             in_intersection = (self.intersection_phase in ('approach', 'wait')
                                or self.commit_direction is not None)
+            # FREEZE the forget timer whenever the robot is HELD in place (RED light,
+            # stop/give-way hold, or drive disabled). Otherwise wall-clock time spent
+            # waiting at a light -- while the sign is already out of the FOV -- eats
+            # the timeout budget and the turn is dropped before we ever reach the cross.
+            held_in_place = (
+                self.current_state == 'RED'
+                or (self._stopsign_until is not None and now < self._stopsign_until)
+                or not self._drive_enabled)
             # If the sign is still visible, refresh the timeout
             if res.name in ('turn_left', 'turn_right', 'go_straight'):
                 self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
-            # If timeout expired AND we are not committed to a cross, discard it
-            elif (not in_intersection
-                  and self._pending_turn_until is not None
+            # If held or already committed to the cross, pause the countdown
+            elif held_in_place or in_intersection:
+                self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
+            # Otherwise (driving in FOLLOW, sign gone): allow the timeout to discard
+            elif (self._pending_turn_until is not None
                   and now >= self._pending_turn_until):
                 discarded_turn = self._pending_turn
                 self.get_logger().warn(
