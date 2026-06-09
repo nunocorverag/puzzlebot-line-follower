@@ -673,6 +673,8 @@ class AutonomousRacer(Node):
         self._csv_writer = None
         self._event_fp = None
         self._t0 = self.get_clock().now()
+        self._loop_stage = 'init'
+        self._last_commit_tick_t = None
         if bool(self.get_parameter('controller_log').value):
             log_path = str(self.get_parameter('controller_log_path').value).strip() or \
                 str(self._snapshot_dir() / 'controller_data.csv')
@@ -1495,6 +1497,56 @@ class AutonomousRacer(Node):
         except OSError:
             pass
 
+    def _write_loop_exception(self, exc, traceback_text):
+        """Persist control-loop exceptions where session pulls can capture them."""
+        try:
+            self._event(
+                'loop_exception',
+                error=repr(exc),
+                loop_stage=getattr(self, '_loop_stage', 'unknown'),
+                traceback=traceback_text[-4000:],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            path = self._snapshot_dir() / 'control_exceptions.log'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            t = (self.get_clock().now() - self._t0).nanoseconds * 1e-9
+            with open(path, 'a', buffering=1) as fp:
+                fp.write(
+                    f"\n=== control_loop exception t={t:.3f} "
+                    f"stage={getattr(self, '_loop_stage', 'unknown')} "
+                    f"state={self._phase_label()[0]} "
+                    f"phase={self.intersection_phase} "
+                    f"commit={self.commit_direction} ===\n"
+                )
+                fp.write(traceback_text)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _commit_debug_tick(self, now, stage, cmd=None, force=False, **fields):
+        if self.commit_direction is None:
+            return
+        last = self._last_commit_tick_t
+        if (not force and last is not None
+                and (now - last).nanoseconds * 1e-9 < 0.25):
+            return
+        self._last_commit_tick_t = now
+        lr = self._last_lane_result
+        payload = {
+            'stage': stage,
+            'direction': self.commit_direction,
+            'cmd_v': None if cmd is None else round(float(cmd.linear.x), 3),
+            'cmd_w': None if cmd is None else round(float(cmd.angular.z), 3),
+            'lane_detected': bool(lr is not None and lr.detected),
+            'lane_conf': None if lr is None else round(float(lr.confidence), 3),
+            'lane_off': None if lr is None else round(float(lr.offset_norm), 3),
+            'drive_enabled': bool(self._drive_enabled),
+            'light': self.current_state,
+        }
+        payload.update(fields)
+        self._event('commit_tick', **payload)
+
     def _snapshot_dir(self):
         base = Path('/home/puzzlebot/ros2_ws/src/puzzlebot_ros')
         if not base.is_dir():
@@ -1649,6 +1701,10 @@ class AutonomousRacer(Node):
             f"{self.max_v:.3f}", f"{self.max_w:.3f}",
             f"{zp.stop_distance_cm:.1f}", f"{zp.slow_distance_cm:.1f}",
             f"{self._commit_min_s:.2f}", f"{self._commit_turn_w:.2f}"])
+        try:
+            self._csv_fp.flush()
+        except OSError:
+            pass
 
     def _publish_stream_frame(self, frame):
         """Throttle and push the annotated frame to the active stream (MJPEG or H264).
@@ -1988,6 +2044,7 @@ class AutonomousRacer(Node):
             self._commit_start_time = now
             self._approach_start_time = None
             self.intersection_phase = None
+            self._last_commit_tick_t = None
             self.intersection_pending = False
             self.intersection_options = []
             self.intersection_decision = None
@@ -2468,20 +2525,24 @@ class AutonomousRacer(Node):
             self.control_loop()
         except Exception as exc:                       # noqa: BLE001
             import traceback
+            tb = traceback.format_exc()
+            self._write_loop_exception(exc, tb)
             self.get_logger().error(
                 f"[CONTROL] loop exception -> STOP + recover: {exc}\n"
-                f"{traceback.format_exc()}")
+                f"{tb}")
             try:
                 self.cmd_pub.publish(Twist())          # fail safe: stop the robot
             except Exception:                          # noqa: BLE001
                 pass
 
     def control_loop(self):
+        self._loop_stage = 'camera_read'
         ret, frame = self.cap.read()
         if not ret:
             self.get_logger().warn("No frame received from camera!")
             return
 
+        self._loop_stage = 'preprocess'
         if self.camera_matrix is not None and self.dist_coeffs is not None:
             frame = cv2.undistort(frame, self.camera_matrix, self.dist_coeffs)
         frame = self._apply_illumination_gain(frame)
@@ -2493,8 +2554,11 @@ class AutonomousRacer(Node):
         # YOLO traffic signs: detect + latch actions (no-op if disabled).
         # During COMMIT the decision is locked; skip inference so a slow/bad sign
         # frame cannot stall the camera/control loop mid-turn.
+        self._loop_stage = 'signs'
         if self.commit_direction is None:
             self._run_signs(frame, now)
+
+        self._loop_stage = 'traffic_light'
 
         # ---------------------------------------------------------
         # 1. TRAFFIC LIGHT PERCEPTION
@@ -2588,6 +2652,8 @@ class AutonomousRacer(Node):
         state_msg = String()
         state_msg.data = self.current_state
         self.state_pub.publish(state_msg)
+
+        self._loop_stage = 'intersection'
 
         # ---------------------------------------------------------
         # 2. INTERSECTION / DASHED-LINE PERCEPTION
@@ -2700,12 +2766,15 @@ class AutonomousRacer(Node):
                 self._commit_start_time = now
                 self._approach_start_time = None
                 self.intersection_phase = None
+                self._last_commit_tick_t = None
                 self.intersection_pending = False
                 self.intersection_options = []
                 self.intersection_decision = None
                 self.intersection_stable = 0
                 self.intersection_result = None
                 self.intersection_cooldown_until = now + Duration(seconds=1.5)
+
+        self._loop_stage = 'lane_control'
 
         # ---------------------------------------------------------
         # 3. LINE PERCEPTION + BASE CONTROL
@@ -3020,6 +3089,17 @@ class AutonomousRacer(Node):
                 pre_odom_cm = (self._odom_m() - self._commit_odom0) * 100.0
                 pre_time_s = pre_cm / max(1e-3, self._commit_speed * 100.0)
                 pre_done = (pre_odom_cm >= pre_cm or pre_elapsed >= pre_time_s)
+                self._commit_debug_tick(
+                    now, 'command_calc',
+                    pre_cm=round(float(pre_cm), 2),
+                    pre_odom_cm=round(float(pre_odom_cm), 2),
+                    pre_elapsed_s=round(float(pre_elapsed), 3),
+                    pre_time_s=round(float(pre_time_s), 3),
+                    pre_done=bool(pre_done),
+                    reacquired=bool(reacquired),
+                    past_min=bool(past_min),
+                    past_max=bool(past_max),
+                )
                 if not pre_done:
                     target_angular_z = 0.0
                 elif self.commit_direction == 'left':
@@ -3147,7 +3227,10 @@ class AutonomousRacer(Node):
             cmd = Twist()
             self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
 
+        self._loop_stage = 'publish_cmd'
+        self._commit_debug_tick(now, 'before_publish_cmd', cmd=cmd, force=True)
         self.cmd_pub.publish(cmd)
+        self._commit_debug_tick(now, 'after_publish_cmd', cmd=cmd, force=True)
 
         # Odometry: integrate the commanded speed into travelled distance.
         self._odom_tick(now, cmd)
@@ -3164,16 +3247,29 @@ class AutonomousRacer(Node):
         if self._sign_result is not None:
             draw_sign_overlay(frame, self._sign_result)
         self._draw_status_hud(frame, cmd)
+        self._loop_stage = 'controller_csv'
+        self._commit_debug_tick(now, 'before_controller_csv', cmd=cmd, force=True)
         self._log_controller_row(now, cmd)
+        self._commit_debug_tick(now, 'after_controller_csv', cmd=cmd, force=True)
+        self._loop_stage = 'lane_status'
         self._publish_lane_status(cmd)
+        self._loop_stage = 'telemetry'
         self._publish_telemetry(now, cmd)
+        self._loop_stage = 'snapshot'
+        self._commit_debug_tick(now, 'before_snapshot', cmd=cmd, force=True)
         self._maybe_snapshot(now, frame)
+        self._commit_debug_tick(now, 'after_snapshot', cmd=cmd, force=True)
         if self.show_window:
+            self._loop_stage = 'imshow'
             cv2.imshow("Frame", frame)
             cv2.waitKey(1)
 
         # Push the annotated frame to the MJPEG stream.
+        self._loop_stage = 'stream'
+        self._commit_debug_tick(now, 'before_stream', cmd=cmd, force=True)
         self._publish_stream_frame(frame)
+        self._commit_debug_tick(now, 'after_stream', cmd=cmd, force=True)
+        self._loop_stage = 'done'
 
     def destroy_node(self):
         self.cap.release()
