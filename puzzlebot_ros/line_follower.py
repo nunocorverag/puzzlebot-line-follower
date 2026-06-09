@@ -614,9 +614,13 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_params_path', '')
         self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
         self.declare_parameter('curve_min_scale', 0.4)   # never below this fraction
+        self.declare_parameter('curve_memory_s', 0.75)   # keep slowing briefly after a tight curve
         self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
         self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
         self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
+        self._curve_memory_s = float(self.get_parameter('curve_memory_s').value)
+        self._curve_hold_until = None
+        self._curve_hold_value = 0.0
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -646,7 +650,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
-        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 0.80)))
+        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 1.20)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
@@ -1175,6 +1179,8 @@ class AutonomousRacer(Node):
                 self._curve_slow_gain = float(p.value)
             elif p.name == 'curve_min_scale':
                 self._curve_min_scale = float(p.value)
+            elif p.name == 'curve_memory_s':
+                self._curve_memory_s = float(p.value)
             elif p.name == 'lane_hold_near_cross':
                 self._lane_hold_near_cross = bool(p.value)
             elif p.name == 'lane_hold_conf':
@@ -1352,6 +1358,7 @@ class AutonomousRacer(Node):
                 'ff_gain': self.ff_gain,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
+                'curve_memory_s': self._curve_memory_s,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3176,12 +3183,22 @@ class AutonomousRacer(Node):
                 self.last_derivative = derivative
                 self.last_time       = now
 
-        # Slow down proportionally to the path curvature. The bird's-eye fit
-        # gives a real curvature estimate; it is 0 on the legacy path, so this
-        # is a no-op there and the legacy curve_factor still applies.
-        if lane_curvature > 0.0:
+        # Slow down proportionally to curvature, with short memory. Tight curves
+        # can produce one flat/fragmented fit while the robot is still physically
+        # in the turn; releasing speed immediately is what caused the jump from
+        # ~0.04 to ~0.09 m/s in the curve sessions.
+        effective_curvature = lane_curvature
+        if lane_curvature >= self._lane_hold_curve_min_curv:
+            self._curve_hold_value = max(self._curve_hold_value, lane_curvature)
+            self._curve_hold_until = now + Duration(seconds=self._curve_memory_s)
+        elif self._curve_hold_until is not None and now < self._curve_hold_until:
+            effective_curvature = max(effective_curvature, self._curve_hold_value)
+        else:
+            self._curve_hold_until = None
+            self._curve_hold_value = 0.0
+        if effective_curvature > 0.0:
             base_linear_x *= max(self._curve_min_scale,
-                                 1.0 - self._curve_slow_gain * lane_curvature)
+                                 1.0 - self._curve_slow_gain * effective_curvature)
 
         # Slow-zone: cap speed while a zebra is in view (FOLLOW only), so the robot
         # closes on the cross slowly enough to center instead of overshooting.

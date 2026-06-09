@@ -74,6 +74,8 @@ class LaneParams:
     blur_ksize: int = 5            # gaussian blur kernel (forced odd)
     line_open_px: int = 5          # remove thin puzzle-piece outlines; the
                                    # painted lane is much thicker and survives
+    line_core_px: int = 7          # keep only pixels with this distance-to-edge;
+                                   # removes jigsaw seams that survive opening
 
     # --- Sliding-window line search ----------------------------------------
     nwindows: int = 12             # vertical windows stacked bottom -> top
@@ -240,7 +242,8 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
         _, mask = cv2.threshold(gray, int(params.black_thresh), 255, cv2.THRESH_BINARY_INV)
         open_px = max(1, int(getattr(params, "line_open_px", 5)) | 1)
         kernel = np.ones((open_px, open_px), np.uint8)
-        return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        return _keep_thick_line_core(mask, params)
     if params.use_clahe:
         clip = max(0.1, params.clahe_clip_x10 / 10.0)
         grid = max(1, params.clahe_grid)
@@ -256,7 +259,22 @@ def warped_black_mask(warped_gray: np.ndarray, params: LaneParams) -> np.ndarray
         _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     open_px = max(1, int(getattr(params, "line_open_px", 5)) | 1)
     kernel = np.ones((open_px, open_px), np.uint8)
-    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    return _keep_thick_line_core(mask, params)
+
+
+def _keep_thick_line_core(mask: np.ndarray, params: LaneParams) -> np.ndarray:
+    """Drop thin puzzle-piece seams while keeping the painted lane core."""
+    core_px = int(getattr(params, "line_core_px", 4))
+    if core_px <= 0:
+        return mask
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 3)
+    core = (dist >= float(core_px)).astype(np.uint8) * 255
+    # Re-grow slightly so the tracker has enough support, but thin seams do not
+    # reappear because they had no surviving core pixels.
+    grow = max(1, (core_px // 2) | 1)
+    kernel = np.ones((grow, grow), np.uint8)
+    return cv2.dilate(core, kernel, iterations=1)
 
 
 def reject_transverse_rows(mask: np.ndarray, params: LaneParams):

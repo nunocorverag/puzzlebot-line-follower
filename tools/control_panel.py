@@ -43,6 +43,7 @@ GROUPS = [
         ("ff_gain",                  "f", 0.1,    "curve/lookahead feed-forward"),
         ("curve_slow_gain",          "f", 0.05,   "slow down on curvature"),
         ("curve_min_scale",          "f", 0.05,   "minimum curve speed scale"),
+        ("curve_memory_s",           "f", 0.05,   "hold curve slowdown after curve"),
     ]),
     ("Intersection", [
         ("intersection_slow_speed",  "f", 0.01,   "speed cap near zebra"),
@@ -103,6 +104,7 @@ GROUPS = [
         ("lane.window_half_w_pct",   "i", 1,      "sliding window half width"),
         ("lane.min_pix",             "i", 10,     "pixels to recenter window"),
         ("lane.line_open_px",        "i", 2,      "remove thin puzzle outlines"),
+        ("lane.line_core_px",        "i", 1,      "keep thick painted line core"),
         ("lane.fit_max_rmse_px",     "i", 2,      "reject scattered lane fits"),
     ]),
     ("AntiZebra", [
@@ -155,7 +157,8 @@ FIELDS = [(name, kind, step) for _, items in GROUPS for name, kind, step, _ in i
 FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kind, step, help_text in items}
 DEFAULTS = {
     "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
-    "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "snapshot_interval": 0.5,
+    "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "curve_memory_s": 0.75,
+    "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
     "approach_speed": 0.06, "commit_turn_w": 0.6, "commit_turn_pre_advance_cm": 4.0,
     "commit_duration": 2.0, "commit_min_s": 0.8,
@@ -197,10 +200,10 @@ DEFAULTS = {
     "lane.src_bot_y_pct": 95, "lane.src_bot_half_w_pct": 42,
     "lane.base_search_half_w_pct": 26, "lane.continuity_search_half_w_pct": 12,
     "lane.window_half_w_pct": 12, "lane.min_pix": 60,
-    "lane.line_open_px": 5, "lane.fit_max_rmse_px": 28,
+    "lane.line_open_px": 5, "lane.line_core_px": 7, "lane.fit_max_rmse_px": 28,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
-    "lane_hold_curve_s": 0.80, "lane_hold_curve_min_curv": 0.55,
+    "lane_hold_curve_s": 1.20, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
     "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
     "lane_curve_guard_max_offset": 0.35,
