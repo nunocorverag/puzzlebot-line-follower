@@ -981,11 +981,18 @@ class AutonomousRacer(Node):
         
         # Check if we have a pending turn from a directional sign
         if self._pending_turn is not None:
+            # Once we're approaching/at the cross, LOCK the decision: the sign has
+            # already left the camera FOV by design, so the timeout must NOT discard
+            # it here -- it will be consumed by the WAIT auto-decision.
+            in_intersection = (self.intersection_phase in ('approach', 'wait')
+                               or self.commit_direction is not None)
             # If the sign is still visible, refresh the timeout
             if res.name in ('turn_left', 'turn_right', 'go_straight'):
                 self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
-            # If timeout expired, discard the pending turn
-            elif self._pending_turn_until is not None and now >= self._pending_turn_until:
+            # If timeout expired AND we are not committed to a cross, discard it
+            elif (not in_intersection
+                  and self._pending_turn_until is not None
+                  and now >= self._pending_turn_until):
                 discarded_turn = self._pending_turn
                 self.get_logger().warn(
                     f"[SIGN] Discarding pending turn '{discarded_turn}' - sign not seen for {self._sign_forget_s}s"
