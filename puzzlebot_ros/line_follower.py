@@ -648,6 +648,11 @@ class AutonomousRacer(Node):
         # turn, so the robot goes further into the curve first instead of cutting it
         # ("advance straight, then turn"). Raise it to turn later / go straighter.
         self.declare_parameter('curve_arc_pre_s', float(saved.get('curve_arc_pre_s', 0.6)))
+        # Post sequence (after the main turn): advance STRAIGHT curve_arc_post_s, then
+        # a short second LEFT turn (curve_arc_recenter_s) to settle back onto center,
+        # then hand back to the PD. The user's "advance a bit, then turn again".
+        self.declare_parameter('curve_arc_post_s', float(saved.get('curve_arc_post_s', 0.4)))
+        self.declare_parameter('curve_arc_recenter_s', float(saved.get('curve_arc_recenter_s', 0.3)))
         self._curve_arc_enabled = bool(self.get_parameter('curve_arc_enabled').value)
         self._curve_arc_v = float(self.get_parameter('curve_arc_v').value)
         self._curve_arc_w = float(self.get_parameter('curve_arc_w').value)
@@ -656,9 +661,13 @@ class AutonomousRacer(Node):
         self._curve_arc_min_s = float(self.get_parameter('curve_arc_min_s').value)
         self._curve_arc_max_s = float(self.get_parameter('curve_arc_max_s').value)
         self._curve_arc_pre_s = float(self.get_parameter('curve_arc_pre_s').value)
+        self._curve_arc_post_s = float(self.get_parameter('curve_arc_post_s').value)
+        self._curve_arc_recenter_s = float(self.get_parameter('curve_arc_recenter_s').value)
         self._curve_arc_active = False
         self._curve_arc_start = None
         self._curve_arc_enter_count = 0
+        self._curve_arc_phase = 'turn'      # 'turn' (pre+left) | 'post' (advance+recenter)
+        self._curve_arc_post_start = None
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -1234,6 +1243,10 @@ class AutonomousRacer(Node):
                 self._curve_arc_max_s = float(p.value)
             elif p.name == 'curve_arc_pre_s':
                 self._curve_arc_pre_s = float(p.value)
+            elif p.name == 'curve_arc_post_s':
+                self._curve_arc_post_s = float(p.value)
+            elif p.name == 'curve_arc_recenter_s':
+                self._curve_arc_recenter_s = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1432,6 +1445,8 @@ class AutonomousRacer(Node):
                 'curve_arc_min_s': self._curve_arc_min_s,
                 'curve_arc_max_s': self._curve_arc_max_s,
                 'curve_arc_pre_s': self._curve_arc_pre_s,
+                'curve_arc_post_s': self._curve_arc_post_s,
+                'curve_arc_recenter_s': self._curve_arc_recenter_s,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3264,22 +3279,42 @@ class AutonomousRacer(Node):
             in_follow = (self.intersection_phase is None and self.commit_direction is None
                          and not self._near_intersection and self.time_line_lost is None)
             if self._curve_arc_active:
-                elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
-                straightened = (arc_detected and curv_mag < self._curve_arc_exit
-                                and off_mag < 0.25)
-                if (elapsed >= self._curve_arc_min_s and straightened) \
-                        or elapsed >= self._curve_arc_max_s or not in_follow:
-                    self._curve_arc_active = False
-                    self.get_logger().warn(
-                        f"[CURVE] arc done ({elapsed:.1f}s, curv={curv_mag:.2f}) -> FOLLOW",
-                        throttle_duration_sec=0.5)
+                if self._curve_arc_phase == 'post':
+                    # advance straight, then a short second left turn, then exit
+                    post_elapsed = (now - self._curve_arc_post_start).nanoseconds * 1e-9
+                    if post_elapsed >= (self._curve_arc_post_s + self._curve_arc_recenter_s) \
+                            or not in_follow:
+                        self._curve_arc_active = False
+                        self.get_logger().warn("[CURVE] arc+recenter done -> FOLLOW",
+                                               throttle_duration_sec=0.5)
+                    else:
+                        curve_arc = True
                 else:
-                    curve_arc = True
+                    elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
+                    straightened = (arc_detected and curv_mag < self._curve_arc_exit
+                                    and off_mag < 0.25)
+                    if elapsed >= self._curve_arc_max_s or not in_follow:
+                        self._curve_arc_active = False       # hard exit (cap / left FOLLOW)
+                        self.get_logger().warn(
+                            f"[CURVE] arc done ({elapsed:.1f}s) -> FOLLOW",
+                            throttle_duration_sec=0.5)
+                    elif elapsed >= self._curve_arc_min_s and straightened:
+                        # main turn finished -> run the advance + re-center sequence
+                        self._curve_arc_phase = 'post'
+                        self._curve_arc_post_start = now
+                        curve_arc = True
+                        self.get_logger().warn(
+                            f"[CURVE] turn done ({elapsed:.1f}s) -> advance+recenter",
+                            throttle_duration_sec=0.5)
+                    else:
+                        curve_arc = True
             elif in_follow and arc_detected and curv_mag >= self._curve_arc_enter:
                 self._curve_arc_enter_count += 1
                 if self._curve_arc_enter_count >= 2:   # 2-frame debounce
                     self._curve_arc_active = True
                     self._curve_arc_start = now
+                    self._curve_arc_phase = 'turn'
+                    self._curve_arc_post_start = None
                     self._curve_arc_enter_count = 0
                     curve_arc = True
                     self.get_logger().warn(
@@ -3289,12 +3324,20 @@ class AutonomousRacer(Node):
                 self._curve_arc_enter_count = 0
 
         if curve_arc:
-            arc_elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
             base_linear_x = self._curve_arc_v
-            if arc_elapsed < self._curve_arc_pre_s:
-                target_angular_z = 0.0             # advance STRAIGHT into the curve first
+            if self._curve_arc_phase == 'post':
+                # advance straight first, then the short second LEFT turn to re-center
+                post_elapsed = (now - self._curve_arc_post_start).nanoseconds * 1e-9
+                if post_elapsed < self._curve_arc_post_s:
+                    target_angular_z = 0.0                 # advance a bit more
+                else:
+                    target_angular_z = self._curve_arc_w   # second turn to re-acquire center
             else:
-                target_angular_z = self._curve_arc_w   # then turn LEFT (every curve here is left)
+                arc_elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
+                if arc_elapsed < self._curve_arc_pre_s:
+                    target_angular_z = 0.0                 # advance STRAIGHT into the curve first
+                else:
+                    target_angular_z = self._curve_arc_w   # main LEFT turn (curves here are left)
             steering_center_x = None               # bypass the PD below
             self.last_error = 0.0
             self.last_derivative = 0.0

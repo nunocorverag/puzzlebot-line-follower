@@ -49,6 +49,8 @@ GROUPS = [
     ("Curve", [
         ("curve_arc_enabled",        "b", 1,      "arc mode for curves (vs PD)"),
         ("curve_arc_pre_s",          "f", 0.1,    "go STRAIGHT this long before turning"),
+        ("curve_arc_post_s",         "f", 0.1,    "advance straight after the turn"),
+        ("curve_arc_recenter_s",     "f", 0.1,    "2nd short turn to re-center"),
         ("curve_arc_w",              "f", 0.02,   "left turn rate in the arc"),
         ("curve_arc_v",              "f", 0.01,   "forward speed in the arc"),
         ("curve_arc_enter",          "f", 0.05,   "|curv| to START the arc"),
@@ -185,6 +187,7 @@ DEFAULTS = {
     "curve_arc_enabled": True, "curve_arc_pre_s": 0.6, "curve_arc_w": 0.30,
     "curve_arc_v": 0.08, "curve_arc_enter": 0.60, "curve_arc_exit": 0.30,
     "curve_arc_min_s": 0.6, "curve_arc_max_s": 4.0,
+    "curve_arc_pre_s": 0.6, "curve_arc_post_s": 0.4, "curve_arc_recenter_s": 0.3,
     "curve_heading_gain": 0.0, "curve_heading_deadband": 0.40,
     "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
