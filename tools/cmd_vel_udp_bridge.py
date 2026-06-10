@@ -22,6 +22,7 @@ import rclpy
 from geometry_msgs.msg import Twist
 from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import Bool
 
 
 class CmdVelUdpBridge(Node):
@@ -39,13 +40,22 @@ class CmdVelUdpBridge(Node):
         self.ang = 0.0
         self.last_rx = 0.0
         self.lock = threading.Lock()
+        # Yield to the line follower when it is driving: when /drive_enable is True
+        # we stop publishing so the follower owns /cmd_vel; when it is False (drive
+        # off) we publish teleop. So the panel's 'd' toggle arbitrates who drives.
+        # Default active (no follower / standalone teleop -> teleop works).
+        self._yield = False
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", self.port))
         threading.Thread(target=self._rx_loop, daemon=True).start()
         self.create_timer(1.0 / 50.0, self._publish)
+        self.create_subscription(Bool, "/drive_enable", self._on_drive_enable, 10)
         self.get_logger().info(
             f"cmd_vel_udp_bridge listening on :{self.port} (watchdog {self.watchdog}s)"
         )
+
+    def _on_drive_enable(self, msg: Bool) -> None:
+        self._yield = bool(msg.data)
 
     def _rx_loop(self) -> None:
         while True:
@@ -62,6 +72,8 @@ class CmdVelUdpBridge(Node):
                 self.lin, self.ang, self.last_rx = v, w, time.monotonic()
 
     def _publish(self) -> None:
+        if self._yield:           # follower is driving -> don't fight it
+            return
         with self.lock:
             stale = (time.monotonic() - self.last_rx) > self.watchdog
             v = 0.0 if stale else self.lin

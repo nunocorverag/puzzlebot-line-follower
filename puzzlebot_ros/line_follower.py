@@ -440,6 +440,13 @@ class AutonomousRacer(Node):
         self.declare_parameter('start_driving', False)
         self._drive_enabled = bool(self.get_parameter('start_driving').value)
         self.create_subscription(Bool, '/drive_enable', self._drive_enable_cb, 10)
+        # When driving is disabled, RELEASE /cmd_vel (send a short STOP burst, then
+        # stay silent) so an external teleop (cmd_vel_udp_bridge) can drive without
+        # fighting the follower's 30 Hz zeros. The 'd' toggle thus arbitrates who
+        # drives. The stop burst guarantees the robot halts even with no teleop.
+        self.declare_parameter('release_cmd_when_off', True)
+        self._release_cmd_when_off = bool(self.get_parameter('release_cmd_when_off').value)
+        self._drive_off_stop_ticks = 0
 
         # Odometry: a monotonically-growing travelled-distance estimate (metres),
         # used to advance/cross exact distances at intersections independent of the
@@ -996,7 +1003,11 @@ class AutonomousRacer(Node):
         return np.clip(corrected, 0, 255).astype(np.uint8)
 
     def _drive_enable_cb(self, msg):
+        was = self._drive_enabled
         self._drive_enabled = bool(msg.data)
+        if was and not self._drive_enabled:
+            # transition ON->OFF: queue a STOP burst before releasing /cmd_vel
+            self._drive_off_stop_ticks = 15
         self.get_logger().info(f"[DRIVE] enabled={self._drive_enabled}")
 
     def _robot_vel_cb(self, msg):
@@ -3636,13 +3647,25 @@ class AutonomousRacer(Node):
 
         # Master motion switch: if driving is disabled, hold still regardless of
         # what the controller computed (perception keeps running below).
+        publish_cmd = True
         if not self._drive_enabled:
             cmd = Twist()
-            self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
+            if self._release_cmd_when_off:
+                # Send a short STOP burst on the way down, then RELEASE /cmd_vel
+                # (stay silent) so an external teleop can drive. 'd' arbitrates.
+                if self._drive_off_stop_ticks > 0:
+                    self._drive_off_stop_ticks -= 1
+                else:
+                    publish_cmd = False
+                self.get_logger().info("[DRIVE] disabled -> /cmd_vel released (teleop can drive)",
+                                       throttle_duration_sec=2.0)
+            else:
+                self.get_logger().info("[DRIVE] disabled -> holding still", throttle_duration_sec=2.0)
 
         self._loop_stage = 'publish_cmd'
         self._commit_debug_tick(now, 'before_publish_cmd', cmd=cmd, force=True)
-        self.cmd_pub.publish(cmd)
+        if publish_cmd:
+            self.cmd_pub.publish(cmd)
         self._commit_debug_tick(now, 'after_publish_cmd', cmd=cmd, force=True)
 
         # Odometry: integrate the commanded speed into travelled distance.

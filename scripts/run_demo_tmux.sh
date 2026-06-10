@@ -25,6 +25,7 @@ TRAFFIC_LIGHT_OPTIONAL="${TRAFFIC_LIGHT_OPTIONAL:-1}"
 USE_SIGNS="${USE_SIGNS:-0}"                         # 1 = enable YOLO signs
 NO_BUILD="${NO_BUILD:-0}"
 DASH="${DASH:-1}"
+TELEOP="${TELEOP:-1}"                               # 1 = add a WASD teleop window
 MOTOR_BOOT_WAIT_S="${MOTOR_BOOT_WAIT_S:-4}"
 
 need_cmd() {
@@ -63,6 +64,12 @@ if [ "${DASH}" = "1" ]; then
   P_DASH=$(tmux display-message -p -t "${SESSION}:MONITOR" '#{pane_id}')
 fi
 
+# --- Window: TELEOP (WASD; coexists with follower via the 'd' toggle) ------
+if [ "${TELEOP}" = "1" ]; then
+  tmux new-window -t "${SESSION}" -n TELEOP
+  P_TELEOP=$(tmux display-message -p -t "${SESSION}:TELEOP" '#{pane_id}')
+fi
+
 # --- Window 3: CONTROL (panel, full screen) -------------------------------
 tmux new-window -t "${SESSION}" -n CONTROL
 P_PANEL=$(tmux display-message -p -t "${SESSION}:CONTROL" '#{pane_id}')
@@ -79,6 +86,14 @@ tmux send-keys -t "${P_FOLLOWER}" "while [ ! -f '${READY_FILE}' ]; do echo '[fol
 # 4. Dashboard (UDP telemetry; skipped when DASH=0).
 if [ "${DASH}" = "1" ]; then
   tmux send-keys -t "${P_DASH}" "echo '[dashboard] waiting for telemetry'; scripts/run_dashboard.sh; exec bash" C-m
+fi
+
+# 4b. Teleop (optional): WASD bridge + GUI. Coexists with the follower thanks to
+# the /drive_enable arbitration: press 'd' in the panel to hand control between
+# them (drive ON = follower drives, drive OFF = teleop drives). FOCUS the pygame
+# window to steer.
+if [ "${TELEOP}" = "1" ]; then
+  tmux send-keys -t "${P_TELEOP}" "while [ ! -f '${READY_FILE}' ]; do echo '[teleop] waiting for build...'; sleep 1; done; echo '[teleop] WASD ready -- press d in the panel to hand control; focus this pygame window to drive'; SYNC=0 scripts/run_teleop_wasd_combo.sh; echo '[teleop] exited'; exec bash" C-m
 fi
 
 # 5. Control panel: wait for the param service, run, and on EXIT tear the whole
