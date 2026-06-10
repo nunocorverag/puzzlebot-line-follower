@@ -89,6 +89,78 @@ def _verify_arrow_direction(frame, box):
     h, w = roi.shape[:2]
     if w < 20 or h < 20:  # Too small to analyze
         return None, {'all_votes': [], 'vote_counts': {}, 'winner': None, 'reason': 'small_roi'}
+
+    # First try the detector that matches the actual signs on this track: blue
+    # circular signs with a white arrow. The older grayscale verifier below is a
+    # fallback, but it can accidentally vote on the blue disk/rim instead of the
+    # arrow. Here we explicitly segment only the white arrow and compare where the
+    # upper arrow head sits relative to the lower shaft:
+    #   upper white mass right of lower shaft -> turn_right
+    #   upper white mass left  of lower shaft -> turn_left
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    white = cv2.inRange(hsv, np.array([0, 0, 130]), np.array([180, 95, 255]))
+    kernel = np.ones((3, 3), np.uint8)
+    white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel)
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel)
+
+    clean = np.zeros_like(white)
+    ncomp, labels, stats, _ = cv2.connectedComponentsWithStats(white, 8)
+    margin = max(2, int(min(w, h) * 0.04))
+    min_area = max(12, int(w * h * 0.006))
+    for i in range(1, ncomp):
+        x, y, cw, ch, area = stats[i]
+        if area < min_area:
+            continue
+        touches_border = (
+            x <= margin or y <= margin
+            or x + cw >= w - margin or y + ch >= h - margin
+        )
+        # Drop the white circular rim if it is present. Keep compact arrow pieces
+        # even if the YOLO crop is tight and they nearly touch an edge.
+        if touches_border and (cw > 0.65 * w or ch > 0.65 * h):
+            continue
+        clean[labels == i] = 255
+
+    ys, xs = np.where(clean > 0)
+    white_details = {
+        'method': 'white_arrow',
+        'white_px': int(len(xs)),
+        'min_area': int(min_area),
+    }
+    if len(xs) >= max(25, int(w * h * 0.018)):
+        top = xs[ys < h * 0.55]
+        bottom = xs[ys > h * 0.45]
+        white_details['top_px'] = int(len(top))
+        white_details['bottom_px'] = int(len(bottom))
+        if len(top) >= min_area and len(bottom) >= min_area:
+            top_center = float(np.median(top))
+            bottom_center = float(np.median(bottom))
+            dx_norm = (top_center - bottom_center) / float(max(1, w))
+            white_details.update({
+                'top_center': round(top_center, 2),
+                'bottom_center': round(bottom_center, 2),
+                'dx_norm': round(dx_norm, 3),
+            })
+            if abs(dx_norm) >= 0.08:
+                winner = 'turn_right' if dx_norm > 0 else 'turn_left'
+                return winner, {
+                    'all_votes': [winner, winner, winner, winner],
+                    'vote_counts': {winner: 4},
+                    'winner': winner,
+                    'reason': 'white_arrow_geometry',
+                    'white_arrow': white_details,
+                }
+        # We found the white arrow but its geometry is not decisive. Do not fall
+        # through to the noisy grayscale vote, because that is what flips
+        # right/left on the blue circular signs.
+        white_details.setdefault('reason', 'weak_white_arrow_geometry')
+        return None, {
+            'all_votes': [],
+            'vote_counts': {},
+            'winner': None,
+            'reason': white_details['reason'],
+            'white_arrow': white_details,
+        }
     
     # Convert to grayscale
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -467,8 +539,11 @@ def draw_sign_overlay(frame, result: SignResult):
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
             
             # Label: show corrected name only
-            rank_marker = "★" if is_selected else f"#{i+1}"
-            label = f"{rank_marker} {sign['name']} c:{sign['conf']:.2f} a:{sign['area_pct']:.1f}%"
+            rank_marker = "*" if is_selected else f"#{i+1}"
+            label_name = sign['name']
+            if sign.get('original_name') and sign['original_name'] != sign['name']:
+                label_name = f"{sign['name']}<-{sign['original_name']}"
+            label = f"{rank_marker} {label_name} c:{sign['conf']:.2f} a:{sign['area_pct']:.1f}%"
             
             # Background for text
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
