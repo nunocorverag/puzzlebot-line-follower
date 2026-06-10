@@ -659,12 +659,14 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
         self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 1.20)))
         self.declare_parameter('lane_curve_dropout_s', float(saved.get('lane_curve_dropout_s', 2.0)))
+        self.declare_parameter('lane_curve_refresh_conf', float(saved.get('lane_curve_refresh_conf', 0.35)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
         self._lane_hold_s = float(self.get_parameter('lane_hold_s').value)
         self._lane_hold_curve_s = float(self.get_parameter('lane_hold_curve_s').value)
         self._lane_curve_dropout_s = float(self.get_parameter('lane_curve_dropout_s').value)
+        self._lane_curve_refresh_conf = float(self.get_parameter('lane_curve_refresh_conf').value)
         self._lane_hold_curve_min_curv = float(self.get_parameter('lane_hold_curve_min_curv').value)
         self._lane_hold_center_x = None  # last confident steering center (orig px)
         self._lane_hold_far_x = None
@@ -1238,6 +1240,8 @@ class AutonomousRacer(Node):
                 self._lane_hold_curve_s = float(p.value)
             elif p.name == 'lane_curve_dropout_s':
                 self._lane_curve_dropout_s = float(p.value)
+            elif p.name == 'lane_curve_refresh_conf':
+                self._lane_curve_refresh_conf = float(p.value)
             elif p.name == 'lane_hold_curve_min_curv':
                 self._lane_hold_curve_min_curv = float(p.value)
             elif p.name == 'lane_base_hold_s':
@@ -1420,6 +1424,7 @@ class AutonomousRacer(Node):
                 'lane_hold_s': self._lane_hold_s,
                 'lane_hold_curve_s': self._lane_hold_curve_s,
                 'lane_curve_dropout_s': self._lane_curve_dropout_s,
+                'lane_curve_refresh_conf': self._lane_curve_refresh_conf,
                 'lane_hold_curve_min_curv': self._lane_hold_curve_min_curv,
                 'lane_base_hold_s': self._lane_base_hold_s,
                 'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
@@ -3044,6 +3049,34 @@ class AutonomousRacer(Node):
             else:
                 self._lane_prev_base = None
             draw_lane_overlay(frame, self.lane_params, lane_result)
+            if (not accept
+                    and lane_result.detected
+                    and lane_result.lane_center_x_orig is not None
+                    and lane_result.lane_center_far_x_orig is not None):
+                signed_curvature = float(lane_result.curvature_norm)
+                curve_age = (
+                    1e9 if self._lane_hold_time is None
+                    else (now - self._lane_hold_time).nanoseconds * 1e-9
+                )
+                same_curve = (
+                    self._lane_hold_signed_curvature == 0.0
+                    or self._lane_hold_signed_curvature * signed_curvature >= 0.0
+                )
+                if (lane_result.confidence >= self._lane_curve_refresh_conf
+                        and abs(signed_curvature) >= self._lane_hold_curve_min_curv
+                        and (same_curve or curve_age > self._lane_hold_curve_s)):
+                    # A tight curve often becomes fragmented before it disappears.
+                    # Keep the curve memory alive from these coherent weak fits so
+                    # the fallback/recover code cannot flip to the opposite side.
+                    self._lane_hold_center_x = lane_result.lane_center_x_orig
+                    self._lane_hold_far_x = lane_result.lane_center_far_x_orig
+                    self._lane_hold_curvature = abs(signed_curvature)
+                    self._lane_hold_signed_curvature = signed_curvature
+                    self._lane_hold_time = now
+                    self.get_logger().warn(
+                        f"[LANE] refresh weak curve hold "
+                        f"(conf={lane_result.confidence:.2f}, curv={signed_curvature:+.2f})",
+                        throttle_duration_sec=0.5)
             if accept and lane_result.lane_center_x_orig is not None:
                 lane_ok = True
                 steering_center_x = lane_result.lane_center_x_orig
@@ -3138,57 +3171,78 @@ class AutonomousRacer(Node):
         # Fallback path: legacy two-ROI detector. Also used during approach and
         # whenever the bird's-eye view is not confident (e.g. warp not yet tuned).
         if not lane_ok:
-            bottom_y_start, bottom_y_end = int(h * 0.60), h
-            bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
             approach_entry_center_x = None
-            if (self.intersection_phase == "approach"
-                    and self.intersection_result is not None
-                    and self.intersection_result.entry_center_x is not None):
-                approach_entry_center_x = float(self.intersection_result.entry_center_x)
-                roi_width = bottom_x_end - bottom_x_start
-                roi_left = approach_entry_center_x - roi_width / 2.0
-                bottom_x_start = int(max(0, min(w - roi_width, roi_left)))
-                bottom_x_end = bottom_x_start + roi_width
-                cv2.line(frame, (int(approach_entry_center_x), bottom_y_start),
-                         (int(approach_entry_center_x), bottom_y_end), (0, 255, 255), 2)
-
-            top_y_start, top_y_end = int(h * 0.25), int(h * 0.50)
-            top_x_start, top_x_end = int(w * 0.10), int(w * 0.90)
-
-            if approach_entry_center_x is not None:
-                bottom_reference_x = approach_entry_center_x
+            curve_loss_age = (
+                1e9 if self._lane_hold_time is None
+                else (now - self._lane_hold_time).nanoseconds * 1e-9
+            )
+            skip_legacy_for_curve_loss = (
+                self._use_birdseye
+                and self.intersection_phase is None
+                and self.commit_direction is None
+                and not self._near_intersection
+                and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                and curve_loss_age <= self._lane_curve_dropout_s + self._recover_seconds
+            )
+            if skip_legacy_for_curve_loss:
+                bottom_candidate = None
+                top_candidate = None
+                self.get_logger().warn(
+                    f"[LANE] curve loss guard skips legacy fallback "
+                    f"(age={curve_loss_age:.2f}s, curv={self._lane_hold_signed_curvature:+.2f})",
+                    throttle_duration_sec=0.5,
+                )
             else:
-                bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
+                bottom_y_start, bottom_y_end = int(h * 0.60), h
+                bottom_x_start, bottom_x_end = int(w * 0.25), int(w * 0.75)
+                if (self.intersection_phase == "approach"
+                        and self.intersection_result is not None
+                        and self.intersection_result.entry_center_x is not None):
+                    approach_entry_center_x = float(self.intersection_result.entry_center_x)
+                    roi_width = bottom_x_end - bottom_x_start
+                    roi_left = approach_entry_center_x - roi_width / 2.0
+                    bottom_x_start = int(max(0, min(w - roi_width, roi_left)))
+                    bottom_x_end = bottom_x_start + roi_width
+                    cv2.line(frame, (int(approach_entry_center_x), bottom_y_start),
+                             (int(approach_entry_center_x), bottom_y_end), (0, 255, 255), 2)
 
-            bottom_candidate, bottom_mask = self.detect_line_in_roi(
-                frame,
-                bottom_x_start, bottom_x_end, bottom_y_start, bottom_y_end,
-                self.last_bottom_center, reference_x=bottom_reference_x,
-                draw_color=(0, 255, 0), force_middle_of_three=False
-            )
+                top_y_start, top_y_end = int(h * 0.25), int(h * 0.50)
+                top_x_start, top_x_end = int(w * 0.10), int(w * 0.90)
 
-            if bottom_candidate:
-                top_reference_x = bottom_candidate[0]
-            else:
-                top_reference_x = self.last_top_center[0] if self.last_top_center else frame_center_x
+                if approach_entry_center_x is not None:
+                    bottom_reference_x = approach_entry_center_x
+                else:
+                    bottom_reference_x = self.last_bottom_center[0] if self.last_bottom_center else frame_center_x
 
-            top_candidate, top_mask = self.detect_line_in_roi(
-                frame,
-                top_x_start, top_x_end, top_y_start, top_y_end,
-                self.last_top_center, reference_x=top_reference_x,
-                draw_color=(0, 0, 255),
-                force_middle_of_three=True
-            )
+                bottom_candidate, bottom_mask = self.detect_line_in_roi(
+                    frame,
+                    bottom_x_start, bottom_x_end, bottom_y_start, bottom_y_end,
+                    self.last_bottom_center, reference_x=bottom_reference_x,
+                    draw_color=(0, 255, 0), force_middle_of_three=False
+                )
 
-            if bottom_candidate is not None: self.last_bottom_center = bottom_candidate
-            if top_candidate    is not None: self.last_top_center    = top_candidate
+                if bottom_candidate:
+                    top_reference_x = bottom_candidate[0]
+                else:
+                    top_reference_x = self.last_top_center[0] if self.last_top_center else frame_center_x
 
-            bot_str = f"({bottom_candidate[0]}, {bottom_candidate[1]})" if bottom_candidate else "NONE"
-            top_str = f"({top_candidate[0]},    {top_candidate[1]})"    if top_candidate    else "NONE"
-            self.get_logger().info(
-                f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}",
-                throttle_duration_sec=1.0,
-            )
+                top_candidate, top_mask = self.detect_line_in_roi(
+                    frame,
+                    top_x_start, top_x_end, top_y_start, top_y_end,
+                    self.last_top_center, reference_x=top_reference_x,
+                    draw_color=(0, 0, 255),
+                    force_middle_of_three=True
+                )
+
+                if bottom_candidate is not None: self.last_bottom_center = bottom_candidate
+                if top_candidate    is not None: self.last_top_center    = top_candidate
+
+                bot_str = f"({bottom_candidate[0]}, {bottom_candidate[1]})" if bottom_candidate else "NONE"
+                top_str = f"({top_candidate[0]},    {top_candidate[1]})"    if top_candidate    else "NONE"
+                self.get_logger().info(
+                    f"[TRACKING] Bottom Line: {bot_str} | Top Line: {top_str}",
+                    throttle_duration_sec=1.0,
+                )
 
             if bottom_candidate is not None:
                 self.time_line_lost = None
@@ -3213,15 +3267,28 @@ class AutonomousRacer(Node):
                     self.time_line_lost = now
                 elapsed_time = (now - self.time_line_lost).nanoseconds * 1e-9
 
-                # Turn toward the side the line was last seen instead of driving
-                # straight off the track. The PD error sign encodes that side:
-                # error>0 => line was left of center => turn left (+w); <0 => right.
-                recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
+                # Turn toward the last reliable curve first. Using only last_error
+                # is unsafe here: weak fallback fits can flip its sign exactly when
+                # the robot loses a tight curve, sending recovery to the wrong side.
+                curve_age = (
+                    1e9 if self._lane_hold_time is None
+                    else (now - self._lane_hold_time).nanoseconds * 1e-9
+                )
+                recover_dir = 0.0
+                recover_reason = "error"
+                if (self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                        and curve_age <= self._lane_curve_dropout_s + self._recover_seconds
+                        and abs(self._lane_hold_signed_curvature) > 1e-3):
+                    recover_dir = 1.0 if self._lane_hold_signed_curvature > 0.0 else -1.0
+                    recover_reason = "curve"
+                else:
+                    recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
                 if elapsed_time < self._recover_seconds:
                     base_linear_x    = self._recover_speed
                     target_angular_z = self._recover_turn * recover_dir
                     self.get_logger().warn(
-                        f"[CONTROL] LINE LOST {elapsed_time:.1f}s -> searching dir={recover_dir:+.0f}",
+                        f"[CONTROL] LINE LOST {elapsed_time:.1f}s -> searching "
+                        f"dir={recover_dir:+.0f} by {recover_reason}",
                         throttle_duration_sec=0.5,
                     )
                 else:
