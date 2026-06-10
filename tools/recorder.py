@@ -17,6 +17,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import threading
 import time
@@ -26,6 +27,7 @@ import cv2
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import Twist
 
 REPO_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_DIR))
@@ -83,6 +85,15 @@ class RecorderNode(Node):
         self.frame_count = 0
         self.last_save_time = 0.0
         self.start_time = time.time()
+
+        # Teleop demonstration capture: log the LATEST /cmd_vel (v, w) the human is
+        # sending, paired with each saved frame, so the desired turn profile can be
+        # replayed against the perception offline. CSV is written next to the frames.
+        self.last_v = 0.0
+        self.last_w = 0.0
+        self._csv_file = None
+        self._csv_writer = None
+        self.create_subscription(Twist, args.cmd_vel_topic, self._on_cmd_vel, 10)
         # Start paused (press Enter to begin) unless --start-recording was given,
         # which is what the WASD+record flow uses since it runs detached (no tty).
         self.recording = bool(getattr(args, "start_recording", False))
@@ -108,6 +119,21 @@ class RecorderNode(Node):
         else:
             print("[info] Press Enter to START/PAUSE recording. Ctrl+C to quit.", flush=True)
             print("[PAUSED] Ready - press Enter when you want to record.", flush=True)
+
+    def _on_cmd_vel(self, msg: Twist):
+        self.last_v = float(msg.linear.x)
+        self.last_w = float(msg.angular.z)
+
+    def _log_teleop(self, frame_path: Path):
+        if self._csv_writer is None:
+            self.args.output_dir.mkdir(parents=True, exist_ok=True)
+            self._csv_file = open(self.args.output_dir / "teleop_cmd.csv", "w", newline="")
+            self._csv_writer = csv.writer(self._csv_file)
+            self._csv_writer.writerow(["t", "frame", "v", "w"])
+        self._csv_writer.writerow([
+            f"{time.time() - self.start_time:.3f}", frame_path.name,
+            f"{self.last_v:.4f}", f"{self.last_w:.4f}"])
+        self._csv_file.flush()
 
     def toggle_recording(self):
         self.recording = not self.recording
@@ -147,14 +173,18 @@ class RecorderNode(Node):
         now = time.time()
         if (now - self.last_save_time) >= self.args.interval:
             path = save_frame(frame, self.args.output_dir)
+            self._log_teleop(path)
             self.save_count += 1
             self.last_save_time = now
-            print(f"[save] {path}  (total: {self.save_count})", flush=True)
+            print(f"[save] {path}  v={self.last_v:+.3f} w={self.last_w:+.3f}"
+                  f"  (total: {self.save_count})", flush=True)
 
     def destroy_node(self):
         self.preview.close()
         if self.cap is not None:
             self.cap.release()
+        if self._csv_file is not None:
+            self._csv_file.close()
         super().destroy_node()
 
 
@@ -170,6 +200,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-illumination-correction", action="store_true")
     parser.add_argument("--output-dir",           type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--interval",             type=float, default=0.5)
+    parser.add_argument("--cmd-vel-topic",        type=str, default="/cmd_vel",
+                        help="teleop Twist topic to log alongside each frame")
     parser.add_argument("--start-recording",      action="store_true",
                         help="begin recording immediately (no Enter; for detached runs)")
     parser.add_argument("--duration",             type=float, default=0.0,

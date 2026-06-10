@@ -37,8 +37,6 @@ import json
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 
-import math
-
 import cv2
 import numpy as np
 
@@ -109,7 +107,9 @@ class LaneParams:
     # border (the "goes to the right line on curves" bug). With dual_line we find
     # BOTH lines and steer on their midpoint; if only one is visible (tight curve)
     # we offset it by half the lane width to recover the center.
-    dual_line: int = 0             # 1 = follow midpoint of the two border lines.
+    dual_line: int = 0             # 1 = follow midpoint of the two lines (this
+                                   # track follows a single central line, so the
+                                   # default is single-line + continuity below)
     min_line_gap_pct: int = 14     # min separation between the two line bases
     lane_half_px: int = 90         # half lane width in warp px (auto-updates when
                                    # both lines are seen; used for 1-line fallback)
@@ -145,8 +145,7 @@ class LaneResult:
     offset_norm: float = 0.0        # offset / (warp_w / 2), in [-1, 1]
     offset_cm: float | None = None  # offset in cm if px_per_cm is set
     curvature: float = 0.0          # 2*a from x = a y^2 + b y + c (1/px)
-    curvature_norm: float = 0.0     # bend-stabilised, see analyze_lane
-    bend_norm: float = 0.0          # (far_x - base_x) / (warp_w/2), geometric
+    curvature_norm: float = 0.0     # curvature scaled to a 0..1-ish magnitude
     heading: float = 0.0            # dx/dy at the eval row (line tilt)
     confidence: float = 0.0         # fraction of windows that found the line
     fit: tuple | None = None        # (a, b, c) of x = a y^2 + b y + c, or None
@@ -506,6 +505,9 @@ def analyze_lane(frame: np.ndarray, params: LaneParams,
     result.offset_px = float(eval_x - center)
     result.offset_norm = float(np.clip((eval_x - center) / center, -2.0, 2.0))
     result.curvature = float(2.0 * fit[0])
+    # Normalize curvature to a ~[-1,1] magnitude over the warp height so it can
+    # scale speed without caring about absolute px units.
+    result.curvature_norm = float(np.clip(2.0 * fit[0] * wh, -1.0, 1.0))
     result.heading = float(2.0 * fit[0] * eval_y + fit[1])  # dx/dy at eval row
     if params.px_per_cm_x10 > 0:
         result.offset_cm = result.offset_px / (params.px_per_cm_x10 / 10.0)
@@ -514,19 +516,11 @@ def analyze_lane(frame: np.ndarray, params: LaneParams,
     # pixels) and the overlay can use it directly.
     result.lane_center_x_orig = _birdseye_to_orig((eval_x, eval_y), minv)[0]
 
-    # Lookahead: evaluate unclipped first for the bend sign, then clip for the
-    # overlay pointer so wild extrapolations don't throw the controller.
+    # Second read further ahead (anticipation). The fit may extrapolate past the
+    # windows that found pixels, which is exactly what predicts the upcoming bend;
+    # clamp x into the warp so a wild extrapolation can't throw the controller.
     look_y = wh * params.lookahead_y_pct / 100.0
-    far_x_raw = float(_eval_fit(fit, look_y))  # unclipped — needed for bend sign
-    # Geometric bend: lateral drift from base to lookahead.
-    # Sign is stable (pure geometry) unlike 2*a which flips on near-vertical fits.
-    base_ref = float(result.base_x) if result.base_x is not None else eval_x
-    bend_px = far_x_raw - base_ref
-    result.bend_norm = float(np.clip(bend_px / (ww / 2.0), -1.0, 1.0))
-    mag = abs(2.0 * fit[0] * wh)
-    signed = bend_px if abs(bend_px) > 2.0 else float(2.0 * fit[0])
-    result.curvature_norm = float(np.clip(math.copysign(min(mag, 1.0), signed), -1.0, 1.0))
-    far_x = float(np.clip(far_x_raw, 0.0, ww))
+    far_x = float(np.clip(_eval_fit(fit, look_y), 0.0, ww))
     result.lane_center_far_x_orig = _birdseye_to_orig((far_x, look_y), minv)[0]
 
     # A few points of the fitted curve, mapped back for the overlay.
