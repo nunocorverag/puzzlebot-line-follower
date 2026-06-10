@@ -42,7 +42,6 @@ GROUPS = [
         ("kd",                       "f", 0.001,  "PD derivative gain"),
         ("ff_gain",                  "f", 0.1,    "curve/lookahead feed-forward"),
         ("curve_ff_scale",           "f", 0.05,   "scale early curve lookahead"),
-        ("curve_ff_min_conf",        "f", 0.05,   "min conf for curve lookahead"),
         ("curve_slow_gain",          "f", 0.05,   "slow down on curvature"),
         ("curve_min_scale",          "f", 0.05,   "minimum curve speed scale"),
         ("curve_memory_s",           "f", 0.05,   "hold curve slowdown after curve"),
@@ -168,8 +167,7 @@ GROUPS = [
 FIELDS = [(name, kind, step) for _, items in GROUPS for name, kind, step, _ in items]
 FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kind, step, help_text in items}
 DEFAULTS = {
-    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "curve_ff_scale": 0.65,
-    "curve_ff_min_conf": 0.65, "max_v": 0.10, "max_w": 0.6,
+    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "curve_ff_scale": 0.65, "max_v": 0.10, "max_w": 0.6,
     "curve_slow_gain": 0.6, "curve_min_scale": 0.40, "curve_memory_s": 1.60,
     "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
