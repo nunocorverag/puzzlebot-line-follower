@@ -617,13 +617,15 @@ class AutonomousRacer(Node):
         # always follows *something*. Tune the warp live in the calibrator.
         self.declare_parameter('use_birdseye', True)
         self.declare_parameter('lane_params_path', '')
-        self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
-        self.declare_parameter('curve_min_scale', 0.4)   # never below this fraction
-        self.declare_parameter('curve_memory_s', 1.20)   # keep slowing briefly after a tight curve
+        self.declare_parameter('curve_slow_gain', float(saved.get('curve_slow_gain', 0.6)))   # speed *= 1 - gain*|curv|
+        self.declare_parameter('curve_min_scale', float(saved.get('curve_min_scale', 0.4)))   # never below this fraction
+        self.declare_parameter('curve_memory_s', float(saved.get('curve_memory_s', 1.20)))   # keep slowing briefly after a tight curve
+        self.declare_parameter('curve_min_v', float(saved.get('curve_min_v', 0.045)))        # avoid motor deadband in tight curves
         self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
         self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
         self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
         self._curve_memory_s = float(self.get_parameter('curve_memory_s').value)
+        self._curve_min_v = float(self.get_parameter('curve_min_v').value)
         self._curve_hold_until = None
         self._curve_hold_value = 0.0
         self.lane_params = self._load_lane_params()
@@ -656,11 +658,13 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
         self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 1.20)))
+        self.declare_parameter('lane_curve_dropout_s', float(saved.get('lane_curve_dropout_s', 2.0)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
         self._lane_hold_s = float(self.get_parameter('lane_hold_s').value)
         self._lane_hold_curve_s = float(self.get_parameter('lane_hold_curve_s').value)
+        self._lane_curve_dropout_s = float(self.get_parameter('lane_curve_dropout_s').value)
         self._lane_hold_curve_min_curv = float(self.get_parameter('lane_hold_curve_min_curv').value)
         self._lane_hold_center_x = None  # last confident steering center (orig px)
         self._lane_hold_far_x = None
@@ -1222,6 +1226,8 @@ class AutonomousRacer(Node):
                 self._curve_min_scale = float(p.value)
             elif p.name == 'curve_memory_s':
                 self._curve_memory_s = float(p.value)
+            elif p.name == 'curve_min_v':
+                self._curve_min_v = float(p.value)
             elif p.name == 'lane_hold_near_cross':
                 self._lane_hold_near_cross = bool(p.value)
             elif p.name == 'lane_hold_conf':
@@ -1230,6 +1236,8 @@ class AutonomousRacer(Node):
                 self._lane_hold_s = float(p.value)
             elif p.name == 'lane_hold_curve_s':
                 self._lane_hold_curve_s = float(p.value)
+            elif p.name == 'lane_curve_dropout_s':
+                self._lane_curve_dropout_s = float(p.value)
             elif p.name == 'lane_hold_curve_min_curv':
                 self._lane_hold_curve_min_curv = float(p.value)
             elif p.name == 'lane_base_hold_s':
@@ -1406,10 +1414,12 @@ class AutonomousRacer(Node):
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
                 'curve_memory_s': self._curve_memory_s,
+                'curve_min_v': self._curve_min_v,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
                 'lane_hold_curve_s': self._lane_hold_curve_s,
+                'lane_curve_dropout_s': self._lane_curve_dropout_s,
                 'lane_hold_curve_min_curv': self._lane_hold_curve_min_curv,
                 'lane_base_hold_s': self._lane_base_hold_s,
                 'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
@@ -3113,7 +3123,7 @@ class AutonomousRacer(Node):
         elif (not lane_ok and self._use_birdseye and self._lane_hold_center_x is not None
               and self._lane_hold_time is not None
               and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
-              and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_curve_s):
+              and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_curve_dropout_s):
             lane_ok = True
             steering_center_x = self._lane_hold_center_x
             steering_far_x = self._lane_hold_far_x
@@ -3121,7 +3131,7 @@ class AutonomousRacer(Node):
             self.time_line_lost = None
             self.get_logger().warn(
                 f"[LANE] hold BEV curve target (cx={steering_center_x:.0f}, "
-                f"curv={lane_curvature:.2f})",
+                f"curv={lane_curvature:.2f}, dropout={self._lane_curve_dropout_s:.2f}s)",
                 throttle_duration_sec=0.5,
             )
 
@@ -3286,6 +3296,8 @@ class AutonomousRacer(Node):
         if effective_curvature > 0.0:
             base_linear_x *= max(self._curve_min_scale,
                                  1.0 - self._curve_slow_gain * effective_curvature)
+            if effective_curvature >= self._lane_hold_curve_min_curv and self._curve_min_v > 0.0:
+                base_linear_x = max(base_linear_x, min(self._curve_min_v, self.max_v))
 
         # Slow-zone: cap speed while a zebra is in view (FOLLOW only), so the robot
         # closes on the cross slowly enough to center instead of overshooting.

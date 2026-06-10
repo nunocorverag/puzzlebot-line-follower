@@ -44,6 +44,7 @@ GROUPS = [
         ("curve_slow_gain",          "f", 0.05,   "slow down on curvature"),
         ("curve_min_scale",          "f", 0.05,   "minimum curve speed scale"),
         ("curve_memory_s",           "f", 0.05,   "hold curve slowdown after curve"),
+        ("curve_min_v",              "f", 0.005,  "minimum speed in tight curves"),
     ]),
     ("Intersection", [
         ("intersection_slow_speed",  "f", 0.01,   "speed cap near zebra"),
@@ -117,6 +118,7 @@ GROUPS = [
         ("lane_hold_conf",           "f", 0.05,   "conf to refresh held heading"),
         ("lane_hold_s",              "f", 0.1,    "max s to hold heading at cross"),
         ("lane_hold_curve_s",        "f", 0.05,   "hold BEV target in curves"),
+        ("lane_curve_dropout_s",     "f", 0.05,   "bridge BEV loss in curves"),
         ("lane_hold_curve_min_curv", "f", 0.05,   "min curve for BEV hold"),
         ("lane_base_max_jump_pct",   "i", 1,      "max base jump %% (branch guard)"),
         ("lane_base_hold_s",         "f", 0.1,    "sticky base hold s at cross"),
@@ -164,6 +166,7 @@ FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kin
 DEFAULTS = {
     "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
     "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "curve_memory_s": 1.20,
+    "curve_min_v": 0.045,
     "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
     "approach_speed": 0.06, "commit_turn_w": 0.6, "commit_turn_pre_advance_cm": 4.0,
@@ -212,7 +215,8 @@ DEFAULTS = {
     "lane.line_open_px": 5, "lane.line_core_px": 7, "lane.fit_max_rmse_px": 28,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
-    "lane_hold_curve_s": 1.20, "lane_hold_curve_min_curv": 0.55,
+    "lane_hold_curve_s": 1.20, "lane_curve_dropout_s": 2.0,
+    "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
     "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
     "lane_curve_guard_max_offset": 0.35, "lane_curve_hold_assist_conf": 0.80,
