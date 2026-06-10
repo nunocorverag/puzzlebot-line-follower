@@ -12,7 +12,7 @@
   "curve_min_v": 0.045,
   "blind_turn_enabled": true,
   "blind_turn_w": 0.45,
-  "blind_turn_v": 0.08,
+  "blind_turn_v": 0.04,
   "blind_conf": 0.5,
   "blind_reacquire_off": 0.25,
   "blind_reacquire_frames": 4,
