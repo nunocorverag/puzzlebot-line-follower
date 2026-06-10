@@ -687,17 +687,24 @@ class AutonomousRacer(Node):
         self.declare_parameter('blind_turn_w', float(saved.get('blind_turn_w', 0.35)))      # blind turn rate (rad/s)
         self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.05)))      # slow forward while blind
         self.declare_parameter('blind_conf', float(saved.get('blind_conf', 0.5)))           # BEV conf = "line visible"
-        self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.45)))  # |off| to call it back
+        self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
+        self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.40)))   # |off| at the edge -> also enter
+        self.declare_parameter('blind_min_s', float(saved.get('blind_min_s', 0.3)))         # min blind turn (hysteresis)
         self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
+        self.declare_parameter('blind_side_w_min', float(saved.get('blind_side_w_min', 0.015)))  # min |w| to update curve side
         self._blind_turn_enabled = bool(self.get_parameter('blind_turn_enabled').value)
         self._blind_turn_w = float(self.get_parameter('blind_turn_w').value)
         self._blind_turn_v = float(self.get_parameter('blind_turn_v').value)
         self._blind_conf = float(self.get_parameter('blind_conf').value)
         self._blind_reacquire_off = float(self.get_parameter('blind_reacquire_off').value)
         self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
+        self._blind_enter_off = float(self.get_parameter('blind_enter_off').value)
+        self._blind_min_s = float(self.get_parameter('blind_min_s').value)
         self._blind_max_s = float(self.get_parameter('blind_max_s').value)
+        self._blind_side_w_min = float(self.get_parameter('blind_side_w_min').value)
         self._curve_side = 0.0          # smoothed turn-side memory (+left / -right)
+        self._prev_cmd_w = 0.0          # last frame's steering intent (for side memory)
         self._blind_lost_frames = 0
         self._blind_active = False
         self._blind_start = None
@@ -795,7 +802,8 @@ class AutonomousRacer(Node):
                     'z_options', 'near_intersection',
                     'error', 'deriv', 'v', 'w',
                     'kp', 'kd', 'ff_gain', 'max_v', 'max_w',
-                    'stop_cm', 'slow_cm', 'commit_min_s', 'commit_turn_w'])
+                    'stop_cm', 'slow_cm', 'commit_min_s', 'commit_turn_w',
+                    'curve_side', 'blind', 'blind_dir'])
                 self.get_logger().info(f'[LOG] controller CSV -> {log_path}')
             except OSError as exc:
                 self.get_logger().error(f'[LOG] could not open CSV ({exc}); disabled')
@@ -1277,8 +1285,14 @@ class AutonomousRacer(Node):
                 self._blind_reacquire_off = float(p.value)
             elif p.name == 'blind_enter_frames':
                 self._blind_enter_frames = int(p.value)
+            elif p.name == 'blind_enter_off':
+                self._blind_enter_off = float(p.value)
+            elif p.name == 'blind_min_s':
+                self._blind_min_s = float(p.value)
             elif p.name == 'blind_max_s':
                 self._blind_max_s = float(p.value)
+            elif p.name == 'blind_side_w_min':
+                self._blind_side_w_min = float(p.value)
             elif p.name == 'curve_arc_enabled':
                 self._curve_arc_enabled = bool(p.value)
             elif p.name == 'curve_arc_v':
@@ -1508,7 +1522,10 @@ class AutonomousRacer(Node):
                 'blind_conf': self._blind_conf,
                 'blind_reacquire_off': self._blind_reacquire_off,
                 'blind_enter_frames': self._blind_enter_frames,
+                'blind_enter_off': self._blind_enter_off,
+                'blind_min_s': self._blind_min_s,
                 'blind_max_s': self._blind_max_s,
+                'blind_side_w_min': self._blind_side_w_min,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -1915,7 +1932,9 @@ class AutonomousRacer(Node):
             f"{self.kp:.4f}", f"{self.kd:.4f}", f"{self.ff_gain:.3f}",
             f"{self.max_v:.3f}", f"{self.max_w:.3f}",
             f"{zp.stop_distance_cm:.1f}", f"{zp.slow_distance_cm:.1f}",
-            f"{self._commit_min_s:.2f}", f"{self._commit_turn_w:.2f}"])
+            f"{self._commit_min_s:.2f}", f"{self._commit_turn_w:.2f}",
+            f"{self._curve_side:+.2f}", int(self._blind_active),
+            f"{self._blind_dir:+.0f}"])
         try:
             self._csv_fp.flush()
         except OSError:
@@ -3425,24 +3444,30 @@ class AutonomousRacer(Node):
                       and lr_b.lane_center_x_orig is not None)
             blind_follow = (self.intersection_phase is None and self.commit_direction is None
                             and not self._near_intersection)
-            if bev_ok and blind_follow:
-                # remember the turn side from where the line is (err sign == w sign)
-                err_b = frame_center_x - float(lr_b.lane_center_x_orig)
-                side = 1.0 if err_b > 0 else (-1.0 if err_b < 0 else 0.0)
-                self._curve_side = 0.6 * self._curve_side + 0.4 * side
+            off_now = abs(float(lr_b.offset_norm)) if bev_ok else 1.0
+            # Side memory = the way the PD was ALREADY steering (prev commanded w).
+            # Its sign is the true curve direction; the line's POSITION is NOT -- in a
+            # left curve the optical flow puts the line on the RIGHT edge as the robot
+            # turns, which fooled the old offset-based detector into turning right.
+            if bev_ok and blind_follow and not self._blind_active:
+                if abs(self._prev_cmd_w) >= self._blind_side_w_min:
+                    s = 1.0 if self._prev_cmd_w > 0 else -1.0
+                    self._curve_side = 0.5 * self._curve_side + 0.5 * s
                 self._blind_lost_frames = 0
-            elif blind_follow:
+            elif blind_follow and not self._blind_active:
                 self._blind_lost_frames += 1
 
             if self._blind_active:
                 elapsed_b = (now - self._blind_start).nanoseconds * 1e-9
-                off_b = abs(float(lr_b.offset_norm)) if bev_ok else 1.0
-                reacquired = bev_ok and off_b <= self._blind_reacquire_off
+                # exit only when the line is back AND near center (hysteresis vs the
+                # edge entry), after a minimum turn, or the safety cap.
+                reacquired = (bev_ok and off_now <= self._blind_reacquire_off
+                              and elapsed_b >= self._blind_min_s)
                 if reacquired or elapsed_b >= self._blind_max_s or not blind_follow:
                     self._blind_active = False
                     self.get_logger().warn(
-                        f"[BLIND] done (reacquired={reacquired}, {elapsed_b:.1f}s) -> FOLLOW",
-                        throttle_duration_sec=0.5)
+                        f"[BLIND] done (reacq={reacquired}, {elapsed_b:.1f}s, "
+                        f"dir={self._blind_dir:+.0f}) -> FOLLOW", throttle_duration_sec=0.5)
                 else:
                     base_linear_x = self._blind_turn_v
                     target_angular_z = self._blind_dir * self._blind_turn_w
@@ -3451,9 +3476,11 @@ class AutonomousRacer(Node):
                     self.last_error = 0.0
                     self.last_derivative = 0.0
                     self.last_time = now
-            elif (blind_follow and self._blind_lost_frames >= self._blind_enter_frames
-                  and abs(self._curve_side) >= 0.3):
-                # line lost while following -> commit to a blind turn toward its side
+            elif (blind_follow and abs(self._curve_side) >= 0.3
+                  and (self._blind_lost_frames >= self._blind_enter_frames
+                       or off_now >= self._blind_enter_off)):
+                # Line LOST, or it has reached the edge (about to leave) in a curve:
+                # commit to a blind turn toward the side the PD was already steering.
                 self._blind_active = True
                 self._blind_start = now
                 self._blind_dir = 1.0 if self._curve_side > 0 else -1.0
@@ -3464,9 +3491,12 @@ class AutonomousRacer(Node):
                 self.last_error = 0.0
                 self.last_derivative = 0.0
                 self.last_time = now
+                reason = ("lost" if self._blind_lost_frames >= self._blind_enter_frames
+                          else "edge")
                 self.get_logger().warn(
-                    f"[BLIND] line lost -> turning {'LEFT' if self._blind_dir > 0 else 'RIGHT'} "
-                    f"(side={self._curve_side:+.2f})", throttle_duration_sec=0.5)
+                    f"[BLIND] {reason} -> turning {'LEFT' if self._blind_dir > 0 else 'RIGHT'} "
+                    f"(side={self._curve_side:+.2f}, off={off_now:.2f})",
+                    throttle_duration_sec=0.5)
 
         # PD Math
         if steering_center_x is not None:
@@ -3523,6 +3553,11 @@ class AutonomousRacer(Node):
                 self.last_error      = line_error
                 self.last_derivative = derivative
                 self.last_time       = now
+
+        # Remember the steering INTENT (sign = curve direction) for the blind-turn
+        # side memory next frame. Captured after the PD so tracking frames store the
+        # real PD output; ignored while blind is active (side update is gated).
+        self._prev_cmd_w = float(target_angular_z)
 
         # Slow down proportionally to curvature, with short memory. Tight curves
         # can produce one flat/fragmented fit while the robot is still physically
