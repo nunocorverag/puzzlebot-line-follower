@@ -490,11 +490,21 @@ class AutonomousRacer(Node):
         # ~1 = anticipate the curve. It is the bend term, so straights are
         # unaffected and the existing straight-line PD tuning is preserved.
         self.declare_parameter('ff_gain', float(saved.get('ff_gain', 1.0)))
+        # Curve steering from the line's heading (tilt at the eval row). A teleop
+        # demonstration showed heading is the reliable curve signal -- correctly
+        # signed (positive = left) and growing from ~0.11 on a straight to ~0.5 in a
+        # tight curve, unlike curvature_norm which flips sign mid-curve. kp*offset
+        # alone under-steered 2-6x (reached ~0.05-0.19 while the human held ~0.30).
+        # w += curve_heading_gain * heading, beyond a straight-residual deadband.
+        self.declare_parameter('curve_heading_gain', float(saved.get('curve_heading_gain', 0.5)))
+        self.declare_parameter('curve_heading_deadband', float(saved.get('curve_heading_deadband', 0.20)))
         self.kp = float(self.get_parameter('kp').value)
         self.kd = float(self.get_parameter('kd').value)
         self.max_v = float(self.get_parameter('max_v').value)
         self.max_w = float(self.get_parameter('max_w').value)
         self.ff_gain = float(self.get_parameter('ff_gain').value)
+        self._curve_heading_gain = float(self.get_parameter('curve_heading_gain').value)
+        self._curve_heading_deadband = float(self.get_parameter('curve_heading_deadband').value)
 
         # Robust-intersection knobs (all live-tunable + persisted in
         # control_params.json). See docs/RUNBOOK.md "Intersections".
@@ -1176,6 +1186,10 @@ class AutonomousRacer(Node):
                 self.max_w = float(p.value)
             elif p.name == 'ff_gain':
                 self.ff_gain = float(p.value)
+            elif p.name == 'curve_heading_gain':
+                self._curve_heading_gain = float(p.value)
+            elif p.name == 'curve_heading_deadband':
+                self._curve_heading_deadband = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1361,6 +1375,8 @@ class AutonomousRacer(Node):
                 'kp': self.kp, 'kd': self.kd,
                 'max_v': self.max_v, 'max_w': self.max_w,
                 'ff_gain': self.ff_gain,
+                'curve_heading_gain': self._curve_heading_gain,
+                'curve_heading_deadband': self._curve_heading_deadband,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
                 'curve_memory_s': self._curve_memory_s,
@@ -1731,6 +1747,8 @@ class AutonomousRacer(Node):
                 'use_zebra_bev': bool(self._use_zebra_bev),
                 'kp': self.kp, 'kd': self.kd, 'max_v': self.max_v, 'max_w': self.max_w,
                 'ff_gain': self.ff_gain,
+                'curve_heading_gain': self._curve_heading_gain,
+                'curve_heading_deadband': self._curve_heading_deadband,
                 'slow_cm': zp.slow_distance_cm, 'stop_cm': zp.stop_distance_cm,
                 'approach_v': self._approach_speed,
             },
@@ -3202,6 +3220,22 @@ class AutonomousRacer(Node):
                     curve_term = 0.0   # relax anticipation near a cross (no overshoot)
                 w_out = (self.kp * line_error) + (self.kd * derivative) \
                     + (self.kp * self.ff_gain * curve_term)
+
+                # Heading curve term (see __init__): the reliable curve signal from
+                # the teleop demo. Steer proportional to the line tilt beyond a
+                # straight-residual deadband, so tight curves get the ~0.30 the human
+                # used instead of the 0.05-0.19 kp*offset produced. Only on a fresh,
+                # confident BEV fit, away from intersections (those steer separately).
+                lr = self._last_lane_result
+                if (self._curve_heading_gain > 0.0
+                        and lr is not None and lr.detected
+                        and lr.confidence >= 0.5
+                        and not self._near_intersection
+                        and self.commit_direction is None
+                        and self.intersection_phase is None):
+                    heading = float(lr.heading)
+                    if abs(heading) >= self._curve_heading_deadband:
+                        w_out += self._curve_heading_gain * heading
 
                 curve_factor = max(0.4, 1.0 - (abs(line_error) / frame_center_x))
 
