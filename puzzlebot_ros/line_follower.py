@@ -3368,7 +3368,12 @@ class AutonomousRacer(Node):
                         and curve_age <= self._lane_curve_dropout_s
                         and abs(self._lane_hold_signed_curvature) > 1e-3):
                     curve_dir = 1.0 if self._lane_hold_signed_curvature > 0.0 else -1.0
-                    min_curve_w = min(abs(self._lane_curve_min_turn_w), self.max_w)
+                    min_curve_w = min(
+                        self._lane_curve_min_turn_w
+                        * (abs(self._lane_hold_signed_curvature) / self._lane_hold_curve_min_curv),
+                        0.6 * self.max_w,
+                    )
+                    min_curve_w = max(min_curve_w, self._lane_curve_min_turn_w)
                     if target_angular_z * curve_dir < min_curve_w:
                         prev_w = target_angular_z
                         target_angular_z = curve_dir * min_curve_w
