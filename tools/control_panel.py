@@ -293,11 +293,22 @@ class Tuner(Node):
         self.recorder_pub = self.create_publisher(Bool, "/recorder_enable", 10)
         self.set_cli = self.create_client(SetParameters, f"/{TARGET_NODE}/set_parameters")
         self.get_cli = self.create_client(GetParameters, f"/{TARGET_NODE}/get_parameters")
-        if self.set_cli.wait_for_service(timeout_sec=5.0):
+        self._connected = False
+        if self.set_cli.wait_for_service(timeout_sec=30.0):
             self._read_current()
+            self._connected = True
             self.msg = f"connected to /{TARGET_NODE}"
         else:
             self.msg = f"WARN: /{TARGET_NODE} not found -- is the follower running?"
+        self.create_timer(10.0, self._retry_connect)
+
+    def _retry_connect(self):
+        if self._connected:
+            return
+        if self.set_cli.service_is_ready():
+            self._read_current()
+            self._connected = True
+            self.msg = f"connected to /{TARGET_NODE}"
 
     def _status_cb(self, msg):
         if len(msg.data) >= 5:
