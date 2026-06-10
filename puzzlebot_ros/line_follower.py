@@ -642,6 +642,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('curve_arc_w', float(saved.get('curve_arc_w', 0.30)))        # +left angular during arc
         self.declare_parameter('curve_arc_enter', float(saved.get('curve_arc_enter', 0.60)))    # |curv| to enter the arc
         self.declare_parameter('curve_arc_exit', float(saved.get('curve_arc_exit', 0.30)))     # |curv| under this (centered) -> exit
+        self.declare_parameter('curve_arc_exit_frames', int(saved.get('curve_arc_exit_frames', 3)))
         self.declare_parameter('curve_arc_min_s', float(saved.get('curve_arc_min_s', 0.6)))     # arc at least this long
         self.declare_parameter('curve_arc_max_s', float(saved.get('curve_arc_max_s', 4.0)))     # safety cap
         # Pre-advance: on entry, drive STRAIGHT this long before starting the left
@@ -658,6 +659,7 @@ class AutonomousRacer(Node):
         self._curve_arc_w = float(self.get_parameter('curve_arc_w').value)
         self._curve_arc_enter = float(self.get_parameter('curve_arc_enter').value)
         self._curve_arc_exit = float(self.get_parameter('curve_arc_exit').value)
+        self._curve_arc_exit_frames = int(self.get_parameter('curve_arc_exit_frames').value)
         self._curve_arc_min_s = float(self.get_parameter('curve_arc_min_s').value)
         self._curve_arc_max_s = float(self.get_parameter('curve_arc_max_s').value)
         self._curve_arc_pre_s = float(self.get_parameter('curve_arc_pre_s').value)
@@ -666,6 +668,7 @@ class AutonomousRacer(Node):
         self._curve_arc_active = False
         self._curve_arc_start = None
         self._curve_arc_enter_count = 0
+        self._curve_arc_exit_count = 0
         self._curve_arc_phase = 'turn'      # 'turn' (pre+left) | 'post' (advance+recenter)
         self._curve_arc_post_start = None
         self.lane_params = self._load_lane_params()
@@ -1237,6 +1240,8 @@ class AutonomousRacer(Node):
                 self._curve_arc_enter = float(p.value)
             elif p.name == 'curve_arc_exit':
                 self._curve_arc_exit = float(p.value)
+            elif p.name == 'curve_arc_exit_frames':
+                self._curve_arc_exit_frames = int(p.value)
             elif p.name == 'curve_arc_min_s':
                 self._curve_arc_min_s = float(p.value)
             elif p.name == 'curve_arc_max_s':
@@ -1442,6 +1447,7 @@ class AutonomousRacer(Node):
                 'curve_arc_w': self._curve_arc_w,
                 'curve_arc_enter': self._curve_arc_enter,
                 'curve_arc_exit': self._curve_arc_exit,
+                'curve_arc_exit_frames': self._curve_arc_exit_frames,
                 'curve_arc_min_s': self._curve_arc_min_s,
                 'curve_arc_max_s': self._curve_arc_max_s,
                 'curve_arc_pre_s': self._curve_arc_pre_s,
@@ -3295,18 +3301,23 @@ class AutonomousRacer(Node):
                                     and off_mag < 0.25)
                     if elapsed >= self._curve_arc_max_s or not in_follow:
                         self._curve_arc_active = False       # hard exit (cap / left FOLLOW)
+                        self._curve_arc_exit_count = 0
                         self.get_logger().warn(
                             f"[CURVE] arc done ({elapsed:.1f}s) -> FOLLOW",
                             throttle_duration_sec=0.5)
                     elif elapsed >= self._curve_arc_min_s and straightened:
-                        # main turn finished -> run the advance + re-center sequence
-                        self._curve_arc_phase = 'post'
-                        self._curve_arc_post_start = now
+                        self._curve_arc_exit_count += 1
                         curve_arc = True
-                        self.get_logger().warn(
-                            f"[CURVE] turn done ({elapsed:.1f}s) -> advance+recenter",
-                            throttle_duration_sec=0.5)
+                        if self._curve_arc_exit_count >= self._curve_arc_exit_frames:
+                            # main turn finished -> run the advance + re-center sequence
+                            self._curve_arc_phase = 'post'
+                            self._curve_arc_post_start = now
+                            self._curve_arc_exit_count = 0
+                            self.get_logger().warn(
+                                f"[CURVE] turn done ({elapsed:.1f}s) -> advance+recenter",
+                                throttle_duration_sec=0.5)
                     else:
+                        self._curve_arc_exit_count = 0
                         curve_arc = True
             elif in_follow and arc_detected and curv_mag >= self._curve_arc_enter:
                 self._curve_arc_enter_count += 1
@@ -3316,6 +3327,7 @@ class AutonomousRacer(Node):
                     self._curve_arc_phase = 'turn'
                     self._curve_arc_post_start = None
                     self._curve_arc_enter_count = 0
+                    self._curve_arc_exit_count = 0
                     curve_arc = True
                     self.get_logger().warn(
                         f"[CURVE] arc START (curv={curv_mag:.2f}) -> forward+left",

@@ -15,6 +15,7 @@
   "curve_arc_w": 0.36,
   "curve_arc_enter": 0.6,
   "curve_arc_exit": 0.3,
+  "curve_arc_exit_frames": 3,
   "curve_arc_min_s": 0.6,
   "curve_arc_max_s": 4.0,
   "curve_arc_pre_s": 1.2,

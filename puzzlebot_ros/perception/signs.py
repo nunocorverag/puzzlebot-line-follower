@@ -488,6 +488,18 @@ class SignDetector:
                                     f"(votes: {vote_details['vote_counts']})")
                             was_corrected = True
                         verified_name = detected_direction
+
+                    # Defensive consistency guard: if the verifier produced a
+                    # strong turn winner, never allow the final label to disagree
+                    # with it. This keeps logs/overlay/action aligned when YOLO
+                    # flickers left<->right on the same blue arrow.
+                    verifier_winner = (vote_details or {}).get('winner')
+                    if verifier_winner in ('turn_left', 'turn_right') and verified_name != verifier_winner:
+                        self._log(
+                            f"[signs] forcing verifier winner: {verified_name} -> {verifier_winner}"
+                        )
+                        was_corrected = (verifier_winner != name)
+                        verified_name = verifier_winner
                 
                 all_signs.append({
                     'name': verified_name,
