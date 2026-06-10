@@ -644,6 +644,10 @@ class AutonomousRacer(Node):
         self.declare_parameter('curve_arc_exit', float(saved.get('curve_arc_exit', 0.30)))     # |curv| under this (centered) -> exit
         self.declare_parameter('curve_arc_min_s', float(saved.get('curve_arc_min_s', 0.6)))     # arc at least this long
         self.declare_parameter('curve_arc_max_s', float(saved.get('curve_arc_max_s', 4.0)))     # safety cap
+        # Pre-advance: on entry, drive STRAIGHT this long before starting the left
+        # turn, so the robot goes further into the curve first instead of cutting it
+        # ("advance straight, then turn"). Raise it to turn later / go straighter.
+        self.declare_parameter('curve_arc_pre_s', float(saved.get('curve_arc_pre_s', 0.6)))
         self._curve_arc_enabled = bool(self.get_parameter('curve_arc_enabled').value)
         self._curve_arc_v = float(self.get_parameter('curve_arc_v').value)
         self._curve_arc_w = float(self.get_parameter('curve_arc_w').value)
@@ -651,6 +655,7 @@ class AutonomousRacer(Node):
         self._curve_arc_exit = float(self.get_parameter('curve_arc_exit').value)
         self._curve_arc_min_s = float(self.get_parameter('curve_arc_min_s').value)
         self._curve_arc_max_s = float(self.get_parameter('curve_arc_max_s').value)
+        self._curve_arc_pre_s = float(self.get_parameter('curve_arc_pre_s').value)
         self._curve_arc_active = False
         self._curve_arc_start = None
         self._curve_arc_enter_count = 0
@@ -1227,6 +1232,8 @@ class AutonomousRacer(Node):
                 self._curve_arc_min_s = float(p.value)
             elif p.name == 'curve_arc_max_s':
                 self._curve_arc_max_s = float(p.value)
+            elif p.name == 'curve_arc_pre_s':
+                self._curve_arc_pre_s = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1424,6 +1431,7 @@ class AutonomousRacer(Node):
                 'curve_arc_exit': self._curve_arc_exit,
                 'curve_arc_min_s': self._curve_arc_min_s,
                 'curve_arc_max_s': self._curve_arc_max_s,
+                'curve_arc_pre_s': self._curve_arc_pre_s,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3281,8 +3289,12 @@ class AutonomousRacer(Node):
                 self._curve_arc_enter_count = 0
 
         if curve_arc:
+            arc_elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
             base_linear_x = self._curve_arc_v
-            target_angular_z = self._curve_arc_w   # +w = LEFT (every curve here is left)
+            if arc_elapsed < self._curve_arc_pre_s:
+                target_angular_z = 0.0             # advance STRAIGHT into the curve first
+            else:
+                target_angular_z = self._curve_arc_w   # then turn LEFT (every curve here is left)
             steering_center_x = None               # bypass the PD below
             self.last_error = 0.0
             self.last_derivative = 0.0

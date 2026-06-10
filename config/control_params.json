@@ -15,6 +15,7 @@
   "curve_arc_exit": 0.30,
   "curve_arc_min_s": 0.6,
   "curve_arc_max_s": 4.0,
+  "curve_arc_pre_s": 0.6,
   "k_align": 0.6,
   "intersection_slow_speed": 0.08,
   "approach_align_slope": 0.15,
