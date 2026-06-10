@@ -496,12 +496,14 @@ class AutonomousRacer(Node):
         # unaffected and the existing straight-line PD tuning is preserved.
         self.declare_parameter('ff_gain', float(saved.get('ff_gain', 1.0)))
         self.declare_parameter('curve_ff_scale', float(saved.get('curve_ff_scale', 0.65)))
+        self.declare_parameter('curve_ff_min_conf', float(saved.get('curve_ff_min_conf', 0.65)))
         self.kp = float(self.get_parameter('kp').value)
         self.kd = float(self.get_parameter('kd').value)
         self.max_v = float(self.get_parameter('max_v').value)
         self.max_w = float(self.get_parameter('max_w').value)
         self.ff_gain = float(self.get_parameter('ff_gain').value)
         self._curve_ff_scale = float(self.get_parameter('curve_ff_scale').value)
+        self._curve_ff_min_conf = float(self.get_parameter('curve_ff_min_conf').value)
 
         # Robust-intersection knobs (all live-tunable + persisted in
         # control_params.json). See docs/RUNBOOK.md "Intersections".
@@ -1226,6 +1228,8 @@ class AutonomousRacer(Node):
                 self.ff_gain = float(p.value)
             elif p.name == 'curve_ff_scale':
                 self._curve_ff_scale = float(p.value)
+            elif p.name == 'curve_ff_min_conf':
+                self._curve_ff_min_conf = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1424,6 +1428,7 @@ class AutonomousRacer(Node):
                 'max_v': self.max_v, 'max_w': self.max_w,
                 'ff_gain': self.ff_gain,
                 'curve_ff_scale': self._curve_ff_scale,
+                'curve_ff_min_conf': self._curve_ff_min_conf,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
                 'curve_memory_s': self._curve_memory_s,
@@ -3107,6 +3112,16 @@ class AutonomousRacer(Node):
                 steering_center_x = lane_result.lane_center_x_orig
                 steering_far_x = lane_result.lane_center_far_x_orig
                 lane_curvature = abs(lane_result.curvature_norm)
+                weak_curve_ff = (
+                    lane_curvature >= self._lane_hold_curve_min_curv
+                    and lane_result.confidence < self._curve_ff_min_conf
+                )
+                if weak_curve_ff:
+                    steering_far_x = None
+                    self.get_logger().warn(
+                        f"[LANE] disable weak curve lookahead "
+                        f"(conf={lane_result.confidence:.2f}, curv={lane_result.curvature_norm:+.2f})",
+                        throttle_duration_sec=0.5)
                 self.time_line_lost = None
                 # Capture the last CONFIDENT heading for the near-cross hysteresis.
                 if lane_result.confidence >= self._lane_hold_conf:
