@@ -688,6 +688,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.08)))      # forward while blind: radius=v/w; too low pivots & cuts inside
         self.declare_parameter('blind_conf', float(saved.get('blind_conf', 0.5)))           # BEV conf = "line visible"
         self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
+        self.declare_parameter('blind_reacquire_frames', int(saved.get('blind_reacquire_frames', 4)))  # consecutive frames needed to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
         self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.55)))   # |off| at the edge -> also enter (strict)
         self.declare_parameter('blind_pre_s', float(saved.get('blind_pre_s', 1.0)))         # after losing it, advance STRAIGHT this long before turning (~v*pre_s metres)
@@ -699,6 +700,7 @@ class AutonomousRacer(Node):
         self._blind_turn_v = float(self.get_parameter('blind_turn_v').value)
         self._blind_conf = float(self.get_parameter('blind_conf').value)
         self._blind_reacquire_off = float(self.get_parameter('blind_reacquire_off').value)
+        self._blind_reacquire_frames = int(self.get_parameter('blind_reacquire_frames').value)
         self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
         self._blind_enter_off = float(self.get_parameter('blind_enter_off').value)
         self._blind_pre_s = float(self.get_parameter('blind_pre_s').value)
@@ -711,6 +713,7 @@ class AutonomousRacer(Node):
         self._blind_active = False
         self._blind_start = None
         self._blind_dir = 0.0
+        self._blind_reacq_count = 0
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -1285,6 +1288,8 @@ class AutonomousRacer(Node):
                 self._blind_conf = float(p.value)
             elif p.name == 'blind_reacquire_off':
                 self._blind_reacquire_off = float(p.value)
+            elif p.name == 'blind_reacquire_frames':
+                self._blind_reacquire_frames = int(p.value)
             elif p.name == 'blind_enter_frames':
                 self._blind_enter_frames = int(p.value)
             elif p.name == 'blind_enter_off':
@@ -1525,6 +1530,7 @@ class AutonomousRacer(Node):
                 'blind_turn_v': self._blind_turn_v,
                 'blind_conf': self._blind_conf,
                 'blind_reacquire_off': self._blind_reacquire_off,
+                'blind_reacquire_frames': self._blind_reacquire_frames,
                 'blind_enter_frames': self._blind_enter_frames,
                 'blind_enter_off': self._blind_enter_off,
                 'blind_pre_s': self._blind_pre_s,
@@ -3464,10 +3470,13 @@ class AutonomousRacer(Node):
 
             if self._blind_active:
                 elapsed_b = (now - self._blind_start).nanoseconds * 1e-9
-                # exit only when the line is back AND near center (hysteresis vs the
-                # edge entry), after a minimum turn, or the safety cap.
-                reacquired = (bev_ok and off_now <= self._blind_reacquire_off
-                              and elapsed_b >= self._blind_min_s)
+                # Require N consecutive frames with the line near center before exiting.
+                # A single flash of an outer/border line won't satisfy this.
+                if bev_ok and off_now <= self._blind_reacquire_off and elapsed_b >= self._blind_min_s:
+                    self._blind_reacq_count += 1
+                else:
+                    self._blind_reacq_count = 0
+                reacquired = self._blind_reacq_count >= self._blind_reacquire_frames
                 if reacquired or elapsed_b >= self._blind_max_s or not blind_follow:
                     self._blind_active = False
                     self.get_logger().warn(
@@ -3493,6 +3502,7 @@ class AutonomousRacer(Node):
                 self._blind_active = True
                 self._blind_start = now
                 self._blind_dir = 1.0 if self._curve_side > 0 else -1.0
+                self._blind_reacq_count = 0
                 base_linear_x = self._blind_turn_v
                 # first frame: advance straight (pre-advance) before turning
                 target_angular_z = (0.0 if self._blind_pre_s > 0.0
