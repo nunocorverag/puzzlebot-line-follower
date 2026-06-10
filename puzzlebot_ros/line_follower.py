@@ -482,7 +482,7 @@ class AutonomousRacer(Node):
         else:
             self.get_logger().warn('control_params.json not found; using defaults')
         self.declare_parameter('kp', float(saved.get('kp', 0.003)))
-        self.declare_parameter('kd', float(saved.get('kd', 0.008)))
+        self.declare_parameter('kd', float(saved.get('kd', 0.0)))
         self.declare_parameter('max_v', float(saved.get('max_v', 0.08)))
         self.declare_parameter('max_w', float(saved.get('max_w', 0.6)))
         # Curve feedforward: steer ahead by the bend (far offset - near offset),

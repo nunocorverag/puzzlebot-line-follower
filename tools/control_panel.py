@@ -181,7 +181,7 @@ GROUPS = [
 FIELDS = [(name, kind, step) for _, items in GROUPS for name, kind, step, _ in items]
 FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kind, step, help_text in items}
 DEFAULTS = {
-    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
+    "kp": 0.0018, "kd": 0.0, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
     "curve_slow_gain": 0.6, "curve_min_scale": 0.7, "curve_memory_s": 1.20,
     "curve_min_v": 0.045,
     "curve_arc_enabled": True, "curve_arc_pre_s": 0.6, "curve_arc_w": 0.30,
