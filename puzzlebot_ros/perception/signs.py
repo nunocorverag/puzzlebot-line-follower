@@ -407,6 +407,7 @@ class SignDetector:
         self._last = SignResult()
         self._stable_name = None
         self._stable_count = 0
+        self._last_decision = None
         if not params.model_path:
             log("[signs] disabled (no model_path)")
             return
@@ -511,13 +512,45 @@ class SignDetector:
             best.area_pct = top['area_pct']
 
         # Debounce: only surface a sign after it is seen stable_needed times.
+        # Directional signs get extra hysteresis when switching left<->right:
+        # a one-frame verifier/model flicker should not change the visible/latched
+        # decision. Until a new opposite decision is stable enough, keep showing
+        # the last stable decision on the current box.
         if best.name is not None and best.name == self._stable_name:
             self._stable_count += 1
         else:
             self._stable_name = best.name
             self._stable_count = 1 if best.name is not None else 0
-        
-        result = best if self._stable_count >= self.p.stable_needed else SignResult(all_detections=all_signs if all_signs else None)
+
+        needed = self.p.stable_needed
+        if (self._last_decision is not None
+                and best.name in ('turn_left', 'turn_right')
+                and self._last_decision.get('name') in ('turn_left', 'turn_right')
+                and best.name != self._last_decision.get('name')):
+            needed += 1
+
+        if best.name is not None and self._stable_count >= needed:
+            result = best
+            self._last_decision = {
+                'name': best.name,
+                'conf': best.conf,
+                'box': best.box,
+                'area_pct': best.area_pct,
+            }
+        elif all_signs and self._last_decision is not None:
+            held = dict(all_signs[0])
+            held['name'] = self._last_decision['name']
+            held['original_name'] = all_signs[0]['name']
+            held['decision_hold'] = True
+            result = SignResult(
+                name=held['name'],
+                conf=held['conf'],
+                box=held['box'],
+                area_pct=held['area_pct'],
+                all_detections=[held] + all_signs[1:],
+            )
+        else:
+            result = SignResult(all_detections=all_signs if all_signs else None)
         self._last = result
         return result
 
@@ -543,6 +576,8 @@ def draw_sign_overlay(frame, result: SignResult):
             label_name = sign['name']
             if sign.get('original_name') and sign['original_name'] != sign['name']:
                 label_name = f"{sign['name']}<-{sign['original_name']}"
+            if sign.get('decision_hold'):
+                label_name = f"{label_name} hold"
             label = f"{rank_marker} {label_name} c:{sign['conf']:.2f} a:{sign['area_pct']:.1f}%"
             
             # Background for text
