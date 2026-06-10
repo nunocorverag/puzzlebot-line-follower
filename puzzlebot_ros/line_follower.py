@@ -692,6 +692,12 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
         self.declare_parameter('lane_curve_min_turn_w', float(saved.get('lane_curve_min_turn_w', 0.075)))
         self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.80)))
+        # Tight-curve angular authority: w += curve_ff_w * ff_gain * |curv| toward the
+        # lookahead, only when |curv| >= curve_ff_min_curv (so straights are untouched).
+        self.declare_parameter('curve_ff_w', float(saved.get('curve_ff_w', 0.40)))
+        self.declare_parameter('curve_ff_min_curv', float(saved.get('curve_ff_min_curv', 0.45)))
+        self._curve_ff_w = float(self.get_parameter('curve_ff_w').value)
+        self._curve_ff_min_curv = float(self.get_parameter('curve_ff_min_curv').value)
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
         self._lane_base_edge_margin_pct = int(self.get_parameter('lane_base_edge_margin_pct').value)
@@ -1264,6 +1270,10 @@ class AutonomousRacer(Node):
                 self._lane_curve_min_turn_w = float(p.value)
             elif p.name == 'lane_curve_hold_assist_conf':
                 self._lane_curve_hold_assist_conf = float(p.value)
+            elif p.name == 'curve_ff_w':
+                self._curve_ff_w = float(p.value)
+            elif p.name == 'curve_ff_min_curv':
+                self._curve_ff_min_curv = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -1442,6 +1452,8 @@ class AutonomousRacer(Node):
                 'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
                 'lane_curve_min_turn_w': self._lane_curve_min_turn_w,
                 'lane_curve_hold_assist_conf': self._lane_curve_hold_assist_conf,
+                'curve_ff_w': self._curve_ff_w,
+                'curve_ff_min_curv': self._curve_ff_min_curv,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -3339,6 +3351,20 @@ class AutonomousRacer(Node):
                     curve_term = 0.0   # relax anticipation near a cross (no overshoot)
                 w_out = (self.kp * line_error) + (self.kd * derivative) \
                     + (self.kp * self.ff_gain * curve_term)
+
+                # Tight-curve authority. A ~45 deg bend needs real angular speed; the
+                # kp*offset + bend feedforward alone under-steers (|w|~0.05 while the
+                # detector reports |curv|=1.0 the whole curve, so the robot opens out
+                # and loses the line). Add a term proportional to |curvature| (which
+                # is ~0 on straights, so they are untouched) steering toward the
+                # lookahead point -- far_error's sign is geometric and reliable,
+                # unlike curvature_norm's sign. Live-tunable via ff_gain.
+                if (steering_far_x is not None
+                        and not self._near_intersection
+                        and abs(lane_curvature) >= self._curve_ff_min_curv):
+                    far_error_c = frame_center_x - steering_far_x
+                    cdir = 1.0 if far_error_c > 0 else (-1.0 if far_error_c < 0 else 0.0)
+                    w_out += cdir * self._curve_ff_w * self.ff_gain * abs(lane_curvature)
 
                 curve_factor = max(0.4, 1.0 - (abs(line_error) / frame_center_x))
 
