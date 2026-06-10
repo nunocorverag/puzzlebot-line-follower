@@ -687,29 +687,35 @@ class AutonomousRacer(Node):
         self.declare_parameter('blind_turn_w', float(saved.get('blind_turn_w', 0.35)))      # blind turn rate (rad/s)
         self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.08)))      # forward while blind: radius=v/w; too low pivots & cuts inside
         self.declare_parameter('blind_conf', float(saved.get('blind_conf', 0.5)))           # BEV conf = "line visible"
+        self.declare_parameter('blind_lost_conf', float(saved.get('blind_lost_conf', 0.35)))  # below this counts as lost
         self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
         self.declare_parameter('blind_reacquire_frames', int(saved.get('blind_reacquire_frames', 4)))  # consecutive frames needed to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
         self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.65)))   # |off| at the edge -> also enter (strict)
         self.declare_parameter('blind_edge_frames', int(saved.get('blind_edge_frames', 3)))    # edge frames before blind entry
+        self.declare_parameter('blind_default_dir', float(saved.get('blind_default_dir', 1.0)))  # fallback curve dir (+left)
         self.declare_parameter('blind_pre_s', float(saved.get('blind_pre_s', 1.0)))         # after losing it, advance STRAIGHT this long before turning (~v*pre_s metres)
         self.declare_parameter('blind_min_s', float(saved.get('blind_min_s', 0.3)))         # min blind turn (hysteresis)
         self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
         self.declare_parameter('blind_side_w_min', float(saved.get('blind_side_w_min', 0.015)))  # min |w| to update curve side
+        self.declare_parameter('blind_heading_min', float(saved.get('blind_heading_min', 0.25)))  # min BEV heading slope to trust turn side
         self._blind_turn_enabled = bool(self.get_parameter('blind_turn_enabled').value)
         self._blind_turn_w = float(self.get_parameter('blind_turn_w').value)
         self._blind_turn_v = float(self.get_parameter('blind_turn_v').value)
         self._blind_conf = float(self.get_parameter('blind_conf').value)
+        self._blind_lost_conf = float(self.get_parameter('blind_lost_conf').value)
         self._blind_reacquire_off = float(self.get_parameter('blind_reacquire_off').value)
         self._blind_reacquire_frames = int(self.get_parameter('blind_reacquire_frames').value)
         self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
         self._blind_enter_off = float(self.get_parameter('blind_enter_off').value)
         self._blind_edge_frames = int(self.get_parameter('blind_edge_frames').value)
+        self._blind_default_dir = float(self.get_parameter('blind_default_dir').value)
         self._blind_pre_s = float(self.get_parameter('blind_pre_s').value)
         self._blind_min_s = float(self.get_parameter('blind_min_s').value)
         self._blind_max_s = float(self.get_parameter('blind_max_s').value)
         self._blind_side_w_min = float(self.get_parameter('blind_side_w_min').value)
-        self._curve_side = 0.0          # smoothed turn-side memory (+left / -right)
+        self._blind_heading_min = float(self.get_parameter('blind_heading_min').value)
+        self._curve_side = self._blind_default_dir  # smoothed turn-side memory (+left / -right)
         self._prev_cmd_w = 0.0          # last frame's steering intent (for side memory)
         self._blind_lost_frames = 0
         self._blind_active = False
@@ -1289,6 +1295,8 @@ class AutonomousRacer(Node):
                 self._blind_turn_v = float(p.value)
             elif p.name == 'blind_conf':
                 self._blind_conf = float(p.value)
+            elif p.name == 'blind_lost_conf':
+                self._blind_lost_conf = float(p.value)
             elif p.name == 'blind_reacquire_off':
                 self._blind_reacquire_off = float(p.value)
             elif p.name == 'blind_reacquire_frames':
@@ -1299,6 +1307,8 @@ class AutonomousRacer(Node):
                 self._blind_enter_off = float(p.value)
             elif p.name == 'blind_edge_frames':
                 self._blind_edge_frames = int(p.value)
+            elif p.name == 'blind_default_dir':
+                self._blind_default_dir = float(p.value)
             elif p.name == 'blind_pre_s':
                 self._blind_pre_s = float(p.value)
             elif p.name == 'blind_min_s':
@@ -1307,6 +1317,8 @@ class AutonomousRacer(Node):
                 self._blind_max_s = float(p.value)
             elif p.name == 'blind_side_w_min':
                 self._blind_side_w_min = float(p.value)
+            elif p.name == 'blind_heading_min':
+                self._blind_heading_min = float(p.value)
             elif p.name == 'curve_arc_enabled':
                 self._curve_arc_enabled = bool(p.value)
             elif p.name == 'curve_arc_v':
@@ -1534,15 +1546,18 @@ class AutonomousRacer(Node):
                 'blind_turn_w': self._blind_turn_w,
                 'blind_turn_v': self._blind_turn_v,
                 'blind_conf': self._blind_conf,
+                'blind_lost_conf': self._blind_lost_conf,
                 'blind_reacquire_off': self._blind_reacquire_off,
                 'blind_reacquire_frames': self._blind_reacquire_frames,
                 'blind_enter_frames': self._blind_enter_frames,
                 'blind_enter_off': self._blind_enter_off,
                 'blind_edge_frames': self._blind_edge_frames,
+                'blind_default_dir': self._blind_default_dir,
                 'blind_pre_s': self._blind_pre_s,
                 'blind_min_s': self._blind_min_s,
                 'blind_max_s': self._blind_max_s,
                 'blind_side_w_min': self._blind_side_w_min,
+                'blind_heading_min': self._blind_heading_min,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3459,16 +3474,27 @@ class AutonomousRacer(Node):
             bev_ok = (lr_b is not None and lr_b.detected
                       and lr_b.confidence >= self._blind_conf
                       and lr_b.lane_center_x_orig is not None)
+            bev_visible = (lr_b is not None and lr_b.detected
+                           and lr_b.confidence >= self._blind_lost_conf
+                           and lr_b.lane_center_x_orig is not None)
             blind_follow = (self.intersection_phase is None and self.commit_direction is None
                             and not self._near_intersection)
-            off_now = abs(float(lr_b.offset_norm)) if bev_ok else 1.0
-            # Side memory = the way the PD was ALREADY steering (prev commanded w).
-            # Its sign is the true curve direction; the line's POSITION is NOT -- in a
-            # left curve the optical flow puts the line on the RIGHT edge as the robot
-            # turns, which fooled the old offset-based detector into turning right.
-            if bev_ok and blind_follow and not self._blind_active:
-                if abs(self._prev_cmd_w) >= self._blind_side_w_min:
-                    s = 1.0 if self._prev_cmd_w > 0 else -1.0
+            off_now = abs(float(lr_b.offset_norm)) if bev_visible else 1.0
+            # Side memory comes from BEV line heading, not from the last commanded W.
+            # The last W can be contaminated by RECOVER or by chasing an exterior line;
+            # that is exactly what made the second blind turn flip to the wrong side.
+            # Heading is the geometric curve direction while the BEV fit is still sane.
+            if bev_visible and blind_follow and not self._blind_active:
+                heading = float(getattr(lr_b, 'heading', 0.0))
+                if (bev_ok
+                        and lr_b.confidence >= max(self._blind_conf, 0.55)
+                        and abs(heading) >= self._blind_heading_min
+                        and abs(float(lr_b.curvature_norm)) >= self._lane_hold_curve_min_curv):
+                    s = 1.0 if heading > 0 else -1.0
+                    if (self._blind_default_dir != 0.0
+                            and s * self._blind_default_dir < 0.0
+                            and (lr_b.confidence < 0.85 or abs(heading) < 2.0 * self._blind_heading_min)):
+                        s = 1.0 if self._blind_default_dir > 0 else -1.0
                     self._curve_side = 0.5 * self._curve_side + 0.5 * s
                 if off_now >= self._blind_enter_off and abs(self._curve_side) >= 0.6:
                     self._blind_edge_count += 1
