@@ -5,7 +5,7 @@
   "max_w": 0.6,
   "ff_gain": 1.0,
   "curve_heading_gain": 0.5,
-  "curve_heading_deadband": 0.25,
+  "curve_heading_deadband": 0.40,
   "curve_slow_gain": 0.6,
   "curve_min_scale": 0.7,
   "k_align": 0.6,
