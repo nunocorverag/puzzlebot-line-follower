@@ -429,6 +429,7 @@ class AutonomousRacer(Node):
         self._sign_result = None             # last SignResult (for HUD/telemetry)
         self._pending_turn = None            # 'left'/'right'/'straight' from a sign
         self._pending_turn_until = None      # timeout: discard pending_turn if sign not seen
+        self._turn_votes = {'left': 0, 'right': 0}
         self._workers_until = None           # slow-zone end time from a workers sign
         self._stopsign_until = None          # hold-still end time (stop/give_way)
         self._sign_last_fired = {}           # sign name -> last action time (cooldown)
@@ -1150,6 +1151,7 @@ class AutonomousRacer(Node):
                            timeout_s=self._sign_forget_s)
                 self._pending_turn = None
                 self._pending_turn_until = None
+                self._turn_votes = {'left': 0, 'right': 0}
         
         if res.name is None:
             return
@@ -1158,7 +1160,24 @@ class AutonomousRacer(Node):
             return
         
         name = res.name
-        if name in ('turn_left', 'turn_right', 'go_straight'):
+        if name == 'go_straight':
+            if res.area_pct < self._sign_turn_act_area_pct:
+                return
+            if self._pending_turn != 'straight':
+                self.get_logger().warn(f"[SIGN] {name} ({res.conf:.2f}) -> auto-straight (direct)")
+                self._pending_turn = 'straight'
+                self._turn_votes = {'left': 0, 'right': 0}
+                self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
+                self._sign_last_fired[name] = now
+                self._event('sign_action', 
+                           sign_name=name,
+                           action='pending_turn',
+                           direction='straight',
+                           conf=round(res.conf, 3),
+                           area_pct=round(res.area_pct, 2))
+            return
+
+        if name in ('turn_left', 'turn_right'):
             # Directional signs latch earlier than STOP/give_way. In real runs the
             # arrow often leaves the FOV before the zebra READ window; waiting for
             # the stop-sign distance threshold means no pending_turn is ever set.
@@ -1168,34 +1187,34 @@ class AutonomousRacer(Node):
                     f"{self._sign_turn_act_area_pct:.1f}%) -> waiting to get closer",
                     throttle_duration_sec=1.0)
                 return
-            direction = {'turn_left': 'left', 'turn_right': 'right',
-                         'go_straight': 'straight'}[name]
-            if self._pending_turn is not None and self._pending_turn != direction:
-                self.get_logger().warn(
-                    f"[SIGN] ignoring conflicting {name}->{direction}; "
-                    f"pending {self._pending_turn} is already latched",
-                    throttle_duration_sec=1.0)
-                self._event('sign_conflict_ignored',
-                            sign_name=name,
-                            direction=direction,
-                            pending_turn=self._pending_turn,
-                            conf=round(res.conf, 3),
-                            area_pct=round(res.area_pct, 2))
-                return
-            self._pending_turn = direction
-            self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
-            self._sign_last_fired[name] = now
-            self.get_logger().warn(
-                f"[SIGN] {name} ({res.conf:.2f}, area {res.area_pct:.1f}%) -> auto-{self._pending_turn} at next cross "
-                f"(expires in {self._sign_forget_s}s if not seen)")
-            self._event('sign_action', 
-                       sign_name=name,
-                       action='pending_turn',
-                       direction=self._pending_turn,
-                       conf=round(res.conf, 3),
-                       area_pct=round(res.area_pct, 2),
-                       threshold_pct=self._sign_turn_act_area_pct,
-                       expires_s=self._sign_forget_s)
+
+            direction = 'left' if name == 'turn_left' else 'right'
+            self._turn_votes[direction] += 1
+            v_l, v_r = self._turn_votes['left'], self._turn_votes['right']
+            
+            # Decision threshold: at least 3 frames of turn signs and a margin of 2.
+            # This allows correcting an initial flicker (e.g. 1 left, then 3 rights -> right wins).
+            candidate = 'left' if v_l > v_r else 'right'
+            margin = abs(v_l - v_r)
+            if v_l + v_r >= 3 and margin >= 2:
+                if self._pending_turn != candidate:
+                    self.get_logger().warn(
+                        f"[SIGN] {name} winner: {candidate} (votes L:{v_l} R:{v_r})")
+                    self._pending_turn = candidate
+
+            if self._pending_turn is not None:
+                self._pending_turn_until = now + Duration(seconds=self._sign_forget_s)
+                self._sign_last_fired[name] = now
+                self._event('sign_action', 
+                           sign_name=name,
+                           action='pending_turn',
+                           direction=self._pending_turn,
+                           conf=round(res.conf, 3),
+                           area_pct=round(res.area_pct, 2),
+                           threshold_pct=self._sign_turn_act_area_pct,
+                           votes=dict(self._turn_votes),
+                           expires_s=self._sign_forget_s)
+            return
         elif name == 'workers':
             self._workers_until = now + Duration(seconds=self._workers_slow_s)
             self._sign_last_fired[name] = now
@@ -1269,6 +1288,7 @@ class AutonomousRacer(Node):
         self.intersection_stable = 0
         self.last_prompt_time = None
         self.intersection_cooldown_until = None
+        self._turn_votes = {'left': 0, 'right': 0}
         self.get_logger().warn('[INTERSECTION] state RESET by operator -> FOLLOW')
         self._event('intersection_reset')
 
@@ -2370,6 +2390,7 @@ class AutonomousRacer(Node):
                 self.get_logger().warn(
                     f"[SIGN] auto-deciding {self._pending_turn} at cross")
                 self._pending_turn = None
+                self._turn_votes = {'left': 0, 'right': 0}
 
             should_prompt = (self.last_prompt_time is None
                              or (now - self.last_prompt_time).nanoseconds * 1e-9 > 1.0)

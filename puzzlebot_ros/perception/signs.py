@@ -114,7 +114,7 @@ def _verify_arrow_direction(frame, box):
     #   upper white mass right of lower shaft -> turn_right
     #   upper white mass left  of lower shaft -> turn_left
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    white = cv2.inRange(hsv, np.array([0, 0, 130]), np.array([180, 95, 255]))
+    white = cv2.inRange(hsv, np.array([0, 0, 115]), np.array([180, 115, 255]))
     kernel = np.ones((3, 3), np.uint8)
     white = cv2.morphologyEx(white, cv2.MORPH_OPEN, kernel)
     white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, kernel)
@@ -143,7 +143,7 @@ def _verify_arrow_direction(frame, box):
         'white_px': int(len(xs)),
         'min_area': int(min_area),
     }
-    if len(xs) >= max(25, int(w * h * 0.018)):
+    if len(xs) >= max(20, int(w * h * 0.012)):
         top = xs[ys < h * 0.55]
         bottom = xs[ys > h * 0.45]
         white_details['top_px'] = int(len(top))
@@ -152,12 +152,34 @@ def _verify_arrow_direction(frame, box):
             top_center = float(np.median(top))
             bottom_center = float(np.median(bottom))
             dx_norm = (top_center - bottom_center) / float(max(1, w))
+            top_p10 = float(np.percentile(top, 10))
+            top_p90 = float(np.percentile(top, 90))
+            right_extent = (top_p90 - bottom_center) / float(max(1, w))
+            left_extent = (bottom_center - top_p10) / float(max(1, w))
+            extent_delta = right_extent - left_extent
             white_details.update({
                 'top_center': round(top_center, 2),
                 'bottom_center': round(bottom_center, 2),
                 'dx_norm': round(dx_norm, 3),
+                'top_p10': round(top_p10, 2),
+                'top_p90': round(top_p90, 2),
+                'right_extent': round(right_extent, 3),
+                'left_extent': round(left_extent, 3),
+                'extent_delta': round(extent_delta, 3),
             })
-            if abs(dx_norm) >= 0.08:
+            # The median can be pulled toward the vertical shaft of a turn-right
+            # sign. The arrow tip is better represented by the upper 90th/10th
+            # percentile extents. Prefer that when it is decisive.
+            if abs(extent_delta) >= 0.08:
+                winner = 'turn_right' if extent_delta > 0 else 'turn_left'
+                return winner, {
+                    'all_votes': [winner, winner, winner, winner, winner],
+                    'vote_counts': {winner: 5},
+                    'winner': winner,
+                    'reason': 'white_arrow_tip_extent',
+                    'white_arrow': white_details,
+                }
+            if abs(dx_norm) >= 0.055:
                 winner = 'turn_right' if dx_norm > 0 else 'turn_left'
                 return winner, {
                     'all_votes': [winner, winner, winner, winner],
@@ -552,7 +574,9 @@ class SignDetector:
 
         top = all_signs[0] if all_signs else None
         top_votes = (top or {}).get('vote_details') or {}
-        strong_winner = top_votes.get('winner') if top_votes.get('reason') == 'white_arrow_geometry' else None
+        strong_winner = (top_votes.get('winner')
+                         if top_votes.get('reason') in ('white_arrow_geometry', 'white_arrow_tip_extent')
+                         else None)
         same_physical_box = (
             self._last_decision is not None
             and top is not None
