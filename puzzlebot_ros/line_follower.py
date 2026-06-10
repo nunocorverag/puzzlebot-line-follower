@@ -495,11 +495,13 @@ class AutonomousRacer(Node):
         # ~1 = anticipate the curve. It is the bend term, so straights are
         # unaffected and the existing straight-line PD tuning is preserved.
         self.declare_parameter('ff_gain', float(saved.get('ff_gain', 1.0)))
+        self.declare_parameter('curve_ff_scale', float(saved.get('curve_ff_scale', 0.65)))
         self.kp = float(self.get_parameter('kp').value)
         self.kd = float(self.get_parameter('kd').value)
         self.max_v = float(self.get_parameter('max_v').value)
         self.max_w = float(self.get_parameter('max_w').value)
         self.ff_gain = float(self.get_parameter('ff_gain').value)
+        self._curve_ff_scale = float(self.get_parameter('curve_ff_scale').value)
 
         # Robust-intersection knobs (all live-tunable + persisted in
         # control_params.json). See docs/RUNBOOK.md "Intersections".
@@ -618,8 +620,8 @@ class AutonomousRacer(Node):
         self.declare_parameter('use_birdseye', True)
         self.declare_parameter('lane_params_path', '')
         self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
-        self.declare_parameter('curve_min_scale', 0.45)  # never below this fraction
-        self.declare_parameter('curve_memory_s', 2.20)   # keep slowing briefly after a tight curve
+        self.declare_parameter('curve_min_scale', 0.40)  # never below this fraction
+        self.declare_parameter('curve_memory_s', 1.60)   # keep slowing briefly after a tight curve
         self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
         self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
         self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
@@ -655,7 +657,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
-        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 2.20)))
+        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 1.80)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
@@ -685,6 +687,9 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
         self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.80)))
         self.declare_parameter('lane_curve_reject_conf', float(saved.get('lane_curve_reject_conf', 0.55)))
+        self.declare_parameter('zebra_block_in_curve', bool(saved.get('zebra_block_in_curve', True)))
+        self.declare_parameter('zebra_curve_block_min_curv', float(saved.get('zebra_curve_block_min_curv', 0.50)))
+        self.declare_parameter('zebra_curve_block_hold_s', float(saved.get('zebra_curve_block_hold_s', 1.20)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
         self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
@@ -692,6 +697,9 @@ class AutonomousRacer(Node):
         self._lane_curve_guard_max_offset = float(self.get_parameter('lane_curve_guard_max_offset').value)
         self._lane_curve_hold_assist_conf = float(self.get_parameter('lane_curve_hold_assist_conf').value)
         self._lane_curve_reject_conf = float(self.get_parameter('lane_curve_reject_conf').value)
+        self._zebra_block_in_curve = bool(self.get_parameter('zebra_block_in_curve').value)
+        self._zebra_curve_block_min_curv = float(self.get_parameter('zebra_curve_block_min_curv').value)
+        self._zebra_curve_block_hold_s = float(self.get_parameter('zebra_curve_block_hold_s').value)
         self._lane_good_base = None      # last accepted base x (warped px)
         self._lane_good_base_time = None # when it was accepted (for the timeout)
 
@@ -1216,6 +1224,8 @@ class AutonomousRacer(Node):
                 self.max_w = float(p.value)
             elif p.name == 'ff_gain':
                 self.ff_gain = float(p.value)
+            elif p.name == 'curve_ff_scale':
+                self._curve_ff_scale = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1248,6 +1258,12 @@ class AutonomousRacer(Node):
                 self._lane_curve_hold_assist_conf = float(p.value)
             elif p.name == 'lane_curve_reject_conf':
                 self._lane_curve_reject_conf = float(p.value)
+            elif p.name == 'zebra_block_in_curve':
+                self._zebra_block_in_curve = bool(p.value)
+            elif p.name == 'zebra_curve_block_min_curv':
+                self._zebra_curve_block_min_curv = float(p.value)
+            elif p.name == 'zebra_curve_block_hold_s':
+                self._zebra_curve_block_hold_s = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -1407,6 +1423,7 @@ class AutonomousRacer(Node):
                 'kp': self.kp, 'kd': self.kd,
                 'max_v': self.max_v, 'max_w': self.max_w,
                 'ff_gain': self.ff_gain,
+                'curve_ff_scale': self._curve_ff_scale,
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
                 'curve_memory_s': self._curve_memory_s,
@@ -1422,6 +1439,9 @@ class AutonomousRacer(Node):
                 'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
                 'lane_curve_hold_assist_conf': self._lane_curve_hold_assist_conf,
                 'lane_curve_reject_conf': self._lane_curve_reject_conf,
+                'zebra_block_in_curve': self._zebra_block_in_curve,
+                'zebra_curve_block_min_curv': self._zebra_curve_block_min_curv,
+                'zebra_curve_block_hold_s': self._zebra_curve_block_hold_s,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -1896,6 +1916,29 @@ class AutonomousRacer(Node):
         self.get_logger().warn(
             f"[ZEBRA] Waiting for decision. Options: {option_text}. dist={d}cm")
 
+    def _curve_gate_state(self, now):
+        lane_curve_now = 0.0
+        lr = self._last_lane_result
+        if lr is not None and lr.detected:
+            lane_curve_now = abs(float(lr.curvature_norm))
+        recent_curve_dt = None
+        if self._lane_hold_time is not None:
+            recent_curve_dt = (now - self._lane_hold_time).nanoseconds * 1e-9
+        active = bool(
+            self._zebra_block_in_curve
+            and self.intersection_phase is None
+            and self.commit_direction is None
+            and (
+                lane_curve_now >= self._zebra_curve_block_min_curv
+                or (
+                    self._lane_hold_curvature >= self._zebra_curve_block_min_curv
+                    and recent_curve_dt is not None
+                    and recent_curve_dt <= self._zebra_curve_block_hold_s
+                )
+            )
+        )
+        return active, lane_curve_now
+
     def _run_zebra_phase(self, frame, now):
         """Robust bird's-eye / ground-coordinate intersection handling.
 
@@ -1905,6 +1948,7 @@ class AutonomousRacer(Node):
         True if it consumed the frame (WAIT: published a stop and early-returned).
         """
         zp = self.zebra_params
+        curve_gate_active, lane_curve_now = self._curve_gate_state(now)
 
         # Suppress detection while committing a turn or inside the post-turn
         # travel/time cooldown (same double-cross guard as the legacy path).
@@ -1958,7 +2002,7 @@ class AutonomousRacer(Node):
             and (float(zp.trigger_max_center_cm) <= 0.0
                  or zres.row_center_cm is None
                  or abs(float(zres.row_center_cm)) <= float(zp.trigger_max_center_cm)))
-        trigger_ok = stable_ok and dashes_ok and angle_ok and center_ok
+        trigger_ok = stable_ok and dashes_ok and angle_ok and center_ok and not curve_gate_active
         
         # Debug: log why approach is rejected
         if (zres is not None and zres.seen and dist is not None
@@ -1993,6 +2037,11 @@ class AutonomousRacer(Node):
                 self.get_logger().info(
                     f"[ZEBRA] Approach blocked: row center={rc}cm "
                     f"> {zp.trigger_max_center_cm:.1f}cm",
+                    throttle_duration_sec=1.0)
+            elif curve_gate_active:
+                self.get_logger().info(
+                    f"[ZEBRA] Approach blocked: lane still in curve "
+                    f"(curv={lane_curve_now:.2f}, hold={self._lane_hold_curvature:.2f})",
                     throttle_duration_sec=1.0)
         
         if (zres is not None and zres.seen and dist is not None
@@ -2818,6 +2867,7 @@ class AutonomousRacer(Node):
             if self._run_zebra_phase(frame, now):
                 return
         else:
+            curve_gate_active, lane_curve_now = self._curve_gate_state(now)
             # Suppress detection while committing a turn, during the time cooldown,
             # OR until we have driven far enough past the last cross (distance proxy
             # that stops a double intersection from re-firing the one we just left).
@@ -2851,6 +2901,11 @@ class AutonomousRacer(Node):
                     self.get_logger().info(
                         f"[INTERSECTION] Approach blocked: insufficient stability ({self.intersection_stable}/3 frames)",
                         throttle_duration_sec=2.0)
+                elif curve_gate_active:
+                    self.get_logger().info(
+                        f"[INTERSECTION] Approach blocked: lane still in curve "
+                        f"(curv={lane_curve_now:.2f}, hold={self._lane_hold_curvature:.2f})",
+                        throttle_duration_sec=1.0)
                 elif stable_ok_legacy:
                     self.intersection_phase = 'approach'
                     self.intersection_options = result.options
@@ -3264,7 +3319,7 @@ class AutonomousRacer(Node):
                 if self._near_intersection:
                     curve_term = 0.0   # relax anticipation near a cross (no overshoot)
                 w_out = (self.kp * line_error) + (self.kd * derivative) \
-                    + (self.kp * self.ff_gain * curve_term)
+                    + (self.kp * self.ff_gain * self._curve_ff_scale * curve_term)
 
                 curve_factor = max(0.4, 1.0 - (abs(line_error) / frame_center_x))
 
