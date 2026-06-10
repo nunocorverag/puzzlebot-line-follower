@@ -631,6 +631,29 @@ class AutonomousRacer(Node):
         self._curve_memory_s = float(self.get_parameter('curve_memory_s').value)
         self._curve_hold_until = None
         self._curve_hold_value = 0.0
+        # --- Robust curve ARC handler -------------------------------------------
+        # On this track every curve is a ~45 deg LEFT bend. Instead of fighting it
+        # with the PD (which anticipated or under-steered), when a tight curve is
+        # CONFIRMED by the curvature MAGNITUDE (reliable; its sign flips) we drive a
+        # fixed arc -- forward + left -- matching the hand-driven demo (v~0.08,
+        # w~0.30), and exit when the line straightens and re-centers. All live-tunable.
+        self.declare_parameter('curve_arc_enabled', bool(saved.get('curve_arc_enabled', True)))
+        self.declare_parameter('curve_arc_v', float(saved.get('curve_arc_v', 0.08)))        # forward speed during arc
+        self.declare_parameter('curve_arc_w', float(saved.get('curve_arc_w', 0.30)))        # +left angular during arc
+        self.declare_parameter('curve_arc_enter', float(saved.get('curve_arc_enter', 0.60)))    # |curv| to enter the arc
+        self.declare_parameter('curve_arc_exit', float(saved.get('curve_arc_exit', 0.30)))     # |curv| under this (centered) -> exit
+        self.declare_parameter('curve_arc_min_s', float(saved.get('curve_arc_min_s', 0.6)))     # arc at least this long
+        self.declare_parameter('curve_arc_max_s', float(saved.get('curve_arc_max_s', 4.0)))     # safety cap
+        self._curve_arc_enabled = bool(self.get_parameter('curve_arc_enabled').value)
+        self._curve_arc_v = float(self.get_parameter('curve_arc_v').value)
+        self._curve_arc_w = float(self.get_parameter('curve_arc_w').value)
+        self._curve_arc_enter = float(self.get_parameter('curve_arc_enter').value)
+        self._curve_arc_exit = float(self.get_parameter('curve_arc_exit').value)
+        self._curve_arc_min_s = float(self.get_parameter('curve_arc_min_s').value)
+        self._curve_arc_max_s = float(self.get_parameter('curve_arc_max_s').value)
+        self._curve_arc_active = False
+        self._curve_arc_start = None
+        self._curve_arc_enter_count = 0
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -1190,6 +1213,20 @@ class AutonomousRacer(Node):
                 self._curve_heading_gain = float(p.value)
             elif p.name == 'curve_heading_deadband':
                 self._curve_heading_deadband = float(p.value)
+            elif p.name == 'curve_arc_enabled':
+                self._curve_arc_enabled = bool(p.value)
+            elif p.name == 'curve_arc_v':
+                self._curve_arc_v = float(p.value)
+            elif p.name == 'curve_arc_w':
+                self._curve_arc_w = float(p.value)
+            elif p.name == 'curve_arc_enter':
+                self._curve_arc_enter = float(p.value)
+            elif p.name == 'curve_arc_exit':
+                self._curve_arc_exit = float(p.value)
+            elif p.name == 'curve_arc_min_s':
+                self._curve_arc_min_s = float(p.value)
+            elif p.name == 'curve_arc_max_s':
+                self._curve_arc_max_s = float(p.value)
             elif p.name == 'snapshot_interval':
                 self._snapshot_interval = float(p.value)   # live recorder rate (s)
             elif p.name == 'curve_slow_gain':
@@ -1380,6 +1417,13 @@ class AutonomousRacer(Node):
                 'curve_slow_gain': self._curve_slow_gain,
                 'curve_min_scale': self._curve_min_scale,
                 'curve_memory_s': self._curve_memory_s,
+                'curve_arc_enabled': self._curve_arc_enabled,
+                'curve_arc_v': self._curve_arc_v,
+                'curve_arc_w': self._curve_arc_w,
+                'curve_arc_enter': self._curve_arc_enter,
+                'curve_arc_exit': self._curve_arc_exit,
+                'curve_arc_min_s': self._curve_arc_min_s,
+                'curve_arc_max_s': self._curve_arc_max_s,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3198,6 +3242,52 @@ class AutonomousRacer(Node):
                     throttle_duration_sec=1.0,
                 )
 
+        # ---- Robust curve ARC handler (see __init__) --------------------------
+        # When a tight curve is CONFIRMED by curvature magnitude, stop using the PD
+        # and drive a fixed forward+left arc (matching the hand-driven demo) until
+        # the line straightens and re-centers. Hardcoded LEFT: every curve on this
+        # track is a left bend, so we never depend on the (flaky) curvature sign.
+        curve_arc = False
+        if self._curve_arc_enabled:
+            lr_arc = self._last_lane_result
+            arc_detected = lr_arc is not None and lr_arc.detected
+            curv_mag = abs(float(lr_arc.curvature_norm)) if arc_detected else 0.0
+            off_mag = abs(float(lr_arc.offset_norm)) if arc_detected else 1.0
+            in_follow = (self.intersection_phase is None and self.commit_direction is None
+                         and not self._near_intersection and self.time_line_lost is None)
+            if self._curve_arc_active:
+                elapsed = (now - self._curve_arc_start).nanoseconds * 1e-9
+                straightened = (arc_detected and curv_mag < self._curve_arc_exit
+                                and off_mag < 0.25)
+                if (elapsed >= self._curve_arc_min_s and straightened) \
+                        or elapsed >= self._curve_arc_max_s or not in_follow:
+                    self._curve_arc_active = False
+                    self.get_logger().warn(
+                        f"[CURVE] arc done ({elapsed:.1f}s, curv={curv_mag:.2f}) -> FOLLOW",
+                        throttle_duration_sec=0.5)
+                else:
+                    curve_arc = True
+            elif in_follow and arc_detected and curv_mag >= self._curve_arc_enter:
+                self._curve_arc_enter_count += 1
+                if self._curve_arc_enter_count >= 2:   # 2-frame debounce
+                    self._curve_arc_active = True
+                    self._curve_arc_start = now
+                    self._curve_arc_enter_count = 0
+                    curve_arc = True
+                    self.get_logger().warn(
+                        f"[CURVE] arc START (curv={curv_mag:.2f}) -> forward+left",
+                        throttle_duration_sec=0.5)
+            else:
+                self._curve_arc_enter_count = 0
+
+        if curve_arc:
+            base_linear_x = self._curve_arc_v
+            target_angular_z = self._curve_arc_w   # +w = LEFT (every curve here is left)
+            steering_center_x = None               # bypass the PD below
+            self.last_error = 0.0
+            self.last_derivative = 0.0
+            self.last_time = now
+
         # PD Math
         if steering_center_x is not None:
             line_error = frame_center_x - steering_center_x
@@ -3267,7 +3357,7 @@ class AutonomousRacer(Node):
         else:
             self._curve_hold_until = None
             self._curve_hold_value = 0.0
-        if effective_curvature > 0.0:
+        if effective_curvature > 0.0 and not curve_arc:
             base_linear_x *= max(self._curve_min_scale,
                                  1.0 - self._curve_slow_gain * effective_curvature)
 
