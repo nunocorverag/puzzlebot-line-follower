@@ -1099,6 +1099,23 @@ class AutonomousRacer(Node):
                 f"[SIGN] Detected: {signs_summary} | Selected: {res.name or 'none'}",
                 throttle_duration_sec=2.0
             )
+            # Per-frame turn-sign breakdown: shows WHICH stage flips left<->right.
+            # yolo = raw model class, ver = white-arrow verifier winner (+dx_norm),
+            # final = what the node will act on, HELD = hysteresis kept an older
+            # decision over the current frame. Watch this live on the bench.
+            for s in res.all_detections:
+                if s['name'] not in ('turn_left', 'turn_right'):
+                    continue
+                vd = s.get('vote_details') or {}
+                wa = vd.get('white_arrow') or {}
+                yolo_raw = s.get('original_name') or s['name']
+                ver = vd.get('winner')
+                dx = wa.get('dx_norm')
+                dx_s = f"{dx:+.3f}" if isinstance(dx, (int, float)) else "--"
+                held = " HELD" if s.get('decision_hold') else ""
+                self.get_logger().warn(
+                    f"[SIGN-DBG] yolo={yolo_raw} ver={ver}(dx{dx_s}) "
+                    f"final={s['name']}{held} a={s['area_pct']:.1f}% c={s['conf']:.2f}")
             # Event: log all detections with vote details
             detections_for_event = []
             for s in res.all_detections:
