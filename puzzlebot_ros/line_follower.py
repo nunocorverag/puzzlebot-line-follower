@@ -685,11 +685,11 @@ class AutonomousRacer(Node):
         # knob is blind_turn_w (turn rate). It only turns AFTER losing the line.
         self.declare_parameter('blind_turn_enabled', bool(saved.get('blind_turn_enabled', True)))
         self.declare_parameter('blind_turn_w', float(saved.get('blind_turn_w', 0.35)))      # blind turn rate (rad/s)
-        self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.05)))      # slow forward while blind
+        self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.08)))      # forward while blind: radius=v/w; too low pivots & cuts inside
         self.declare_parameter('blind_conf', float(saved.get('blind_conf', 0.5)))           # BEV conf = "line visible"
         self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
-        self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.40)))   # |off| at the edge -> also enter
+        self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.55)))   # |off| at the edge -> also enter (strict)
         self.declare_parameter('blind_min_s', float(saved.get('blind_min_s', 0.3)))         # min blind turn (hysteresis)
         self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
         self.declare_parameter('blind_side_w_min', float(saved.get('blind_side_w_min', 0.015)))  # min |w| to update curve side
@@ -3478,7 +3478,8 @@ class AutonomousRacer(Node):
                     self.last_time = now
             elif (blind_follow and abs(self._curve_side) >= 0.3
                   and (self._blind_lost_frames >= self._blind_enter_frames
-                       or off_now >= self._blind_enter_off)):
+                       or (off_now >= self._blind_enter_off
+                           and abs(self._curve_side) >= 0.6))):
                 # Line LOST, or it has reached the edge (about to leave) in a curve:
                 # commit to a blind turn toward the side the PD was already steering.
                 self._blind_active = True
