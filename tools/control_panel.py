@@ -121,6 +121,7 @@ GROUPS = [
         ("lane_curve_guard_conf",    "f", 0.05,   "conf below this guards curve jumps"),
         ("lane_curve_guard_max_offset", "f", 0.05, "max weak-fit offset in curves"),
         ("lane_curve_hold_assist_conf", "f", 0.05, "use held curve lookahead below conf"),
+        ("lane_curve_reject_conf",   "f", 0.05,   "reject weak fits while holding curve"),
     ]),
     ("Warp", [
         ("lane.src_top_y_pct",       "i", 1,      "warp top y"),
@@ -136,6 +137,7 @@ GROUPS = [
         ("sign_cooldown_s", "f", 0.5,       "same sign cooldown"),
         ("sign_forget_s", "f", 0.5,         "turn forget while FOLLOW"),
         ("sign_lane_mask_margin_px", "i", 2, "mask sign boxes from lane BEV"),
+        ("sign_lane_mask_extend_down_px", "i", 5, "extend sign mask downward"),
     ]),
     ("Traffic", [
         ("traffic_light_roi_y_pct", "i", 1,      "top image pct to search"),
@@ -158,8 +160,8 @@ GROUPS = [
 FIELDS = [(name, kind, step) for _, items in GROUPS for name, kind, step, _ in items]
 FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kind, step, help_text in items}
 DEFAULTS = {
-    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
-    "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "curve_memory_s": 1.20,
+    "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.10, "max_w": 0.6,
+    "curve_slow_gain": 0.6, "curve_min_scale": 0.45, "curve_memory_s": 2.20,
     "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
     "approach_speed": 0.06, "commit_turn_w": 0.6, "commit_turn_pre_advance_cm": 4.0,
@@ -191,7 +193,8 @@ DEFAULTS = {
     "sign_turn_act_area_pct": 1.4, "sign_act_area_pct": 6.0,
     "workers_min_speed": 0.04,
     "sign_cooldown_s": 6.0, "sign_forget_s": 15.0,
-    "sign_lane_mask_margin_px": 18,
+    "sign_lane_mask_margin_px": 32,
+    "sign_lane_mask_extend_down_px": 90,
     "traffic_light_action_min_radius_px": 10.0,
     "traffic_light_action_max_radius_px": 80.0,
     "traffic_light_action_min_distance_cm": 12.0,
@@ -206,10 +209,11 @@ DEFAULTS = {
     "lane.line_open_px": 5, "lane.line_core_px": 7, "lane.fit_max_rmse_px": 28,
     "lane.zebra_row_reject": 1, "lane.zebra_row_fill_pct": 40,
     "lane.zebra_row_close_px": 9, "lane_hold_conf": 0.5, "lane_hold_s": 1.5,
-    "lane_hold_curve_s": 1.20, "lane_hold_curve_min_curv": 0.55,
+    "lane_hold_curve_s": 2.20, "lane_hold_curve_min_curv": 0.55,
     "lane_base_max_jump_pct": 15, "lane_base_hold_s": 1.0,
     "lane_curve_max_jump_pct": 10, "lane_curve_guard_conf": 0.80,
     "lane_curve_guard_max_offset": 0.35, "lane_curve_hold_assist_conf": 0.80,
+    "lane_curve_reject_conf": 0.55,
 }
 
 

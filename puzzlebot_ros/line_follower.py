@@ -406,10 +406,12 @@ class AutonomousRacer(Node):
         # area_pct is a distance proxy: bigger box => closer sign.
         self.declare_parameter('sign_act_area_pct', 6.0)
         self.declare_parameter('sign_turn_act_area_pct', 1.4)
-        self.declare_parameter('sign_lane_mask_margin_px', 18)
+        self.declare_parameter('sign_lane_mask_margin_px', 32)
+        self.declare_parameter('sign_lane_mask_extend_down_px', 90)
         self._sign_act_area_pct = float(self.get_parameter('sign_act_area_pct').value)
         self._sign_turn_act_area_pct = float(self.get_parameter('sign_turn_act_area_pct').value)
         self._sign_lane_mask_margin_px = int(self.get_parameter('sign_lane_mask_margin_px').value)
+        self._sign_lane_mask_extend_down_px = int(self.get_parameter('sign_lane_mask_extend_down_px').value)
         self._use_signs = bool(self.get_parameter('use_signs').value)
         self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
         self._workers_min_speed = float(self.get_parameter('workers_min_speed').value)
@@ -486,7 +488,7 @@ class AutonomousRacer(Node):
             self.get_logger().warn('control_params.json not found; using defaults')
         self.declare_parameter('kp', float(saved.get('kp', 0.003)))
         self.declare_parameter('kd', float(saved.get('kd', 0.008)))
-        self.declare_parameter('max_v', float(saved.get('max_v', 0.08)))
+        self.declare_parameter('max_v', float(saved.get('max_v', 0.10)))
         self.declare_parameter('max_w', float(saved.get('max_w', 0.6)))
         # Curve feedforward: steer ahead by the bend (far offset - near offset),
         # weighted by ff_gain and the SAME kp. 0 = pure feedback (old behavior);
@@ -616,8 +618,8 @@ class AutonomousRacer(Node):
         self.declare_parameter('use_birdseye', True)
         self.declare_parameter('lane_params_path', '')
         self.declare_parameter('curve_slow_gain', 0.6)   # speed *= 1 - gain*|curv|
-        self.declare_parameter('curve_min_scale', 0.4)   # never below this fraction
-        self.declare_parameter('curve_memory_s', 1.20)   # keep slowing briefly after a tight curve
+        self.declare_parameter('curve_min_scale', 0.45)  # never below this fraction
+        self.declare_parameter('curve_memory_s', 2.20)   # keep slowing briefly after a tight curve
         self._use_birdseye = bool(self.get_parameter('use_birdseye').value)
         self._curve_slow_gain = float(self.get_parameter('curve_slow_gain').value)
         self._curve_min_scale = float(self.get_parameter('curve_min_scale').value)
@@ -653,7 +655,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_hold_near_cross', bool(saved.get('lane_hold_near_cross', True)))
         self.declare_parameter('lane_hold_conf', float(saved.get('lane_hold_conf', 0.5)))
         self.declare_parameter('lane_hold_s', float(saved.get('lane_hold_s', 1.5)))
-        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 1.20)))
+        self.declare_parameter('lane_hold_curve_s', float(saved.get('lane_hold_curve_s', 2.20)))
         self.declare_parameter('lane_hold_curve_min_curv', float(saved.get('lane_hold_curve_min_curv', 0.55)))
         self._lane_hold_near_cross = bool(self.get_parameter('lane_hold_near_cross').value)
         self._lane_hold_conf = float(self.get_parameter('lane_hold_conf').value)
@@ -682,12 +684,14 @@ class AutonomousRacer(Node):
         self.declare_parameter('lane_curve_guard_conf', float(saved.get('lane_curve_guard_conf', 0.80)))
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
         self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.80)))
+        self.declare_parameter('lane_curve_reject_conf', float(saved.get('lane_curve_reject_conf', 0.55)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
         self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
         self._lane_curve_guard_conf = float(self.get_parameter('lane_curve_guard_conf').value)
         self._lane_curve_guard_max_offset = float(self.get_parameter('lane_curve_guard_max_offset').value)
         self._lane_curve_hold_assist_conf = float(self.get_parameter('lane_curve_hold_assist_conf').value)
+        self._lane_curve_reject_conf = float(self.get_parameter('lane_curve_reject_conf').value)
         self._lane_good_base = None      # last accepted base x (warped px)
         self._lane_good_base_time = None # when it was accepted (for the timeout)
 
@@ -1137,6 +1141,7 @@ class AutonomousRacer(Node):
         masked = frame.copy()
         h, w = masked.shape[:2]
         margin = int(self._sign_lane_mask_margin_px)
+        extend_down = max(0, int(self._sign_lane_mask_extend_down_px))
         for det in detections:
             box = det.get("box") if isinstance(det, dict) else None
             if box is None:
@@ -1145,7 +1150,7 @@ class AutonomousRacer(Node):
             x0 = max(0, x1 - margin)
             y0 = max(0, y1 - margin)
             x3 = min(w, x2 + margin)
-            y3 = min(h, y2 + margin)
+            y3 = min(h, y2 + margin + extend_down)
             if x3 <= x0 or y3 <= y0:
                 continue
             masked[y0:y3, x0:x3] = (210, 210, 210)
@@ -1241,6 +1246,8 @@ class AutonomousRacer(Node):
                 self._lane_curve_guard_max_offset = float(p.value)
             elif p.name == 'lane_curve_hold_assist_conf':
                 self._lane_curve_hold_assist_conf = float(p.value)
+            elif p.name == 'lane_curve_reject_conf':
+                self._lane_curve_reject_conf = float(p.value)
             elif p.name == 'k_align':
                 self._k_align = float(p.value)
             elif p.name == 'intersection_slow_speed':
@@ -1335,6 +1342,8 @@ class AutonomousRacer(Node):
                 self._sign_turn_act_area_pct = float(p.value)
             elif p.name == 'sign_lane_mask_margin_px':
                 self._sign_lane_mask_margin_px = int(p.value)
+            elif p.name == 'sign_lane_mask_extend_down_px':
+                self._sign_lane_mask_extend_down_px = int(p.value)
             elif p.name == 'detect_distance_cm':
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
@@ -1412,6 +1421,7 @@ class AutonomousRacer(Node):
                 'lane_curve_guard_conf': self._lane_curve_guard_conf,
                 'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
                 'lane_curve_hold_assist_conf': self._lane_curve_hold_assist_conf,
+                'lane_curve_reject_conf': self._lane_curve_reject_conf,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
                 'approach_align_slope': self._approach_align_slope,
@@ -1429,6 +1439,7 @@ class AutonomousRacer(Node):
                 'sign_cooldown_s': self._sign_cooldown_s,
                 'sign_forget_s': self._sign_forget_s,
                 'sign_lane_mask_margin_px': self._sign_lane_mask_margin_px,
+                'sign_lane_mask_extend_down_px': self._sign_lane_mask_extend_down_px,
                 'workers_min_speed': self._workers_min_speed,
                 'advance_lane_keep_gain': self._advance_lane_keep_gain,
                 'advance_lane_keep_max_w': self._advance_lane_keep_max_w,
@@ -2976,6 +2987,11 @@ class AutonomousRacer(Node):
                     abs(float(lane_result.curvature_norm)) >= self._lane_hold_curve_min_curv
                     or self._lane_hold_curvature >= self._lane_hold_curve_min_curv
                 )
+                recent_curve_hold = (
+                    self._lane_hold_time is not None
+                    and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                    and (now - self._lane_hold_time).nanoseconds * 1e-9 <= self._lane_hold_curve_s
+                )
                 weak_curve_fit = lane_result.confidence < self._lane_curve_guard_conf
                 jump_reason = None
                 max_jump_pct = None
@@ -2995,6 +3011,14 @@ class AutonomousRacer(Node):
                         self.get_logger().warn(
                             f"[LANE] curve fit outlier off={lane_result.offset_norm:+.2f} "
                             f"conf={lane_result.confidence:.2f} rejected",
+                            throttle_duration_sec=0.5)
+                    elif (recent_curve_hold
+                          and self._lane_curve_reject_conf > 0.0
+                          and lane_result.confidence <= self._lane_curve_reject_conf):
+                        curve_fit_outlier = True
+                        self.get_logger().warn(
+                            f"[LANE] weak curve fit conf={lane_result.confidence:.2f} "
+                            "rejected; holding previous curve target",
                             throttle_duration_sec=0.5)
                 if max_jump_pct is not None:
                     max_jump = self.lane_params.warp_w * max_jump_pct / 100.0
