@@ -24,7 +24,7 @@
   "blind_heading_min": 0.25,
   "blind_min_s": 0.3,
   "blind_side_w_min": 0.015,
-  "blind_max_s": 5.0,
+  "blind_max_s": 3.7,
   "curve_arc_enabled": true,
   "curve_arc_v": 0.08,
   "curve_arc_w": 0.36,
