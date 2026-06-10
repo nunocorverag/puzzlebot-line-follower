@@ -295,17 +295,36 @@ class Tuner(Node):
         self.get_cli = self.create_client(GetParameters, f"/{TARGET_NODE}/get_parameters")
         self._connected = False
         self._params_loaded = False
+        self._waited_ticks = 0
         self.msg = f"waiting for /{TARGET_NODE} params service..."
         # Poll the GET-parameters service asynchronously until it answers with
         # the live node values. The SET service can be discovered before GET,
         # so waiting on SET (or /lane_status telemetry) is NOT proof the panel
         # has the real values -- it would silently show DEFAULTS otherwise.
+        # The panel often starts WHILE the follower is still booting (camera
+        # init ~10-15s). A service client created before its server exists can
+        # stay blind to the late-joining server in FastDDS, so we recreate the
+        # clients while waiting -- a fresh client discovers an up node in ~0s.
         self.create_timer(1.0, self._try_load_params)
+
+    def _recreate_clients(self):
+        try:
+            self.destroy_client(self.get_cli)
+            self.destroy_client(self.set_cli)
+        except Exception:
+            pass
+        self.set_cli = self.create_client(SetParameters, f"/{TARGET_NODE}/set_parameters")
+        self.get_cli = self.create_client(GetParameters, f"/{TARGET_NODE}/get_parameters")
 
     def _try_load_params(self):
         if self._params_loaded:
             return
         if not self.get_cli.service_is_ready():
+            # Recreate after a couple of failed ticks to force fresh discovery.
+            self._waited_ticks += 1
+            if self._waited_ticks >= 2:
+                self._waited_ticks = 0
+                self._recreate_clients()
             self.msg = f"waiting for /{TARGET_NODE} params service..."
             return
         names = [f[0] for f in FIELDS]
