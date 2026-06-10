@@ -19,7 +19,7 @@
   "base_search_half_w_pct": 26,
   "min_fill_pct": 1,
   "max_fill_pct": 55,
-  "dual_line": 1,
+  "dual_line": 0,
   "min_line_gap_pct": 14,
   "lane_half_px": 90,
   "continuity": 1,

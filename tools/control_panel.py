@@ -207,7 +207,7 @@ DEFAULTS = {
     "traffic_light_action_min_distance_cm": 12.0,
     "traffic_light_action_max_distance_cm": 45.0,
     "traffic_light_distance_k_cm_px": 360.0,
-    "lane.dual_line": 1, "lane.lane_half_px": 90, "lane.min_line_gap_pct": 14,
+    "lane.dual_line": 0, "lane.lane_half_px": 90, "lane.min_line_gap_pct": 14,
     "lane.eval_y_pct": 72, "lane.lookahead_y_pct": 45,
     "lane.continuity": 1, "lane.base_hist_h_pct": 18,
     "lane.src_top_y_pct": 55, "lane.src_top_half_w_pct": 14,

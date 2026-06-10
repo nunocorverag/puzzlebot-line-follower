@@ -107,7 +107,7 @@ class LaneParams:
     # border (the "goes to the right line on curves" bug). With dual_line we find
     # BOTH lines and steer on their midpoint; if only one is visible (tight curve)
     # we offset it by half the lane width to recover the center.
-    dual_line: int = 1             # 1 = follow midpoint of the two border lines.
+    dual_line: int = 0             # 1 = follow midpoint of the two border lines.
     min_line_gap_pct: int = 14     # min separation between the two line bases
     lane_half_px: int = 90         # half lane width in warp px (auto-updates when
                                    # both lines are seen; used for 1-line fallback)
@@ -404,10 +404,7 @@ def _dual_line_fit(mask: np.ndarray, params: LaneParams):
         a, b, c = t["fit"]
         center_fit = (a, b, c + sign * half)
         base_x = t["base"] + sign * half
-        # A single border is useful on tight curves, but it is less reliable
-        # than seeing both borders. Penalize confidence so the runtime hold/
-        # continuity guards keep control instead of chasing an extreme edge.
-        found = max(0, t["found"] - 2)
+        found = t["found"]
         centers = t["centers"]
 
     return {"fit": center_fit, "base_x": base_x, "window_centers": centers,
