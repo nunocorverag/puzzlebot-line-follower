@@ -64,6 +64,22 @@ def _canon(raw) -> str | None:
     return None
 
 
+def _box_iou(a, b) -> float:
+    if a is None or b is None:
+        return 0.0
+    ax1, ay1, ax2, ay2 = (float(v) for v in a)
+    bx1, by1, bx2, by2 = (float(v) for v in b)
+    ix1, iy1 = max(ax1, bx1), max(ay1, by1)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+    inter = iw * ih
+    if inter <= 0.0:
+        return 0.0
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+    return inter / max(1.0, area_a + area_b - inter)
+
+
 def _verify_arrow_direction(frame, box):
     """Verify arrow direction by analyzing the sign's ROI using multiple robust methods.
     
@@ -534,8 +550,18 @@ class SignDetector:
             self._stable_name = best.name
             self._stable_count = 1 if best.name is not None else 0
 
+        top = all_signs[0] if all_signs else None
+        top_votes = (top or {}).get('vote_details') or {}
+        strong_winner = top_votes.get('winner') if top_votes.get('reason') == 'white_arrow_geometry' else None
+        same_physical_box = (
+            self._last_decision is not None
+            and top is not None
+            and _box_iou(top.get('box'), self._last_decision.get('box')) >= 0.20
+        )
+
         needed = self.p.stable_needed
-        if (self._last_decision is not None
+        if (same_physical_box
+                and strong_winner is None
                 and best.name in ('turn_left', 'turn_right')
                 and self._last_decision.get('name') in ('turn_left', 'turn_right')
                 and best.name != self._last_decision.get('name')):
@@ -549,7 +575,10 @@ class SignDetector:
                 'box': best.box,
                 'area_pct': best.area_pct,
             }
-        elif all_signs and self._last_decision is not None:
+        elif (same_physical_box
+              and top is not None
+              and top.get('name') in ('turn_left', 'turn_right')
+              and self._last_decision.get('name') in ('turn_left', 'turn_right')):
             held = dict(all_signs[0])
             held['name'] = self._last_decision['name']
             held['original_name'] = all_signs[0]['name']
@@ -562,6 +591,8 @@ class SignDetector:
                 all_detections=[held] + all_signs[1:],
             )
         else:
+            if top is not None and not same_physical_box:
+                self._last_decision = None
             result = SignResult(all_detections=all_signs if all_signs else None)
         self._last = result
         return result
