@@ -3287,22 +3287,12 @@ class AutonomousRacer(Node):
                     self.time_line_lost = now
                 elapsed_time = (now - self.time_line_lost).nanoseconds * 1e-9
 
-                # Turn toward the last reliable curve first. Using only last_error
-                # is unsafe here: weak fallback fits can flip its sign exactly when
-                # the robot loses a tight curve, sending recovery to the wrong side.
-                curve_age = (
-                    1e9 if self._lane_hold_time is None
-                    else (now - self._lane_hold_time).nanoseconds * 1e-9
-                )
-                recover_dir = 0.0
+                # Recover toward where the line actually was. The curvature SIGN is
+                # unreliable here and was inverted vs the steering sign (a LEFT curve
+                # reads curv=-1 yet needs w>0), so a curvature-based recover spun the
+                # wrong way. last_error's sign matches w directly, so steer by it.
+                recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
                 recover_reason = "error"
-                if (self._lane_hold_curvature >= self._lane_hold_curve_min_curv
-                        and curve_age <= self._lane_curve_dropout_s + self._recover_seconds
-                        and abs(self._lane_hold_signed_curvature) > 1e-3):
-                    recover_dir = 1.0 if self._lane_hold_signed_curvature > 0.0 else -1.0
-                    recover_reason = "curve"
-                else:
-                    recover_dir = 1.0 if self.last_error > 0 else (-1.0 if self.last_error < 0 else 0.0)
                 if elapsed_time < self._recover_seconds:
                     base_linear_x    = self._recover_speed
                     target_angular_z = self._recover_turn * recover_dir
@@ -3355,27 +3345,12 @@ class AutonomousRacer(Node):
                 if base_linear_x == 0.0:
                     base_linear_x = self.max_v * curve_factor
 
+                # NOTE: the curvature-sign "curve direction guard" was removed. Its
+                # sign was inverted vs the steering sign, so on these (always-left)
+                # curves it flipped a correct strong kp turn into a weak opposite one
+                # (e.g. err=+150 -> w=-0.075). Plain kp*error + feedforward steers the
+                # curve correctly, as it did before the afternoon regressions.
                 target_angular_z = max(-self.max_w, min(self.max_w, w_out))
-                curve_age = (
-                    1e9 if self._lane_hold_time is None
-                    else (now - self._lane_hold_time).nanoseconds * 1e-9
-                )
-                if (self._lane_curve_min_turn_w > 0.0
-                        and self.intersection_phase is None
-                        and self.commit_direction is None
-                        and not self._near_intersection
-                        and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
-                        and curve_age <= self._lane_curve_dropout_s
-                        and abs(self._lane_hold_signed_curvature) > 1e-3):
-                    curve_dir = 1.0 if self._lane_hold_signed_curvature > 0.0 else -1.0
-                    min_curve_w = min(abs(self._lane_curve_min_turn_w), self.max_w)
-                    if target_angular_z * curve_dir < min_curve_w:
-                        prev_w = target_angular_z
-                        target_angular_z = curve_dir * min_curve_w
-                        self.get_logger().warn(
-                            f"[CONTROL] curve direction guard W {prev_w:+.3f}->{target_angular_z:+.3f} "
-                            f"(curv={self._lane_hold_signed_curvature:+.2f})",
-                            throttle_duration_sec=0.5)
 
                 self.get_logger().info(
                     f"[MATH] Error: {line_error:.1f} | Deriv: {derivative:.1f} | "
