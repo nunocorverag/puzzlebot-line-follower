@@ -320,6 +320,7 @@ class Tuner(Node):
         self.decision_pub = self.create_publisher(String, "/intersection_decision", 10)
         self.reset_pub = self.create_publisher(Bool, "/intersection_reset", 10)
         self.recorder_pub = self.create_publisher(Bool, "/recorder_enable", 10)
+        self.recorder_reset_pub = self.create_publisher(Bool, "/recorder_reset", 10)
         self.set_cli = self.create_client(SetParameters, f"/{TARGET_NODE}/set_parameters")
         self.get_cli = self.create_client(GetParameters, f"/{TARGET_NODE}/get_parameters")
         self._connected = False
@@ -434,6 +435,10 @@ class Tuner(Node):
         self.recorder_pub.publish(Bool(data=self.recording))
         self.msg = f"REC {'ON' if self.recording else 'off'}"
 
+    def reset_recording(self):
+        self.recorder_reset_pub.publish(Bool(data=True))
+        self.msg = "REC reset -> session starts from 0"
+
 
 STEP_MULTS = [0.1, 0.5, 1.0, 2.0, 5.0, 10.0]
 
@@ -492,7 +497,7 @@ def _draw(stdscr, tuner, page_idx, sel):
     status = (f"drive:{drive}  rec:{rec}  off:{off:+.2f} conf:{conf:.2f} "
               f"curv:{curv:+.2f} v:{v:.3f} w:{w:+.2f}")
     _safe_addstr(stdscr, 3, 2, status, curses.A_BOLD if tuner.drive_on else curses.A_NORMAL)
-    _safe_addstr(stdscr, 4, 2, "Cmd: [d] drive [r] REC [1/2/3] L/S/R [0] reset [s] save [q] quit+pull")
+    _safe_addstr(stdscr, 4, 2, "Cmd: [d] drive [r] REC [R] reset REC [1/2/3] L/S/R [0] reset [s] save [q] quit+pull")
     _safe_addstr(stdscr, 5, 2, f"Nav: [Tab h/l] page  [j/k] select  [-/=] nudge  [[/]] step x{tuner.step_mult:g}")
     _safe_addstr(stdscr, 6, 2, "-" * max(20, min(90, max_x - 4)))
 
@@ -583,6 +588,8 @@ def _loop(stdscr, tuner):
             tuner.reset_intersection()
         elif key == ord("r"):
             tuner.toggle_recording()
+        elif key == ord("R"):
+            tuner.reset_recording()
 
 def main():
     rclpy.init()

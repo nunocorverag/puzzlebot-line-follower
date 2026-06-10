@@ -798,7 +798,19 @@ class AutonomousRacer(Node):
         self.declare_parameter('controller_log_path', '')
         self._csv_fp = None
         self._csv_writer = None
+        self._csv_path = None
+        self._csv_header = [
+            't', 'state', 'phase', 'commit', 'pending', 'decision', 'options',
+            'lane_src', 'off', 'conf', 'curv', 'base_x',
+            'z_seen', 'z_dist_cm', 'z_angle_deg', 'z_ndashes', 'z_span_cm',
+            'z_options', 'near_intersection',
+            'error', 'deriv', 'v', 'w',
+            'kp', 'kd', 'ff_gain', 'max_v', 'max_w',
+            'stop_cm', 'slow_cm', 'commit_min_s', 'commit_turn_w',
+            'curve_side', 'blind', 'blind_dir',
+        ]
         self._event_fp = None
+        self._event_path = None
         self._t0 = self.get_clock().now()
         self._loop_stage = 'init'
         self._last_commit_tick_t = None
@@ -806,22 +818,12 @@ class AutonomousRacer(Node):
             log_path = str(self.get_parameter('controller_log_path').value).strip() or \
                 str(self._snapshot_dir() / 'controller_data.csv')
             try:
-                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-                self._csv_fp = open(log_path, 'w', newline='')
-                self._csv_writer = csv.writer(self._csv_fp)
-                self._csv_writer.writerow([
-                    't', 'state', 'phase', 'commit', 'pending', 'decision', 'options',
-                    'lane_src', 'off', 'conf', 'curv', 'base_x',
-                    'z_seen', 'z_dist_cm', 'z_angle_deg', 'z_ndashes', 'z_span_cm',
-                    'z_options', 'near_intersection',
-                    'error', 'deriv', 'v', 'w',
-                    'kp', 'kd', 'ff_gain', 'max_v', 'max_w',
-                    'stop_cm', 'slow_cm', 'commit_min_s', 'commit_turn_w',
-                    'curve_side', 'blind', 'blind_dir'])
+                self._csv_path = Path(log_path)
+                self._open_csv_logger('w')
                 self.get_logger().info(f'[LOG] controller CSV -> {log_path}')
             except OSError as exc:
                 self.get_logger().error(f'[LOG] could not open CSV ({exc}); disabled')
-                self._csv_fp = self._csv_writer = None
+                self._csv_fp = self._csv_writer = self._csv_path = None
         self.declare_parameter('session_log', True)
         self.declare_parameter('session_log_path', '')
         if bool(self.get_parameter('session_log').value):
@@ -829,12 +831,12 @@ class AutonomousRacer(Node):
             if not log_path:
                 log_path = str(self._snapshot_dir() / 'events.jsonl')
             try:
-                Path(log_path).parent.mkdir(parents=True, exist_ok=True)
-                self._event_fp = open(log_path, 'a', buffering=1)
+                self._event_path = Path(log_path)
+                self._open_event_logger('a')
                 self.get_logger().info(f'[LOG] session events -> {log_path}')
             except OSError as exc:
                 self.get_logger().error(f'[LOG] could not open events log ({exc}); disabled')
-                self._event_fp = None
+                self._event_fp = self._event_path = None
 
         # Operator reset for the intersection state machine
         # (scripts/set_intersection_jetson.sh reset): clears phase/decision/commit.
@@ -872,6 +874,7 @@ class AutonomousRacer(Node):
         self._last_snap_t = self.get_clock().now()
         self._snap_count = 0
         self.create_subscription(Bool, '/recorder_enable', self._recorder_cb, 10)
+        self.create_subscription(Bool, '/recorder_reset', self._recorder_reset_cb, 10)
 
         # Live PD/warp tuning via ros2 param set (param tuner / rqt_reconfigure /
         # scripts/set_gain_jetson.sh). Registered LAST so it sees all declarations.
@@ -1720,6 +1723,58 @@ class AutonomousRacer(Node):
             f'[REC] recording {"ON" if self._recording else "off"} '
             f'(total snaps: {self._snap_count})')
         self._event('recorder', enabled=self._recording, snaps=self._snap_count)
+
+    def _open_csv_logger(self, mode='w'):
+        if self._csv_path is None:
+            return
+        self._csv_path.parent.mkdir(parents=True, exist_ok=True)
+        self._csv_fp = open(self._csv_path, mode, newline='')
+        self._csv_writer = csv.writer(self._csv_fp)
+        if mode == 'w':
+            self._csv_writer.writerow(self._csv_header)
+            self._csv_fp.flush()
+
+    def _open_event_logger(self, mode='a'):
+        if self._event_path is None:
+            return
+        self._event_path.parent.mkdir(parents=True, exist_ok=True)
+        self._event_fp = open(self._event_path, mode, buffering=1)
+
+    def _recorder_reset_cb(self, msg):
+        if not bool(msg.data):
+            return
+        was_recording = self._recording
+        self._recording = False
+        try:
+            if self._csv_fp is not None:
+                self._csv_fp.close()
+            if self._event_fp is not None:
+                self._event_fp.close()
+        except Exception:
+            pass
+        self._csv_fp = self._csv_writer = self._event_fp = None
+
+        d = self._snapshot_dir()
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            for path in d.glob('follow_*.jpg'):
+                path.unlink(missing_ok=True)
+            for name in ('events.jsonl', 'controller_data.csv', 'control_exceptions.log'):
+                (d / name).unlink(missing_ok=True)
+            self._snap_count = 0
+            self._t0 = self.get_clock().now()
+            self._last_snap_t = self._t0
+            self._last_commit_tick_t = None
+            self._open_csv_logger('w')
+            self._open_event_logger('w')
+            self._recording = was_recording
+            self.get_logger().warn(f'[REC] RESET session (recording={"ON" if self._recording else "off"})')
+            self._event('recorder_reset', enabled=self._recording, snaps=self._snap_count)
+        except OSError as exc:
+            self.get_logger().error(f'[REC] reset failed: {exc}')
+            self._open_csv_logger('a')
+            self._open_event_logger('a')
+            self._recording = was_recording
 
     def _event(self, name, **fields):
         if self._event_fp is None:
