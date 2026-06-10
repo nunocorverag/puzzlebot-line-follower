@@ -294,38 +294,51 @@ class Tuner(Node):
         self.set_cli = self.create_client(SetParameters, f"/{TARGET_NODE}/set_parameters")
         self.get_cli = self.create_client(GetParameters, f"/{TARGET_NODE}/get_parameters")
         self._connected = False
-        if self.set_cli.wait_for_service(timeout_sec=30.0):
-            self._read_current()
-            self._connected = True
-            self.msg = f"connected to /{TARGET_NODE}"
-        else:
-            self.msg = f"WARN: /{TARGET_NODE} not found -- is the follower running?"
-        self.create_timer(10.0, self._retry_connect)
+        self._params_loaded = False
+        self.msg = f"waiting for /{TARGET_NODE} params service..."
+        # Poll the GET-parameters service asynchronously until it answers with
+        # the live node values. The SET service can be discovered before GET,
+        # so waiting on SET (or /lane_status telemetry) is NOT proof the panel
+        # has the real values -- it would silently show DEFAULTS otherwise.
+        self.create_timer(1.0, self._try_load_params)
 
-    def _retry_connect(self):
-        if self._connected:
+    def _try_load_params(self):
+        if self._params_loaded:
             return
-        if self.set_cli.service_is_ready():
-            self._read_current()
+        if not self.get_cli.service_is_ready():
+            self.msg = f"waiting for /{TARGET_NODE} params service..."
+            return
+        names = [f[0] for f in FIELDS]
+        req = GetParameters.Request()
+        req.names = names
+        fut = self.get_cli.call_async(req)
+        fut.add_done_callback(lambda f: self._on_params(f, names))
+
+    def _on_params(self, fut, names):
+        try:
+            res = fut.result()
+        except Exception as exc:
+            self.msg = f"param read failed: {exc}"
+            return
+        if res is None or not res.values:
+            return
+        got = 0
+        for name, pv in zip(names, res.values):
+            val = _pv_to_py(pv)
+            if val is not None:
+                self.values[name] = val
+                got += 1
+        if got:
+            self._params_loaded = True
             self._connected = True
-            self.msg = f"connected to /{TARGET_NODE}"
+            self.msg = f"connected to /{TARGET_NODE} ({got} live params)"
 
     def _status_cb(self, msg):
         if len(msg.data) >= 5:
             self.metrics = list(msg.data[:5])
 
     def _read_current(self):
-        req = GetParameters.Request()
-        req.names = [f[0] for f in FIELDS]
-        fut = self.get_cli.call_async(req)
-        rclpy.spin_until_future_complete(self, fut, timeout_sec=4.0)
-        res = fut.result()
-        if res is None:
-            return
-        for name, pv in zip(req.names, res.values):
-            val = _pv_to_py(pv)
-            if val is not None:
-                self.values[name] = val
+        self._try_load_params()
 
     def set_value(self, name, kind, value):
         if kind == "b":
