@@ -678,6 +678,30 @@ class AutonomousRacer(Node):
         self._curve_arc_exit_count = 0
         self._curve_arc_phase = 'turn'      # 'turn' (pre+left) | 'post' (advance+recenter)
         self._curve_arc_post_start = None
+        # --- BLIND TURN (primary tight-curve handler; replaces the timer arc) ----
+        # Follow closed-loop while the line is visible; when it is LOST, turn toward
+        # the side it was going (auto left/right) until it re-appears near center.
+        # Event-driven: the line decides when to stop turning, not a timer. The main
+        # knob is blind_turn_w (turn rate). It only turns AFTER losing the line.
+        self.declare_parameter('blind_turn_enabled', bool(saved.get('blind_turn_enabled', True)))
+        self.declare_parameter('blind_turn_w', float(saved.get('blind_turn_w', 0.35)))      # blind turn rate (rad/s)
+        self.declare_parameter('blind_turn_v', float(saved.get('blind_turn_v', 0.05)))      # slow forward while blind
+        self.declare_parameter('blind_conf', float(saved.get('blind_conf', 0.5)))           # BEV conf = "line visible"
+        self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.45)))  # |off| to call it back
+        self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
+        self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
+        self._blind_turn_enabled = bool(self.get_parameter('blind_turn_enabled').value)
+        self._blind_turn_w = float(self.get_parameter('blind_turn_w').value)
+        self._blind_turn_v = float(self.get_parameter('blind_turn_v').value)
+        self._blind_conf = float(self.get_parameter('blind_conf').value)
+        self._blind_reacquire_off = float(self.get_parameter('blind_reacquire_off').value)
+        self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
+        self._blind_max_s = float(self.get_parameter('blind_max_s').value)
+        self._curve_side = 0.0          # smoothed turn-side memory (+left / -right)
+        self._blind_lost_frames = 0
+        self._blind_active = False
+        self._blind_start = None
+        self._blind_dir = 0.0
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -1241,6 +1265,20 @@ class AutonomousRacer(Node):
                 self._curve_heading_gain = float(p.value)
             elif p.name == 'curve_heading_deadband':
                 self._curve_heading_deadband = float(p.value)
+            elif p.name == 'blind_turn_enabled':
+                self._blind_turn_enabled = bool(p.value)
+            elif p.name == 'blind_turn_w':
+                self._blind_turn_w = float(p.value)
+            elif p.name == 'blind_turn_v':
+                self._blind_turn_v = float(p.value)
+            elif p.name == 'blind_conf':
+                self._blind_conf = float(p.value)
+            elif p.name == 'blind_reacquire_off':
+                self._blind_reacquire_off = float(p.value)
+            elif p.name == 'blind_enter_frames':
+                self._blind_enter_frames = int(p.value)
+            elif p.name == 'blind_max_s':
+                self._blind_max_s = float(p.value)
             elif p.name == 'curve_arc_enabled':
                 self._curve_arc_enabled = bool(p.value)
             elif p.name == 'curve_arc_v':
@@ -1464,6 +1502,13 @@ class AutonomousRacer(Node):
                 'curve_arc_pre_s': self._curve_arc_pre_s,
                 'curve_arc_post_s': self._curve_arc_post_s,
                 'curve_arc_recenter_s': self._curve_arc_recenter_s,
+                'blind_turn_enabled': self._blind_turn_enabled,
+                'blind_turn_w': self._blind_turn_w,
+                'blind_turn_v': self._blind_turn_v,
+                'blind_conf': self._blind_conf,
+                'blind_reacquire_off': self._blind_reacquire_off,
+                'blind_enter_frames': self._blind_enter_frames,
+                'blind_max_s': self._blind_max_s,
                 'lane_hold_near_cross': self._lane_hold_near_cross,
                 'lane_hold_conf': self._lane_hold_conf,
                 'lane_hold_s': self._lane_hold_s,
@@ -3288,7 +3333,7 @@ class AutonomousRacer(Node):
         # the line straightens and re-centers. Hardcoded LEFT: every curve on this
         # track is a left bend, so we never depend on the (flaky) curvature sign.
         curve_arc = False
-        if self._curve_arc_enabled:
+        if self._curve_arc_enabled and not self._blind_turn_enabled:
             lr_arc = self._last_lane_result
             arc_detected = lr_arc is not None and lr_arc.detected
             curv_mag = abs(float(lr_arc.curvature_norm)) if arc_detected else 0.0
@@ -3365,6 +3410,63 @@ class AutonomousRacer(Node):
             self.last_error = 0.0
             self.last_derivative = 0.0
             self.last_time = now
+
+        # ---- BLIND TURN until re-acquire (robust tight-curve handler) ----------
+        # Tight 45-deg curves sweep the line out of the warp, so we LOSE it mid-turn
+        # -- no controller follows what it can't see. So: follow closed-loop (PD)
+        # while the line is VISIBLE, remembering which way it is going; the moment we
+        # LOSE it, turn that way at a fixed rate (slow forward) until it comes back
+        # near center, then resume PD. Event-driven (no timers), auto left/right, and
+        # it only turns AFTER losing the line, so it never cuts the curve early.
+        if self._blind_turn_enabled:
+            lr_b = self._last_lane_result
+            bev_ok = (lr_b is not None and lr_b.detected
+                      and lr_b.confidence >= self._blind_conf
+                      and lr_b.lane_center_x_orig is not None)
+            blind_follow = (self.intersection_phase is None and self.commit_direction is None
+                            and not self._near_intersection)
+            if bev_ok and blind_follow:
+                # remember the turn side from where the line is (err sign == w sign)
+                err_b = frame_center_x - float(lr_b.lane_center_x_orig)
+                side = 1.0 if err_b > 0 else (-1.0 if err_b < 0 else 0.0)
+                self._curve_side = 0.6 * self._curve_side + 0.4 * side
+                self._blind_lost_frames = 0
+            elif blind_follow:
+                self._blind_lost_frames += 1
+
+            if self._blind_active:
+                elapsed_b = (now - self._blind_start).nanoseconds * 1e-9
+                off_b = abs(float(lr_b.offset_norm)) if bev_ok else 1.0
+                reacquired = bev_ok and off_b <= self._blind_reacquire_off
+                if reacquired or elapsed_b >= self._blind_max_s or not blind_follow:
+                    self._blind_active = False
+                    self.get_logger().warn(
+                        f"[BLIND] done (reacquired={reacquired}, {elapsed_b:.1f}s) -> FOLLOW",
+                        throttle_duration_sec=0.5)
+                else:
+                    base_linear_x = self._blind_turn_v
+                    target_angular_z = self._blind_dir * self._blind_turn_w
+                    steering_center_x = None          # bypass PD + suppress recover
+                    self.time_line_lost = None
+                    self.last_error = 0.0
+                    self.last_derivative = 0.0
+                    self.last_time = now
+            elif (blind_follow and self._blind_lost_frames >= self._blind_enter_frames
+                  and abs(self._curve_side) >= 0.3):
+                # line lost while following -> commit to a blind turn toward its side
+                self._blind_active = True
+                self._blind_start = now
+                self._blind_dir = 1.0 if self._curve_side > 0 else -1.0
+                base_linear_x = self._blind_turn_v
+                target_angular_z = self._blind_dir * self._blind_turn_w
+                steering_center_x = None
+                self.time_line_lost = None
+                self.last_error = 0.0
+                self.last_derivative = 0.0
+                self.last_time = now
+                self.get_logger().warn(
+                    f"[BLIND] line lost -> turning {'LEFT' if self._blind_dir > 0 else 'RIGHT'} "
+                    f"(side={self._curve_side:+.2f})", throttle_duration_sec=0.5)
 
         # PD Math
         if steering_center_x is not None:
