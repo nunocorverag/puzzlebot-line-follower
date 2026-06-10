@@ -686,15 +686,19 @@ class AutonomousRacer(Node):
         #     lane_base_max_jump_pct of the warp width from the last good base.
         self.declare_parameter('lane_base_hold_s', float(saved.get('lane_base_hold_s', 1.0)))
         self.declare_parameter('lane_base_max_jump_pct', int(saved.get('lane_base_max_jump_pct', 15)))
+        self.declare_parameter('lane_base_edge_margin_pct', int(saved.get('lane_base_edge_margin_pct', 12)))
         self.declare_parameter('lane_curve_max_jump_pct', int(saved.get('lane_curve_max_jump_pct', 10)))
         self.declare_parameter('lane_curve_guard_conf', float(saved.get('lane_curve_guard_conf', 0.80)))
         self.declare_parameter('lane_curve_guard_max_offset', float(saved.get('lane_curve_guard_max_offset', 0.35)))
+        self.declare_parameter('lane_curve_min_turn_w', float(saved.get('lane_curve_min_turn_w', 0.075)))
         self.declare_parameter('lane_curve_hold_assist_conf', float(saved.get('lane_curve_hold_assist_conf', 0.80)))
         self._lane_base_hold_s = float(self.get_parameter('lane_base_hold_s').value)
         self._lane_base_max_jump_pct = int(self.get_parameter('lane_base_max_jump_pct').value)
+        self._lane_base_edge_margin_pct = int(self.get_parameter('lane_base_edge_margin_pct').value)
         self._lane_curve_max_jump_pct = int(self.get_parameter('lane_curve_max_jump_pct').value)
         self._lane_curve_guard_conf = float(self.get_parameter('lane_curve_guard_conf').value)
         self._lane_curve_guard_max_offset = float(self.get_parameter('lane_curve_guard_max_offset').value)
+        self._lane_curve_min_turn_w = float(self.get_parameter('lane_curve_min_turn_w').value)
         self._lane_curve_hold_assist_conf = float(self.get_parameter('lane_curve_hold_assist_conf').value)
         self._lane_good_base = None      # last accepted base x (warped px)
         self._lane_good_base_time = None # when it was accepted (for the timeout)
@@ -1248,12 +1252,16 @@ class AutonomousRacer(Node):
                 self._lane_base_hold_s = float(p.value)
             elif p.name == 'lane_base_max_jump_pct':
                 self._lane_base_max_jump_pct = int(p.value)
+            elif p.name == 'lane_base_edge_margin_pct':
+                self._lane_base_edge_margin_pct = int(p.value)
             elif p.name == 'lane_curve_max_jump_pct':
                 self._lane_curve_max_jump_pct = int(p.value)
             elif p.name == 'lane_curve_guard_conf':
                 self._lane_curve_guard_conf = float(p.value)
             elif p.name == 'lane_curve_guard_max_offset':
                 self._lane_curve_guard_max_offset = float(p.value)
+            elif p.name == 'lane_curve_min_turn_w':
+                self._lane_curve_min_turn_w = float(p.value)
             elif p.name == 'lane_curve_hold_assist_conf':
                 self._lane_curve_hold_assist_conf = float(p.value)
             elif p.name == 'k_align':
@@ -1428,9 +1436,11 @@ class AutonomousRacer(Node):
                 'lane_hold_curve_min_curv': self._lane_hold_curve_min_curv,
                 'lane_base_hold_s': self._lane_base_hold_s,
                 'lane_base_max_jump_pct': self._lane_base_max_jump_pct,
+                'lane_base_edge_margin_pct': self._lane_base_edge_margin_pct,
                 'lane_curve_max_jump_pct': self._lane_curve_max_jump_pct,
                 'lane_curve_guard_conf': self._lane_curve_guard_conf,
                 'lane_curve_guard_max_offset': self._lane_curve_guard_max_offset,
+                'lane_curve_min_turn_w': self._lane_curve_min_turn_w,
                 'lane_curve_hold_assist_conf': self._lane_curve_hold_assist_conf,
                 'k_align': self._k_align,
                 'intersection_slow_speed': self._intersection_slow_speed,
@@ -2982,6 +2992,7 @@ class AutonomousRacer(Node):
             # medium-confidence lane fit.
             base_jumped = False
             curve_fit_outlier = False
+            edge_base_outlier = False
             recent_base_dt = None
             if self._lane_good_base_time is not None:
                 recent_base_dt = (now - self._lane_good_base_time).nanoseconds * 1e-9
@@ -2990,9 +3001,18 @@ class AutonomousRacer(Node):
                 and recent_base_dt is not None
                 and recent_base_dt <= max(self._lane_base_hold_s, self._lane_hold_curve_s)
             )
+            if now_good and base_x is not None and self._lane_base_edge_margin_pct > 0:
+                edge_margin = self.lane_params.warp_w * self._lane_base_edge_margin_pct / 100.0
+                if base_x < edge_margin or base_x > (self.lane_params.warp_w - edge_margin):
+                    edge_base_outlier = True
+                    self.get_logger().warn(
+                        f"[LANE] edge base {base_x:.0f}px rejected "
+                        f"(margin={edge_margin:.0f}px)",
+                        throttle_duration_sec=0.5)
             if (now_good and base_x is not None
                     and self._lane_good_base is not None
-                    and recent_base):
+                    and recent_base
+                    and not edge_base_outlier):
                 in_curve = (
                     abs(float(lane_result.curvature_norm)) >= self._lane_hold_curve_min_curv
                     or self._lane_hold_curvature >= self._lane_hold_curve_min_curv
@@ -3030,7 +3050,7 @@ class AutonomousRacer(Node):
                             f"[LANE] base jump {self._lane_good_base:.0f}->{base_x:.0f} "
                             f"(> {max_jump:.0f}px) rejected -- {jump_reason}",
                             throttle_duration_sec=0.5)
-            accept = now_good and not base_jumped and not curve_fit_outlier
+            accept = now_good and not base_jumped and not curve_fit_outlier and not edge_base_outlier
 
             # Thread the base x to the next frame for continuity (stay on the same
             # line through a curve). Near a cross keep it STICKY through brief
@@ -3042,7 +3062,7 @@ class AutonomousRacer(Node):
                 self._lane_prev_base = base_x
                 self._lane_good_base = base_x
                 self._lane_good_base_time = now
-            elif ((near or base_jumped or curve_fit_outlier) and self._lane_good_base_time is not None
+            elif ((near or base_jumped or curve_fit_outlier or edge_base_outlier) and self._lane_good_base_time is not None
                   and recent_base_dt is not None
                   and recent_base_dt <= max(self._lane_base_hold_s, self._lane_hold_curve_s)):
                 pass  # sticky: keep _lane_prev_base anchored on the last good line
@@ -3336,6 +3356,26 @@ class AutonomousRacer(Node):
                     base_linear_x = self.max_v * curve_factor
 
                 target_angular_z = max(-self.max_w, min(self.max_w, w_out))
+                curve_age = (
+                    1e9 if self._lane_hold_time is None
+                    else (now - self._lane_hold_time).nanoseconds * 1e-9
+                )
+                if (self._lane_curve_min_turn_w > 0.0
+                        and self.intersection_phase is None
+                        and self.commit_direction is None
+                        and not self._near_intersection
+                        and self._lane_hold_curvature >= self._lane_hold_curve_min_curv
+                        and curve_age <= self._lane_curve_dropout_s
+                        and abs(self._lane_hold_signed_curvature) > 1e-3):
+                    curve_dir = 1.0 if self._lane_hold_signed_curvature > 0.0 else -1.0
+                    min_curve_w = min(abs(self._lane_curve_min_turn_w), self.max_w)
+                    if target_angular_z * curve_dir < min_curve_w:
+                        prev_w = target_angular_z
+                        target_angular_z = curve_dir * min_curve_w
+                        self.get_logger().warn(
+                            f"[CONTROL] curve direction guard W {prev_w:+.3f}->{target_angular_z:+.3f} "
+                            f"(curv={self._lane_hold_signed_curvature:+.2f})",
+                            throttle_duration_sec=0.5)
 
                 self.get_logger().info(
                     f"[MATH] Error: {line_error:.1f} | Deriv: {derivative:.1f} | "
