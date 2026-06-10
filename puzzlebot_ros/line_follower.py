@@ -690,7 +690,8 @@ class AutonomousRacer(Node):
         self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
         self.declare_parameter('blind_reacquire_frames', int(saved.get('blind_reacquire_frames', 4)))  # consecutive frames needed to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
-        self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.55)))   # |off| at the edge -> also enter (strict)
+        self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.65)))   # |off| at the edge -> also enter (strict)
+        self.declare_parameter('blind_edge_frames', int(saved.get('blind_edge_frames', 3)))    # edge frames before blind entry
         self.declare_parameter('blind_pre_s', float(saved.get('blind_pre_s', 1.0)))         # after losing it, advance STRAIGHT this long before turning (~v*pre_s metres)
         self.declare_parameter('blind_min_s', float(saved.get('blind_min_s', 0.3)))         # min blind turn (hysteresis)
         self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
@@ -703,6 +704,7 @@ class AutonomousRacer(Node):
         self._blind_reacquire_frames = int(self.get_parameter('blind_reacquire_frames').value)
         self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
         self._blind_enter_off = float(self.get_parameter('blind_enter_off').value)
+        self._blind_edge_frames = int(self.get_parameter('blind_edge_frames').value)
         self._blind_pre_s = float(self.get_parameter('blind_pre_s').value)
         self._blind_min_s = float(self.get_parameter('blind_min_s').value)
         self._blind_max_s = float(self.get_parameter('blind_max_s').value)
@@ -714,6 +716,7 @@ class AutonomousRacer(Node):
         self._blind_start = None
         self._blind_dir = 0.0
         self._blind_reacq_count = 0
+        self._blind_edge_count = 0
         self.lane_params = self._load_lane_params()
         # Expose every LaneParams field as a live ROS param (lane.<field>) so the
         # warp can be tuned live (param tuner / rqt) and saved back to JSON.
@@ -1294,6 +1297,8 @@ class AutonomousRacer(Node):
                 self._blind_enter_frames = int(p.value)
             elif p.name == 'blind_enter_off':
                 self._blind_enter_off = float(p.value)
+            elif p.name == 'blind_edge_frames':
+                self._blind_edge_frames = int(p.value)
             elif p.name == 'blind_pre_s':
                 self._blind_pre_s = float(p.value)
             elif p.name == 'blind_min_s':
@@ -1533,6 +1538,7 @@ class AutonomousRacer(Node):
                 'blind_reacquire_frames': self._blind_reacquire_frames,
                 'blind_enter_frames': self._blind_enter_frames,
                 'blind_enter_off': self._blind_enter_off,
+                'blind_edge_frames': self._blind_edge_frames,
                 'blind_pre_s': self._blind_pre_s,
                 'blind_min_s': self._blind_min_s,
                 'blind_max_s': self._blind_max_s,
@@ -3464,9 +3470,14 @@ class AutonomousRacer(Node):
                 if abs(self._prev_cmd_w) >= self._blind_side_w_min:
                     s = 1.0 if self._prev_cmd_w > 0 else -1.0
                     self._curve_side = 0.5 * self._curve_side + 0.5 * s
+                if off_now >= self._blind_enter_off and abs(self._curve_side) >= 0.6:
+                    self._blind_edge_count += 1
+                else:
+                    self._blind_edge_count = 0
                 self._blind_lost_frames = 0
             elif blind_follow and not self._blind_active:
                 self._blind_lost_frames += 1
+                self._blind_edge_count = 0
 
             if self._blind_active:
                 elapsed_b = (now - self._blind_start).nanoseconds * 1e-9
@@ -3495,14 +3506,14 @@ class AutonomousRacer(Node):
                     self.last_time = now
             elif (blind_follow and abs(self._curve_side) >= 0.3
                   and (self._blind_lost_frames >= self._blind_enter_frames
-                       or (off_now >= self._blind_enter_off
-                           and abs(self._curve_side) >= 0.6))):
+                       or self._blind_edge_count >= self._blind_edge_frames)):
                 # Line LOST, or it has reached the edge (about to leave) in a curve:
                 # commit to a blind turn toward the side the PD was already steering.
                 self._blind_active = True
                 self._blind_start = now
                 self._blind_dir = 1.0 if self._curve_side > 0 else -1.0
                 self._blind_reacq_count = 0
+                self._blind_edge_count = 0
                 base_linear_x = self._blind_turn_v
                 # first frame: advance straight (pre-advance) before turning
                 target_angular_z = (0.0 if self._blind_pre_s > 0.0
