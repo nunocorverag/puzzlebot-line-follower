@@ -23,6 +23,8 @@ Keys: j/k select  -/= nudge  s save  d drive on/off  1/2/3 = left/straight/right
 from __future__ import annotations
 
 import curses
+import json
+from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -49,7 +51,7 @@ GROUPS = [
     ("Curve", [
         ("blind_turn_enabled",       "b", 1,      "PRIMARY: blind-turn until reacquire"),
         ("blind_turn_w",             "f", 0.02,   "** blind turn rate (main knob)"),
-        ("blind_turn_v",             "f", 0.01,   "forward speed while turning blind"),
+        ("blind_turn_v",             "f", 0.02,   "forward speed while turning blind"),
         ("blind_pre_s",              "f", 0.1,    "advance STRAIGHT this long before turning"),
         ("blind_enter_off",          "f", 0.05,   "|off| at edge -> start the turn"),
         ("blind_reacquire_off",      "f", 0.05,   "|off| back at center -> stop turn"),
@@ -202,7 +204,7 @@ DEFAULTS = {
     "curve_arc_pre_s": 0.6, "curve_arc_post_s": 0.4, "curve_arc_recenter_s": 0.3,
     "blind_turn_enabled": True, "blind_turn_w": 0.35, "blind_turn_v": 0.08,
     "blind_conf": 0.5, "blind_reacquire_off": 0.25, "blind_enter_frames": 3,
-    "blind_enter_off": 0.55, "blind_pre_s": 1.0, "blind_min_s": 0.3, "blind_side_w_min": 0.015,
+    "blind_enter_off": 0.55, "blind_pre_s": 2.0, "blind_min_s": 0.3, "blind_side_w_min": 0.015,
     "blind_max_s": 3.0,
     "curve_heading_gain": 0.0, "curve_heading_deadband": 0.40,
     "snapshot_interval": 0.5,
@@ -262,6 +264,26 @@ DEFAULTS = {
     "lane_curve_guard_max_offset": 0.35, "lane_curve_min_turn_w": 0.075,
     "lane_curve_hold_assist_conf": 0.80,
 }
+
+
+def _load_config_defaults():
+    """Use config/control_params.json as the panel fallback source of truth.
+
+    The panel still reads live ROS params when /autonomous_racer is available,
+    but before discovery finishes it should not show stale hardcoded values.
+    """
+    cfg_path = Path(__file__).resolve().parents[1] / "config" / "control_params.json"
+    try:
+        with cfg_path.open() as f:
+            data = json.load(f)
+    except Exception:
+        return
+    for name in DEFAULTS:
+        if name in data:
+            DEFAULTS[name] = data[name]
+
+
+_load_config_defaults()
 
 
 def _pv_to_py(pv):
