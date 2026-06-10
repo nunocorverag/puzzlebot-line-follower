@@ -406,8 +406,10 @@ class AutonomousRacer(Node):
         # area_pct is a distance proxy: bigger box => closer sign.
         self.declare_parameter('sign_act_area_pct', 6.0)
         self.declare_parameter('sign_turn_act_area_pct', 1.4)
+        self.declare_parameter('sign_lane_mask_margin_px', 18)
         self._sign_act_area_pct = float(self.get_parameter('sign_act_area_pct').value)
         self._sign_turn_act_area_pct = float(self.get_parameter('sign_turn_act_area_pct').value)
+        self._sign_lane_mask_margin_px = int(self.get_parameter('sign_lane_mask_margin_px').value)
         self._use_signs = bool(self.get_parameter('use_signs').value)
         self._workers_speed_factor = float(self.get_parameter('workers_speed_factor').value)
         self._workers_min_speed = float(self.get_parameter('workers_min_speed').value)
@@ -427,6 +429,7 @@ class AutonomousRacer(Node):
                            conf=float(self.get_parameter('signs_conf').value)),
                 log=self.get_logger().info)
         self._sign_result = None             # last SignResult (for HUD/telemetry)
+        self._sign_result_time = None
         self._pending_turn = None            # 'left'/'right'/'straight' from a sign
         self._pending_turn_until = None      # timeout: discard pending_turn if sign not seen
         self._workers_until = None           # slow-zone end time from a workers sign
@@ -977,6 +980,7 @@ class AutonomousRacer(Node):
             return
         res = self._sign_detector.detect(frame)
         self._sign_result = res
+        self._sign_result_time = now
         
         # Log all detections for debugging and events
         if res.all_detections:
@@ -1115,6 +1119,37 @@ class AutonomousRacer(Node):
                            conf=round(res.conf, 3),
                            area_pct=round(res.area_pct, 2),
                            duration_s=dur)
+
+    def _mask_signs_for_lane(self, frame, now):
+        """Paint detected signs non-black only for lane perception."""
+        sr = self._sign_result
+        if (sr is None or self._sign_lane_mask_margin_px <= 0
+                or self._sign_result_time is None
+                or (now - self._sign_result_time).nanoseconds * 1e-9 > 0.75):
+            return frame
+        detections = []
+        if getattr(sr, "all_detections", None):
+            detections.extend(sr.all_detections)
+        elif sr.box is not None:
+            detections.append({"box": sr.box})
+        if not detections:
+            return frame
+        masked = frame.copy()
+        h, w = masked.shape[:2]
+        margin = int(self._sign_lane_mask_margin_px)
+        for det in detections:
+            box = det.get("box") if isinstance(det, dict) else None
+            if box is None:
+                continue
+            x1, y1, x2, y2 = (int(v) for v in box)
+            x0 = max(0, x1 - margin)
+            y0 = max(0, y1 - margin)
+            x3 = min(w, x2 + margin)
+            y3 = min(h, y2 + margin)
+            if x3 <= x0 or y3 <= y0:
+                continue
+            masked[y0:y3, x0:x3] = (210, 210, 210)
+        return masked
 
     def _intersection_decision_cb(self, msg):
         decision = msg.data.strip().lower()
@@ -1298,6 +1333,8 @@ class AutonomousRacer(Node):
                 self._sign_act_area_pct = float(p.value)
             elif p.name == 'sign_turn_act_area_pct':
                 self._sign_turn_act_area_pct = float(p.value)
+            elif p.name == 'sign_lane_mask_margin_px':
+                self._sign_lane_mask_margin_px = int(p.value)
             elif p.name == 'detect_distance_cm':
                 self._detect_distance_cm = float(p.value)
             elif p.name == 'read_distance_cm':
@@ -1391,6 +1428,7 @@ class AutonomousRacer(Node):
                 'sign_act_area_pct': self._sign_act_area_pct,
                 'sign_cooldown_s': self._sign_cooldown_s,
                 'sign_forget_s': self._sign_forget_s,
+                'sign_lane_mask_margin_px': self._sign_lane_mask_margin_px,
                 'workers_min_speed': self._workers_min_speed,
                 'advance_lane_keep_gain': self._advance_lane_keep_gain,
                 'advance_lane_keep_max_w': self._advance_lane_keep_max_w,
@@ -2909,7 +2947,8 @@ class AutonomousRacer(Node):
             if self._lane_M is None or self._lane_frame_size != (w, h):
                 self._lane_M, self._lane_Minv = compute_homography(self.lane_params, w, h)
                 self._lane_frame_size = (w, h)
-            lane_result = analyze_lane(frame, self.lane_params, self._lane_M,
+            lane_frame = self._mask_signs_for_lane(frame, now)
+            lane_result = analyze_lane(lane_frame, self.lane_params, self._lane_M,
                                        self._lane_Minv, self._lane_prev_base)
             self._last_lane_result = lane_result
             now_good = lane_result.detected and lane_result.confidence >= 0.5

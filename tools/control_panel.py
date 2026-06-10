@@ -135,6 +135,7 @@ GROUPS = [
         ("workers_min_speed", "f", 0.01,     "min speed while workers slow"),
         ("sign_cooldown_s", "f", 0.5,       "same sign cooldown"),
         ("sign_forget_s", "f", 0.5,         "turn forget while FOLLOW"),
+        ("sign_lane_mask_margin_px", "i", 2, "mask sign boxes from lane BEV"),
     ]),
     ("Traffic", [
         ("traffic_light_roi_y_pct", "i", 1,      "top image pct to search"),
@@ -190,6 +191,7 @@ DEFAULTS = {
     "sign_turn_act_area_pct": 1.4, "sign_act_area_pct": 6.0,
     "workers_min_speed": 0.04,
     "sign_cooldown_s": 6.0, "sign_forget_s": 15.0,
+    "sign_lane_mask_margin_px": 18,
     "traffic_light_action_min_radius_px": 10.0,
     "traffic_light_action_max_radius_px": 80.0,
     "traffic_light_action_min_distance_cm": 12.0,
