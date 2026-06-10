@@ -46,6 +46,18 @@ GROUPS = [
         ("curve_memory_s",           "f", 0.05,   "hold curve slowdown after curve"),
         ("curve_min_v",              "f", 0.005,  "minimum speed in tight curves"),
     ]),
+    ("Curve", [
+        ("curve_arc_enabled",        "b", 1,      "arc mode for curves (vs PD)"),
+        ("curve_arc_pre_s",          "f", 0.1,    "go STRAIGHT this long before turning"),
+        ("curve_arc_w",              "f", 0.02,   "left turn rate in the arc"),
+        ("curve_arc_v",              "f", 0.01,   "forward speed in the arc"),
+        ("curve_arc_enter",          "f", 0.05,   "|curv| to START the arc"),
+        ("curve_arc_exit",           "f", 0.05,   "|curv| under this (centered)=exit"),
+        ("curve_arc_min_s",          "f", 0.1,    "arc at least this long"),
+        ("curve_arc_max_s",          "f", 0.5,    "arc safety cap"),
+        ("curve_heading_gain",       "f", 0.05,   "(legacy) heading steer; 0=off"),
+        ("curve_heading_deadband",   "f", 0.05,   "(legacy) heading deadband"),
+    ]),
     ("Intersection", [
         ("intersection_slow_speed",  "f", 0.01,   "speed cap near zebra"),
         ("approach_speed",           "f", 0.01,   "creep speed toward zebra"),
@@ -168,8 +180,12 @@ FIELDS = [(name, kind, step) for _, items in GROUPS for name, kind, step, _ in i
 FIELD_META = {name: (kind, step, help_text) for _, items in GROUPS for name, kind, step, help_text in items}
 DEFAULTS = {
     "kp": 0.0018, "kd": 0.01, "ff_gain": 1.0, "max_v": 0.08, "max_w": 0.6,
-    "curve_slow_gain": 0.6, "curve_min_scale": 0.4, "curve_memory_s": 1.20,
+    "curve_slow_gain": 0.6, "curve_min_scale": 0.7, "curve_memory_s": 1.20,
     "curve_min_v": 0.045,
+    "curve_arc_enabled": True, "curve_arc_pre_s": 0.6, "curve_arc_w": 0.30,
+    "curve_arc_v": 0.08, "curve_arc_enter": 0.60, "curve_arc_exit": 0.30,
+    "curve_arc_min_s": 0.6, "curve_arc_max_s": 4.0,
+    "curve_heading_gain": 0.0, "curve_heading_deadband": 0.40,
     "snapshot_interval": 0.5,
     "k_align": 0.6, "approach_align_slope": 0.15, "intersection_slow_speed": 0.08,
     "approach_speed": 0.06, "commit_turn_w": 0.6, "commit_turn_pre_advance_cm": 4.0,
