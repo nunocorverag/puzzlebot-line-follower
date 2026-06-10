@@ -690,6 +690,7 @@ class AutonomousRacer(Node):
         self.declare_parameter('blind_reacquire_off', float(saved.get('blind_reacquire_off', 0.25)))  # |off| back near center to exit
         self.declare_parameter('blind_enter_frames', int(saved.get('blind_enter_frames', 3)))  # lost frames before turning
         self.declare_parameter('blind_enter_off', float(saved.get('blind_enter_off', 0.55)))   # |off| at the edge -> also enter (strict)
+        self.declare_parameter('blind_pre_s', float(saved.get('blind_pre_s', 1.0)))         # after losing it, advance STRAIGHT this long before turning (~v*pre_s metres)
         self.declare_parameter('blind_min_s', float(saved.get('blind_min_s', 0.3)))         # min blind turn (hysteresis)
         self.declare_parameter('blind_max_s', float(saved.get('blind_max_s', 3.0)))         # safety cap
         self.declare_parameter('blind_side_w_min', float(saved.get('blind_side_w_min', 0.015)))  # min |w| to update curve side
@@ -700,6 +701,7 @@ class AutonomousRacer(Node):
         self._blind_reacquire_off = float(self.get_parameter('blind_reacquire_off').value)
         self._blind_enter_frames = int(self.get_parameter('blind_enter_frames').value)
         self._blind_enter_off = float(self.get_parameter('blind_enter_off').value)
+        self._blind_pre_s = float(self.get_parameter('blind_pre_s').value)
         self._blind_min_s = float(self.get_parameter('blind_min_s').value)
         self._blind_max_s = float(self.get_parameter('blind_max_s').value)
         self._blind_side_w_min = float(self.get_parameter('blind_side_w_min').value)
@@ -1287,6 +1289,8 @@ class AutonomousRacer(Node):
                 self._blind_enter_frames = int(p.value)
             elif p.name == 'blind_enter_off':
                 self._blind_enter_off = float(p.value)
+            elif p.name == 'blind_pre_s':
+                self._blind_pre_s = float(p.value)
             elif p.name == 'blind_min_s':
                 self._blind_min_s = float(p.value)
             elif p.name == 'blind_max_s':
@@ -1523,6 +1527,7 @@ class AutonomousRacer(Node):
                 'blind_reacquire_off': self._blind_reacquire_off,
                 'blind_enter_frames': self._blind_enter_frames,
                 'blind_enter_off': self._blind_enter_off,
+                'blind_pre_s': self._blind_pre_s,
                 'blind_min_s': self._blind_min_s,
                 'blind_max_s': self._blind_max_s,
                 'blind_side_w_min': self._blind_side_w_min,
@@ -3470,7 +3475,10 @@ class AutonomousRacer(Node):
                         f"dir={self._blind_dir:+.0f}) -> FOLLOW", throttle_duration_sec=0.5)
                 else:
                     base_linear_x = self._blind_turn_v
-                    target_angular_z = self._blind_dir * self._blind_turn_w
+                    if elapsed_b < self._blind_pre_s:
+                        target_angular_z = 0.0        # advance STRAIGHT into the curve first
+                    else:
+                        target_angular_z = self._blind_dir * self._blind_turn_w
                     steering_center_x = None          # bypass PD + suppress recover
                     self.time_line_lost = None
                     self.last_error = 0.0
@@ -3486,7 +3494,9 @@ class AutonomousRacer(Node):
                 self._blind_start = now
                 self._blind_dir = 1.0 if self._curve_side > 0 else -1.0
                 base_linear_x = self._blind_turn_v
-                target_angular_z = self._blind_dir * self._blind_turn_w
+                # first frame: advance straight (pre-advance) before turning
+                target_angular_z = (0.0 if self._blind_pre_s > 0.0
+                                    else self._blind_dir * self._blind_turn_w)
                 steering_center_x = None
                 self.time_line_lost = None
                 self.last_error = 0.0

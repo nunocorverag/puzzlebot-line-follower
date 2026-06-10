@@ -93,5 +93,6 @@
   "traffic_light_action_min_distance_cm": 12.0,
   "traffic_light_action_max_distance_cm": 45.0,
   "traffic_light_distance_k_cm_px": 360.0,
-  "snapshot_interval": 0.5
+  "snapshot_interval": 0.5,
+  "blind_pre_s": 1.0
 }
